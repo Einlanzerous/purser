@@ -1,0 +1,35 @@
+name: Release Please
+
+# Automated releases. Release Please watches conventional commits on main and
+# maintains a release PR (version bump + CHANGELOG). Merging it creates the tag +
+# GitHub Release; publish.yml then pushes the semver-tagged image to GHCR.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # Mint a short-lived installation token from the org's release-bot GitHub
+      # App so the release PR/tag is created by the App identity (GITHUB_TOKEN
+      # events don't trigger downstream workflows). Matches the switchyard /
+      # lyceum / aperture setup.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

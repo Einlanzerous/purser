@@ -1,0 +1,49 @@
+# Purser service block for construct-server/docker-compose.yml.
+#
+# Paste this `purser:` service under the top-level `services:` key. It follows
+# the house pattern (Switchyard / Lyceum): GHCR image, construct_net, depends on
+# the shared Postgres, /healthz check, Watchtower opt-out (explicit deploys).
+#
+# Prerequisites (three coordinated edits in construct-server — see the Purser
+# README "Deploying to construct-server"):
+#   1. db/init-db.sh   : ensure_db purser_user "$PURSER_DB_PASSWORD" purser
+#   2. postgres env     : add - PURSER_DB_PASSWORD=${PURSER_DB_PASSWORD}
+#   3. .env / .env.example : PURSER_DB_PASSWORD, PURSER_SWITCHYARD_TOKEN,
+#                            PURSER_CF_* , PURSER_SMTP_* , PURSER_API_TOKEN
+# Then: docker compose up -d postgres && make db-init && docker compose up -d purser
+
+  purser:
+    image: ghcr.io/einlanzerous/purser:latest
+    container_name: purser
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      - PURSER_ADDR=:4006
+      - PURSER_DATABASE_URL=postgres://purser_user:${PURSER_DB_PASSWORD}@postgres:5432/purser?sslmode=disable
+      - PURSER_API_TOKEN=${PURSER_API_TOKEN}
+      # Switchyard connector (create user + mint token)
+      - PURSER_SWITCHYARD_BASE_URL=http://switchyard:4002
+      - PURSER_SWITCHYARD_TOKEN=${PURSER_SWITCHYARD_TOKEN}
+      - PURSER_SWITCHYARD_URL=https://switchyard.zerogravity.industries
+      # Cloudflare Access connector (add to SSO). Optional: unset => manual step printed.
+      - PURSER_CF_API_TOKEN=${PURSER_CF_API_TOKEN:-}
+      - PURSER_CF_ACCOUNT_ID=${PURSER_CF_ACCOUNT_ID:-}
+      - PURSER_CF_ACCESS_GROUP_ID=${PURSER_CF_ACCESS_GROUP_ID:-}
+      - PURSER_CF_ACCESS_GROUP_NAME=zerogravity-members
+      - PURSER_CF_TEAM_DOMAIN=zero-gravity-industries.cloudflareaccess.com
+      # Email delivery (optional)
+      - PURSER_SMTP_HOST=${PURSER_SMTP_HOST:-}
+      - PURSER_SMTP_PORT=${PURSER_SMTP_PORT:-587}
+      - PURSER_SMTP_USERNAME=${PURSER_SMTP_USERNAME:-}
+      - PURSER_SMTP_PASSWORD=${PURSER_SMTP_PASSWORD:-}
+      - PURSER_SMTP_FROM=${PURSER_SMTP_FROM:-purser@zerogravity.industries}
+    networks:
+      - construct_net
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:4006/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

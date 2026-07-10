@@ -1,0 +1,74 @@
+name: backend
+
+# Go build + test. DB-backed store tests skip unless PURSER_TEST_DATABASE_URL is
+# set, so a Postgres 16 service container provides one. A paths-filter keeps the
+# expensive Go steps off non-Go PRs while still reporting a pass.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: purser_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PURSER_TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/purser_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            go:
+              - "**.go"
+              - "go.mod"
+              - "go.sum"
+              - "migrations/**"
+              - ".github/workflows/backend.yml"
+
+      - uses: actions/setup-go@v5
+        if: steps.changes.outputs.go == 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        if: steps.changes.outputs.go == 'true'
+        run: go build ./...
+
+      - name: Vet
+        if: steps.changes.outputs.go == 'true'
+        run: go vet ./...
+
+      - name: Test
+        if: steps.changes.outputs.go == 'true'
+        run: go test -race ./...
+
+      - name: Not applicable
+        if: steps.changes.outputs.go != 'true'
+        run: echo "No Go/migration changes — backend tests not applicable; reporting pass."
