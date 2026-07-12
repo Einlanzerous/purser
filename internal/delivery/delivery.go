@@ -131,11 +131,17 @@ func (s *Sender) connect(ctx context.Context) (*smtp.Client, error) {
 	}
 
 	if s.cfg.TLS == TLSStartTLS {
-		if ok, _ := client.Extension("STARTTLS"); ok {
-			if err := client.StartTLS(&tls.Config{ServerName: s.cfg.Host, MinVersion: tls.VersionTLS12}); err != nil {
-				_ = client.Close()
-				return nil, fmt.Errorf("delivery: starttls: %w", err)
-			}
+		// Fail closed: if the relay doesn't advertise STARTTLS (or a MITM strips
+		// it), refuse rather than silently sending AUTH credentials and the
+		// one-time secret in cleartext. Use TLS=none only for local capture/tests.
+		ok, _ := client.Extension("STARTTLS")
+		if !ok {
+			_ = client.Close()
+			return nil, errors.New("delivery: STARTTLS required (TLS=starttls) but the relay did not offer it")
+		}
+		if err := client.StartTLS(&tls.Config{ServerName: s.cfg.Host, MinVersion: tls.VersionTLS12}); err != nil {
+			_ = client.Close()
+			return nil, fmt.Errorf("delivery: starttls: %w", err)
 		}
 	}
 	return client, nil

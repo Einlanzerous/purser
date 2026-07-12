@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -88,7 +89,10 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 		scopes = adminScopes
 	}
 
-	token, err := c.mintToken(ctx, u.ID, in.InviteRef, scopes)
+	// Distinct idempotency keys per operation so a relay that scopes idempotency
+	// by key value alone can't cross-return a create-user response for a token
+	// mint (or vice-versa).
+	token, err := c.mintToken(ctx, u.ID, in.InviteRef+":token", scopes)
 	if err != nil {
 		return connector.Result{}, err
 	}
@@ -121,7 +125,7 @@ func (c *Connector) ensureUser(ctx context.Context, in connector.Input) (user, e
 		body["email"] = in.Email
 	}
 
-	status, raw, err := c.do(ctx, http.MethodPost, "/v1/users", in.InviteRef, body)
+	status, raw, err := c.do(ctx, http.MethodPost, "/v1/users", in.InviteRef+":user", body)
 	if err != nil {
 		return user{}, err
 	}
@@ -152,7 +156,7 @@ func (c *Connector) findUser(ctx context.Context, name, email string) (user, boo
 	for pageNum := 0; pageNum < 100; pageNum++ { // bounded: avoid runaway pagination
 		path := "/v1/users?limit=100"
 		if cursor != "" {
-			path += "&cursor=" + cursor
+			path += "&cursor=" + url.QueryEscape(cursor)
 		}
 		status, raw, err := c.do(ctx, http.MethodGet, path, "", nil)
 		if err != nil {
@@ -174,7 +178,7 @@ func (c *Connector) findUser(ctx context.Context, name, email string) (user, boo
 			if email != "" && strings.ToLower(u.Email) == email {
 				return u, true, nil
 			}
-			if email == "" && u.Name == name {
+			if email == "" && strings.EqualFold(u.Name, name) {
 				return u, true, nil
 			}
 		}

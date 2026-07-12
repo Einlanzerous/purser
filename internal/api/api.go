@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -67,15 +68,23 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 		deliver = model.DeliverCopyPaste
 	}
 
-	res, err := s.svc.Run(r.Context(), invite.Request{
+	inviteReq := invite.Request{
 		Name:     req.Name,
 		Email:    req.Email,
 		Services: req.Services,
 		Role:     req.Role,
 		Delivery: deliver,
-	})
-	if err != nil {
+	}
+	// Validation errors are the caller's fault (400); a failure inside Run is an
+	// infrastructure error (500) and its raw text is not leaked to the client.
+	if err := s.svc.Validate(inviteReq); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res, err := s.svc.Run(r.Context(), inviteReq)
+	if err != nil {
+		log.Printf("api: invite run failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "provisioning failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, newInviteResponse(res))
@@ -93,7 +102,8 @@ func (s *Server) handleGetInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("api: get invite failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	writeJSON(w, http.StatusOK, newStatusResponse(inv, tasks))
@@ -105,7 +115,8 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		if s.apiToken != "" {
 			const prefix = "Bearer "
 			h := r.Header.Get("Authorization")
-			if len(h) <= len(prefix) || subtle.ConstantTimeCompare([]byte(h[len(prefix):]), []byte(s.apiToken)) != 1 {
+			if !strings.HasPrefix(h, prefix) ||
+				subtle.ConstantTimeCompare([]byte(h[len(prefix):]), []byte(s.apiToken)) != 1 {
 				writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
 				return
 			}

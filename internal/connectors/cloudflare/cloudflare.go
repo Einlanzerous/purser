@@ -27,6 +27,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Einlanzerous/purser/internal/connector"
@@ -56,6 +57,12 @@ type Connector struct {
 	cfg     Config
 	http    *http.Client
 	baseURL string // Cloudflare API base; overridable in tests
+	// groupMu serializes the group read-modify-write so two concurrent invites
+	// (e.g. batch-provisioning several people to Cloudflare) can't lost-update
+	// each other's email onto the shared group. Cloudflare's Access-group API
+	// has no conditional-write primitive, so in-process serialization is the
+	// pragmatic guard for a single-process service.
+	groupMu sync.Mutex
 }
 
 // New builds the connector. It never fails on missing credentials — an
@@ -127,8 +134,11 @@ type group struct {
 }
 
 // addEmailToGroup fetches the group, appends the email include rule if missing,
-// and writes it back. Returns whether the email was newly added.
+// and writes it back. Returns whether the email was newly added. Serialized via
+// groupMu so concurrent invites don't lost-update the shared include list.
 func (c *Connector) addEmailToGroup(ctx context.Context, email string) (bool, error) {
+	c.groupMu.Lock()
+	defer c.groupMu.Unlock()
 	g, err := c.getGroup(ctx)
 	if err != nil {
 		return false, err
@@ -189,10 +199,14 @@ func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
 		return fmt.Errorf("cloudflare: not configured")
 	}
 	email := strings.ToLower(strings.TrimSpace(in.Email))
+	c.groupMu.Lock()
+	defer c.groupMu.Unlock()
 	g, err := c.getGroup(ctx)
 	if err != nil {
 		return err
 	}
+	// getGroup returns a freshly-decoded (unaliased) slice, so filtering into
+	// g.Include[:0] reuses its backing array without corrupting shared state.
 	kept := g.Include[:0]
 	for _, rule := range g.Include {
 		if em, ok := rule["email"].(map[string]any); ok {

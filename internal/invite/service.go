@@ -177,11 +177,12 @@ func (s *Service) provisionOne(ctx context.Context, inv model.Invite, person mod
 		return out, err
 	}
 
-	// Idempotency: an active account with an upstream id means this person is
-	// already provisioned into this service. Skip re-provisioning (no duplicate
-	// upstream user, no fresh secret).
+	// Idempotency: an active account means this person is already provisioned
+	// into this service (an account row is written only after a successful
+	// Provision). Skip re-provisioning — no duplicate upstream user, no fresh
+	// secret.
 	if acct, err := s.store.AccountFor(ctx, person.ID, svc.ID); err == nil &&
-		acct.Status == model.AccountActive && acct.ExternalID != "" {
+		acct.Status == model.AccountActive {
 		task.Status = model.TaskSkipped
 		task.AccountID = &acct.ID
 		if err := s.store.UpdateTask(ctx, task); err != nil {
@@ -205,7 +206,10 @@ func (s *Service) provisionOne(ctx context.Context, inv model.Invite, person mod
 		PersonName: person.Name,
 		Email:      person.Email,
 		Role:       role,
-		InviteRef:  fmt.Sprintf("purser-%s-%s", inv.ID, conn.Key()),
+		// Stable per (person × service) — NOT per invite — so an upstream
+		// Idempotency-Key actually dedupes across CLI re-runs (each run mints a
+		// fresh invite id).
+		InviteRef: fmt.Sprintf("purser-%s-%s", person.ID, conn.Key()),
 	})
 	if provErr != nil {
 		task.Status = model.TaskFailed

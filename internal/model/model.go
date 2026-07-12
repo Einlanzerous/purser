@@ -38,8 +38,8 @@ const (
 type AccountStatus string
 
 const (
-	AccountActive     AccountStatus = "active"
-	AccountDeprovoked AccountStatus = "deprovisioned"
+	AccountActive        AccountStatus = "active"
+	AccountDeprovisioned AccountStatus = "deprovisioned"
 )
 
 // DeliveryMethod is how the resulting credential block reaches the person.
