@@ -6,6 +6,9 @@ package store
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -31,6 +34,51 @@ func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("store: ping: %w", err)
 	}
 	return pool, nil
+}
+
+// ConnectWithRetry opens the pool, retrying transient failures with exponential
+// backoff up to maxWait before giving up. A Postgres restart (e.g. recreating
+// the shared container) is thus ridden out instead of crash-looping the process
+// via the boot-time fatal. A genuinely bad DSN still fails — just after the
+// budget, with a clear message.
+//
+// It also fails LOUDLY on an obviously-broken credential: an empty password in
+// the DSN (a blank ${PURSER_DB_PASSWORD}) otherwise surfaces only as an opaque
+// SASL error, which was the root cause of two real crash-loops.
+func ConnectWithRetry(ctx context.Context, dsn string, maxWait time.Duration) (*pgxpool.Pool, error) {
+	if cfg, err := pgxpool.ParseConfig(dsn); err == nil {
+		if cfg.ConnConfig.Password == "" && os.Getenv("PGPASSWORD") == "" {
+			log.Printf("store: WARNING — database password is EMPTY (DSN carries no password and PGPASSWORD is unset); check ${PURSER_DB_PASSWORD} interpolation")
+		}
+	}
+
+	deadline := time.Now().Add(maxWait)
+	delay := 500 * time.Millisecond
+	const maxDelay = 5 * time.Second
+	var lastErr error
+
+	for attempt := 1; ; attempt++ {
+		pool, err := Connect(ctx, dsn)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("store: connected after %d attempt(s)", attempt)
+			}
+			return pool, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("store: giving up after %s: %w", maxWait, lastErr)
+		}
+		log.Printf("store: connect attempt %d failed (%v); retrying in %s", attempt, err, delay)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay *= 2; delay > maxDelay {
+			delay = maxDelay
+		}
+	}
 }
 
 // New builds a Store over an already-connected pool.

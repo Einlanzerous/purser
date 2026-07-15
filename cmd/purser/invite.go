@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Einlanzerous/purser/internal/connector"
 	"github.com/Einlanzerous/purser/internal/invite"
 	"github.com/Einlanzerous/purser/internal/model"
 )
@@ -19,14 +20,19 @@ import (
 func runInvite(args []string) {
 	fs := flag.NewFlagSet("invite", flag.ExitOnError)
 	var (
-		name    = fs.String("name", "", "person's display name (required)")
-		email   = fs.String("email", "", "person's email (required for SSO + email delivery)")
-		to      = fs.String("to", "", "comma-separated services, e.g. switchyard,cloudflare (required)")
-		role    = fs.String("role", "member", "permission hint: member | admin")
-		deliver = fs.String("deliver", "copypaste", "delivery method: copypaste | email")
+		name     = fs.String("name", "", "person's display name (required)")
+		email    = fs.String("email", "", "person's email (required for SSO + email delivery)")
+		to       = fs.String("to", "", "comma-separated services, e.g. switchyard,cloudflare (required)")
+		role     = fs.String("role", "member", "preset: member | admin (shortcut for --instance-role + --scopes)")
+		instRole = fs.String("instance-role", "", "Switchyard instance role: member | owner (overrides --role)")
+		scopes   = fs.String("scopes", "", "explicit token scopes, comma-separated (overrides --role's default)")
+		projects = fs.String("projects", "", "project memberships, e.g. '*:viewer,IDEA:editor' ('*' = all projects)")
+		deliver  = fs.String("deliver", "copypaste", "delivery method: copypaste | email")
 	)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: purser invite --name NAME --email EMAIL --to svc1,svc2 [--role member|admin] [--deliver copypaste|email]")
+		fmt.Fprintln(os.Stderr, "usage: purser invite --name NAME --email EMAIL --to svc1,svc2")
+		fmt.Fprintln(os.Stderr, "       [--role member|admin] [--instance-role member|owner] [--scopes a,b,c]")
+		fmt.Fprintln(os.Stderr, "       [--projects '*:viewer,IDEA:editor'] [--deliver copypaste|email]")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
@@ -46,11 +52,14 @@ func runInvite(args []string) {
 	defer a.cleanup()
 
 	res, err := a.svc.Run(ctx, invite.Request{
-		Name:     *name,
-		Email:    *email,
-		Services: services,
-		Role:     *role,
-		Delivery: model.DeliveryMethod(*deliver),
+		Name:         *name,
+		Email:        *email,
+		Services:     services,
+		Role:         *role,
+		InstanceRole: *instRole,
+		Scopes:       splitCSV(*scopes),
+		Projects:     parseProjects(*projects),
+		Delivery:     model.DeliveryMethod(*deliver),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
@@ -60,12 +69,33 @@ func runInvite(args []string) {
 	printResult(res)
 }
 
-func splitServices(csv string) []string {
+func splitServices(csv string) []string { return splitCSV(csv) }
+
+func splitCSV(s string) []string {
 	var out []string
-	for _, s := range strings.Split(csv, ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			out = append(out, s)
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// parseProjects parses "*:viewer,IDEA:editor" into project grants. Malformed
+// entries are warned about and skipped.
+func parseProjects(s string) []connector.ProjectGrant {
+	var out []connector.ProjectGrant
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		key, role, ok := strings.Cut(p, ":")
+		key, role = strings.TrimSpace(key), strings.TrimSpace(role)
+		if !ok || key == "" || role == "" {
+			fmt.Fprintf(os.Stderr, "purser: ignoring malformed --projects entry %q (want KEY:ROLE)\n", p)
+			continue
+		}
+		out = append(out, connector.ProjectGrant{Key: key, Role: role})
 	}
 	return out
 }

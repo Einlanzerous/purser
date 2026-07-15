@@ -127,3 +127,88 @@ func TestProvision_APIErrorSurfaces(t *testing.T) {
 		t.Errorf("error should surface API message, got %v", err)
 	}
 }
+
+func TestProvision_InstanceRoleScopesAndProjects(t *testing.T) {
+	var createBody, tokenBody map[string]any
+	projectRoles := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/users":
+			_ = json.Unmarshal(body, &createBody)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"u-5","name":"Mara"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/users/u-5/tokens":
+			_ = json.Unmarshal(body, &tokenBody)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"token":"sw_TOK"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"key":"AAA"},{"key":"IDEA"}]`))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/projects/"):
+			var m map[string]any
+			_ = json.Unmarshal(body, &m)
+			key := strings.Split(r.URL.Path, "/")[3]
+			projectRoles[key], _ = m["role"].(string)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"role":"` + projectRoles[key] + `"}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	res, err := c.Provision(context.Background(), connector.Input{
+		PersonName:   "Mara",
+		Email:        "mara@example.com",
+		InstanceRole: "owner",
+		Scopes:       []string{"tickets:read", "webhooks:manage"},
+		Projects: []connector.ProjectGrant{
+			{Key: "*", Role: "viewer"},
+			{Key: "IDEA", Role: "editor"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if createBody["instance_role"] != "owner" {
+		t.Errorf("instance_role: want owner, got %v", createBody["instance_role"])
+	}
+	gotScopes, _ := tokenBody["scopes"].([]any)
+	if len(gotScopes) != 2 || gotScopes[0] != "tickets:read" || gotScopes[1] != "webhooks:manage" {
+		t.Errorf("scopes: want explicit list, got %v", tokenBody["scopes"])
+	}
+	if projectRoles["AAA"] != "viewer" {
+		t.Errorf("AAA should get the wildcard viewer, got %q", projectRoles["AAA"])
+	}
+	if projectRoles["IDEA"] != "editor" {
+		t.Errorf("IDEA override should win (editor), got %q", projectRoles["IDEA"])
+	}
+	if a := res.Extra["Access"]; !strings.Contains(a, "viewer") || !strings.Contains(a, "editor") {
+		t.Errorf("access summary wrong: %q", a)
+	}
+}
+
+func TestAssignOne_PatchFallbackWhenAlreadyMember(t *testing.T) {
+	var patched bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"conflict","message":"already a member"}}`))
+		case http.MethodPatch:
+			patched = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"role":"editor"}`))
+		}
+	}))
+	defer srv.Close()
+	c, _ := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	if err := c.assignOne(context.Background(), "IDEA", "u-1", "editor"); err != nil {
+		t.Fatalf("assignOne: %v", err)
+	}
+	if !patched {
+		t.Error("expected PATCH fallback when POST returns 409")
+	}
+}

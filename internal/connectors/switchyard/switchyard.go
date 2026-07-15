@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,20 +86,15 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 		return connector.Result{}, err
 	}
 
-	scopes := memberScopes
-	if strings.EqualFold(in.Role, "admin") {
-		scopes = adminScopes
-	}
-
 	// Distinct idempotency keys per operation so a relay that scopes idempotency
 	// by key value alone can't cross-return a create-user response for a token
 	// mint (or vice-versa).
-	token, err := c.mintToken(ctx, u.ID, in.InviteRef+":token", scopes)
+	token, err := c.mintToken(ctx, u.ID, in.InviteRef+":token", resolveScopes(in))
 	if err != nil {
 		return connector.Result{}, err
 	}
 
-	return connector.Result{
+	res := connector.Result{
 		ExternalID:  u.ID,
 		Username:    u.Name,
 		Secret:      token,
@@ -107,21 +103,55 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 		Instructions: "Open the URL and sign in with the email one-time-PIN — you'll go " +
 			"straight in, no token to paste. The token above is only for LAN/direct access, " +
 			"or if SSO is ever unavailable.",
-	}, nil
+	}
+
+	// Assign project memberships (SERV-39). Best-effort: the account + token
+	// already exist, so a membership hiccup is surfaced in the block rather than
+	// failing the whole provision.
+	if len(in.Projects) > 0 {
+		summary, err := c.assignProjects(ctx, u.ID, in.Projects)
+		res.Extra = map[string]string{}
+		if err != nil {
+			res.Extra["Access"] = "membership assignment error: " + err.Error()
+		} else if summary != "" {
+			res.Extra["Access"] = summary
+		}
+	}
+	return res, nil
+}
+
+// resolveInstanceRole picks the Switchyard instance role: an explicit
+// InstanceRole wins, else it derives from the Role preset (admin→owner).
+func resolveInstanceRole(in connector.Input) string {
+	if r := strings.ToLower(strings.TrimSpace(in.InstanceRole)); r != "" {
+		return r
+	}
+	if strings.EqualFold(in.Role, "admin") {
+		return "owner"
+	}
+	return "member"
+}
+
+// resolveScopes picks the token scopes: an explicit Scopes list wins, else it
+// derives from the Role preset.
+func resolveScopes(in connector.Input) []string {
+	if len(in.Scopes) > 0 {
+		return in.Scopes
+	}
+	if strings.EqualFold(in.Role, "admin") {
+		return adminScopes
+	}
+	return memberScopes
 }
 
 // ensureUser creates the user, or reconciles an existing one on a 409 conflict
 // (name/email already taken) by finding it in the user list — making Provision
 // safe to retry.
 func (c *Connector) ensureUser(ctx context.Context, in connector.Input) (user, error) {
-	instanceRole := "member"
-	if strings.EqualFold(in.Role, "admin") {
-		instanceRole = "owner"
-	}
 	body := map[string]any{
 		"name":          in.PersonName,
 		"type":          "human",
-		"instance_role": instanceRole,
+		"instance_role": resolveInstanceRole(in),
 	}
 	if in.Email != "" {
 		body["email"] = in.Email
@@ -218,6 +248,120 @@ func (c *Connector) mintToken(ctx context.Context, userID, inviteRef string, sco
 		return "", errors.New("switchyard: token response had no secret")
 	}
 	return tr.Token, nil
+}
+
+// assignProjects applies the project grants to the user idempotently. A "*"
+// grant is the default role for every project; specific-key grants override it.
+// Returns a short human summary (e.g. "viewer ×13, editor ×1") for the block.
+func (c *Connector) assignProjects(ctx context.Context, userID string, grants []connector.ProjectGrant) (string, error) {
+	defaultRole := ""
+	overrides := map[string]string{}
+	for _, g := range grants {
+		if g.Key == "*" {
+			defaultRole = g.Role
+		} else if g.Key != "" {
+			overrides[g.Key] = g.Role
+		}
+	}
+
+	targets := map[string]string{}
+	if defaultRole != "" {
+		keys, err := c.listProjectKeys(ctx)
+		if err != nil {
+			return "", err
+		}
+		for _, k := range keys {
+			targets[k] = defaultRole
+		}
+	}
+	for k, r := range overrides {
+		targets[k] = r
+	}
+
+	roleCounts := map[string]int{}
+	var failed int
+	for key, role := range targets {
+		if err := c.assignOne(ctx, key, userID, role); err != nil {
+			failed++
+			continue
+		}
+		roleCounts[role]++
+	}
+
+	roles := make([]string, 0, len(roleCounts))
+	for r := range roleCounts {
+		roles = append(roles, r)
+	}
+	sort.Strings(roles)
+	parts := make([]string, 0, len(roles))
+	for _, r := range roles {
+		parts = append(parts, fmt.Sprintf("%s ×%d", r, roleCounts[r]))
+	}
+	summary := strings.Join(parts, ", ")
+	if failed > 0 {
+		summary += fmt.Sprintf(" (%d failed)", failed)
+	}
+	return summary, nil
+}
+
+// assignOne grants userID the role on a project, idempotently: POST to add, and
+// if the user is already a member (or the add otherwise fails), PATCH the role.
+func (c *Connector) assignOne(ctx context.Context, projectKey, userID, role string) error {
+	status, _, err := c.do(ctx, http.MethodPost, "/v1/projects/"+projectKey+"/members", "",
+		map[string]any{"user_id": userID, "role": role})
+	if err != nil {
+		return err
+	}
+	if status == http.StatusCreated || status == http.StatusOK {
+		return nil
+	}
+	status2, raw2, err := c.do(ctx, http.MethodPatch, "/v1/projects/"+projectKey+"/members/"+userID, "",
+		map[string]any{"role": role})
+	if err != nil {
+		return err
+	}
+	if status2 == http.StatusOK || status2 == http.StatusCreated {
+		return nil
+	}
+	return apiError("assign "+projectKey, status2, raw2)
+}
+
+// listProjectKeys returns every project key. The endpoint returns a bare array;
+// an {items:[…]} wrapper is tolerated too.
+func (c *Connector) listProjectKeys(ctx context.Context) ([]string, error) {
+	status, raw, err := c.do(ctx, http.MethodGet, "/v1/projects", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, apiError("list projects", status, raw)
+	}
+	var keys []string
+	var arr []struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+		for _, p := range arr {
+			if p.Key != "" {
+				keys = append(keys, p.Key)
+			}
+		}
+		return keys, nil
+	}
+	var wrap struct {
+		Items []struct {
+			Key string `json:"key"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &wrap); err != nil {
+		return nil, fmt.Errorf("switchyard: decode projects: %w", err)
+	}
+	for _, p := range wrap.Items {
+		if p.Key != "" {
+			keys = append(keys, p.Key)
+		}
+	}
+	return keys, nil
 }
 
 // Reconcile is a no-op today: an existing Switchyard user needs no periodic

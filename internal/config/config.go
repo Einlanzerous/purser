@@ -18,8 +18,19 @@ type Config struct {
 
 	Switchyard SwitchyardConfig
 	Cloudflare CloudflareConfig
+	Lyceum     LyceumConfig
 	SMTP       SMTPConfig
 }
+
+// LyceumConfig configures the Lyceum connector.
+type LyceumConfig struct {
+	BaseURL    string // PURSER_LYCEUM_BASE_URL (internal API base)
+	OwnerToken string // PURSER_LYCEUM_OWNER_TOKEN (owner session token, lyc_…)
+	AppURL     string // PURSER_LYCEUM_URL (public app URL for the block; optional)
+}
+
+// Configured reports whether the Lyceum connector can run.
+func (c LyceumConfig) Configured() bool { return c.BaseURL != "" && c.OwnerToken != "" }
 
 // SwitchyardConfig configures the Switchyard connector.
 type SwitchyardConfig struct {
@@ -72,6 +83,11 @@ func Load() Config {
 			GroupName:  envOr("PURSER_CF_ACCESS_GROUP_NAME", "zerogravity-members"),
 			TeamDomain: envOr("PURSER_CF_TEAM_DOMAIN", "zero-gravity-industries.cloudflareaccess.com"),
 			AppsNote:   envOr("PURSER_CF_APPS_NOTE", "Switchyard and the other tunneled Construct apps"),
+		},
+		Lyceum: LyceumConfig{
+			BaseURL:    envOr("PURSER_LYCEUM_BASE_URL", "http://lyceum:4005"),
+			OwnerToken: os.Getenv("PURSER_LYCEUM_OWNER_TOKEN"),
+			AppURL:     os.Getenv("PURSER_LYCEUM_URL"),
 		},
 		SMTP: SMTPConfig{
 			Host:     os.Getenv("PURSER_SMTP_HOST"),

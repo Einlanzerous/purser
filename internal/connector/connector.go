@@ -17,15 +17,35 @@ import (
 // blindly.
 var ErrPending = errors.New("connector: provisioning not yet available")
 
-// Input carries everything a connector needs to provision one person. It is
-// intentionally system-agnostic; each connector maps these onto its own API.
+// Input carries everything a connector needs to provision one person. The core
+// fields are system-agnostic; the permission fields below are optional hints a
+// connector may map onto its own model (Switchyard uses all of them; connectors
+// that don't understand a field ignore it).
 type Input struct {
 	PersonName string // display name
 	Email      string // lowercased; the SSO / login identity
-	Role       string // optional permission hint: "member" (default) | "admin"
-	// InviteRef is a stable per-(invite×service) string suitable for an
+	Role       string // preset hint: "member" (default) | "admin"
+
+	// InstanceRole overrides the instance-wide role the preset would pick
+	// ("member" | "owner"). Empty → derive from Role.
+	InstanceRole string
+	// Scopes is an explicit least-privilege token scope list. Empty → the
+	// connector derives a default from Role.
+	Scopes []string
+	// Projects are project memberships to assign after the account is created.
+	Projects []ProjectGrant
+
+	// InviteRef is a stable per-(person×service) string suitable for an
 	// idempotency key on upstream APIs that support one.
 	InviteRef string
+}
+
+// ProjectGrant assigns a person a role on a project. Key "*" is a wildcard
+// meaning "every project" (a connector expands it, and a specific-key grant for
+// the same project overrides the wildcard).
+type ProjectGrant struct {
+	Key  string // project key, or "*" for all projects
+	Role string // e.g. "viewer" | "user" | "editor" | "admin"
 }
 
 // Result is what a successful Provision hands back: the upstream identity plus a

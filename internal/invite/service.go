@@ -59,8 +59,14 @@ type Request struct {
 	Name     string
 	Email    string
 	Services []string // connector keys
-	Role     string   // permission hint: "" (member) | "admin"
+	Role     string   // preset permission hint: "" (member) | "admin"
 	Delivery model.DeliveryMethod
+
+	// Fine-grained permission controls (Switchyard). Optional; empty falls back
+	// to the Role preset.
+	InstanceRole string                   // "" | "member" | "owner"
+	Scopes       []string                 // explicit token scopes
+	Projects     []connector.ProjectGrant // project memberships to assign
 }
 
 // ServiceOutcome is the per-service result surfaced to the caller and rendered
@@ -141,7 +147,7 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 
 	for _, key := range req.Services {
 		conn, _ := s.registry.Get(key) // validated
-		outcome, err := s.provisionOne(ctx, inv, person, conn, req.Role)
+		outcome, err := s.provisionOne(ctx, inv, person, conn, req)
 		if err != nil {
 			return nil, err // infrastructure error (DB), not a connector failure
 		}
@@ -166,7 +172,7 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 
 // provisionOne handles a single service: skip if already provisioned, otherwise
 // run the connector and persist the result.
-func (s *Service) provisionOne(ctx context.Context, inv model.Invite, person model.Person, conn connector.Connector, role string) (ServiceOutcome, error) {
+func (s *Service) provisionOne(ctx context.Context, inv model.Invite, person model.Person, conn connector.Connector, req Request) (ServiceOutcome, error) {
 	out := ServiceOutcome{ServiceKey: conn.Key(), DisplayName: conn.DisplayName(), Icon: conn.Icon()}
 
 	svc, err := s.store.ServiceByKey(ctx, conn.Key())
@@ -204,9 +210,12 @@ func (s *Service) provisionOne(ctx context.Context, inv model.Invite, person mod
 	}
 
 	provRes, provErr := conn.Provision(ctx, connector.Input{
-		PersonName: person.Name,
-		Email:      person.Email,
-		Role:       role,
+		PersonName:   person.Name,
+		Email:        person.Email,
+		Role:         req.Role,
+		InstanceRole: req.InstanceRole,
+		Scopes:       req.Scopes,
+		Projects:     req.Projects,
 		// Stable per (person × service) — NOT per invite — so an upstream
 		// Idempotency-Key actually dedupes across CLI re-runs (each run mints a
 		// fresh invite id).

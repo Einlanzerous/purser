@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/Einlanzerous/purser/internal/config"
 	"github.com/Einlanzerous/purser/internal/connector"
 	"github.com/Einlanzerous/purser/internal/connectors/argosy"
 	"github.com/Einlanzerous/purser/internal/connectors/cloudflare"
+	"github.com/Einlanzerous/purser/internal/connectors/lyceum"
 	"github.com/Einlanzerous/purser/internal/connectors/switchyard"
 	"github.com/Einlanzerous/purser/internal/delivery"
 	"github.com/Einlanzerous/purser/internal/invite"
@@ -73,7 +75,7 @@ type app struct {
 func setup(ctx context.Context) (*app, error) {
 	cfg := config.Load()
 
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	pool, err := store.ConnectWithRetry(ctx, cfg.DatabaseURL, 60*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect database: %w", err)
 	}
@@ -143,12 +145,27 @@ func buildRegistry(cfg config.Config) *connector.Registry {
 
 	conns = append(conns, argosy.New())
 
+	if cfg.Lyceum.Configured() {
+		lc, err := lyceum.New(lyceum.Config{
+			BaseURL:    cfg.Lyceum.BaseURL,
+			OwnerToken: cfg.Lyceum.OwnerToken,
+			AppURL:     cfg.Lyceum.AppURL,
+		})
+		if err != nil {
+			log.Fatalf("lyceum connector: %v", err)
+		}
+		conns = append(conns, lc)
+	} else {
+		conns = append(conns, connector.NewUnavailable("lyceum", "Lyceum",
+			"set PURSER_LYCEUM_OWNER_TOKEN (owner session token) and run the lyceum service with LYCEUM_AUTH=true"))
+	}
+
 	return connector.NewRegistry(conns...)
 }
 
 func runMigrate() {
 	ctx := context.Background()
-	pool, err := store.Connect(ctx, config.Load().DatabaseURL)
+	pool, err := store.ConnectWithRetry(ctx, config.Load().DatabaseURL, 60*time.Second)
 	if err != nil {
 		log.Fatalf("connect database: %v", err)
 	}
