@@ -24,6 +24,11 @@ func NewUnavailable(key, display, reason string) *Unavailable {
 func (u *Unavailable) Key() string         { return u.ServiceKey }
 func (u *Unavailable) DisplayName() string { return u.Display }
 
+// Icon returns an empty string; an unconfigured connector has no service icon
+// and the renderer falls back to a bullet. Unavailable outcomes surface only in
+// the operator note anyway.
+func (u *Unavailable) Icon() string { return "" }
+
 func (u *Unavailable) Provision(ctx context.Context, in Input) (Result, error) {
 	return Result{}, fmt.Errorf("%w: %s", ErrPending, u.Reason)
 }

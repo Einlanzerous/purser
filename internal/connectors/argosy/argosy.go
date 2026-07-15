@@ -26,6 +26,7 @@ func New() *Connector { return &Connector{} }
 
 func (c *Connector) Key() string         { return "argosy" }
 func (c *Connector) DisplayName() string { return "Argosy" }
+func (c *Connector) Icon() string        { return "🎬" }
 
 // Provision reports that Argosy provisioning is pending upstream support.
 func (c *Connector) Provision(ctx context.Context, in connector.Input) (connector.Result, error) {

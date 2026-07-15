@@ -68,6 +68,7 @@ type Request struct {
 type ServiceOutcome struct {
 	ServiceKey  string
 	DisplayName string
+	Icon        string // emoji shown next to the service in the credential block
 	Status      model.TaskStatus
 	Error       string // set when Status == failed
 	Pending     bool   // connector is wired but upstream support is not ready
@@ -166,7 +167,7 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 // provisionOne handles a single service: skip if already provisioned, otherwise
 // run the connector and persist the result.
 func (s *Service) provisionOne(ctx context.Context, inv model.Invite, person model.Person, conn connector.Connector, role string) (ServiceOutcome, error) {
-	out := ServiceOutcome{ServiceKey: conn.Key(), DisplayName: conn.DisplayName()}
+	out := ServiceOutcome{ServiceKey: conn.Key(), DisplayName: conn.DisplayName(), Icon: conn.Icon()}
 
 	svc, err := s.store.ServiceByKey(ctx, conn.Key())
 	if err != nil {

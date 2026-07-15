@@ -78,6 +78,7 @@ func New(cfg Config) *Connector {
 
 func (c *Connector) Key() string         { return "cloudflare" }
 func (c *Connector) DisplayName() string { return "Cloudflare Access (SSO)" }
+func (c *Connector) Icon() string        { return "🔐" }
 
 func (c *Connector) configured() bool {
 	return c.cfg.APIToken != "" && c.cfg.AccountID != "" && c.cfg.GroupID != ""

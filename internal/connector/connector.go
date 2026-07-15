@@ -48,6 +48,9 @@ type Connector interface {
 	Key() string
 	// DisplayName is a human label for the credential block, e.g. "Switchyard".
 	DisplayName() string
+	// Icon is an emoji shown next to the service in the credential block (e.g.
+	// "🚉" for Switchyard). May be empty; the renderer falls back to a bullet.
+	Icon() string
 	// Provision creates or ensures the person's account in the service and
 	// returns the identity + any one-time secret. Implementations should be
 	// idempotent where the upstream API allows (treat "already exists" as

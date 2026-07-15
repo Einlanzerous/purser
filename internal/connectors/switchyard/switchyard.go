@@ -66,6 +66,7 @@ func New(cfg Config) (*Connector, error) {
 
 func (c *Connector) Key() string         { return "switchyard" }
 func (c *Connector) DisplayName() string { return "Switchyard" }
+func (c *Connector) Icon() string        { return "🚉" }
 
 type user struct {
 	ID    string `json:"id"`
@@ -101,10 +102,11 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 		ExternalID:  u.ID,
 		Username:    u.Name,
 		Secret:      token,
-		SecretLabel: "API token",
+		SecretLabel: "API token (fallback — LAN/direct only)",
 		LoginURL:    c.cfg.LoginURL,
-		Instructions: "Through the tunnel you'll be signed in automatically after the " +
-			"Cloudflare email one-time-PIN. On the LAN, paste the API token on the login screen.",
+		Instructions: "Open the URL and sign in with the email one-time-PIN — you'll go " +
+			"straight in, no token to paste. The token above is only for LAN/direct access, " +
+			"or if SSO is ever unavailable.",
 	}, nil
 }
 

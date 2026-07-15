@@ -42,7 +42,7 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome) strin
 
 	for _, o := range succeeded {
 		b.WriteString("\n")
-		fmt.Fprintf(&b, "▸ %s\n", o.DisplayName)
+		fmt.Fprintf(&b, "%s %s\n", marker(o.Icon), o.DisplayName)
 		if o.LoginURL != "" {
 			fmt.Fprintf(&b, "    URL:      %s\n", o.LoginURL)
 		}
@@ -66,7 +66,7 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome) strin
 
 	for _, o := range skipped {
 		b.WriteString("\n")
-		fmt.Fprintf(&b, "▸ %s (already set up)\n", o.DisplayName)
+		fmt.Fprintf(&b, "%s %s (already set up)\n", marker(o.Icon), o.DisplayName)
 		if o.Username != "" {
 			fmt.Fprintf(&b, "    Username: %s\n", o.Username)
 		}
@@ -89,6 +89,14 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome) strin
 	}
 
 	return b.String()
+}
+
+// marker returns the service's emoji, or a bullet fallback when it has none.
+func marker(icon string) string {
+	if icon == "" {
+		return "▸"
+	}
+	return icon
 }
 
 func sortedKeys(m map[string]string) []string {

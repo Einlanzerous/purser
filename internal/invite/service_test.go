@@ -19,6 +19,7 @@ import (
 type fakeConn struct {
 	key     string
 	display string
+	icon    string
 	mu      sync.Mutex
 	calls   int
 	fail    error // when non-nil, Provision returns this
@@ -27,6 +28,7 @@ type fakeConn struct {
 
 func (f *fakeConn) Key() string         { return f.key }
 func (f *fakeConn) DisplayName() string { return f.display }
+func (f *fakeConn) Icon() string        { return f.icon }
 func (f *fakeConn) Provision(_ context.Context, in connector.Input) (connector.Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -55,11 +57,11 @@ func newFakeStore() *fakeStore {
 
 func TestRun_HappyPath_RendersCredentialBlock(t *testing.T) {
 	st := newFakeStore()
-	sw := &fakeConn{key: "switchyard", display: "Switchyard", result: connector.Result{
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", icon: "🚉", result: connector.Result{
 		ExternalID: "u-1", Username: "Ada", Secret: "sw_TOKEN", SecretLabel: "API token",
 		LoginURL: "https://switchyard.example", Instructions: "sign in",
 	}}
-	cf := &fakeConn{key: "cloudflare", display: "Cloudflare Access (SSO)", result: connector.Result{
+	cf := &fakeConn{key: "cloudflare", display: "Cloudflare Access (SSO)", icon: "🔐", result: connector.Result{
 		ExternalID: "ada@example.com", Instructions: "use the email OTP",
 	}}
 	reg := connector.NewRegistry(sw, cf)
@@ -88,6 +90,9 @@ func TestRun_HappyPath_RendersCredentialBlock(t *testing.T) {
 	}
 	if !strings.Contains(res.CredentialBlock, "email OTP") {
 		t.Errorf("credential block missing SSO instructions:\n%s", res.CredentialBlock)
+	}
+	if !strings.Contains(res.CredentialBlock, "🚉 Switchyard") || !strings.Contains(res.CredentialBlock, "🔐 Cloudflare") {
+		t.Errorf("credential block missing service emojis:\n%s", res.CredentialBlock)
 	}
 	// Secret must never be persisted in plaintext.
 	acct := st.accounts[keyOf(res.Person.ID, st.services["switchyard"].ID)]
