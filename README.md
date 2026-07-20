@@ -11,24 +11,31 @@ Tailscale/Cloudflare edge).
 
 ```
 purser invite --name "Ada Lovelace" --email ada@example.com \
-    --to switchyard,cloudflare --deliver copypaste
+    --to switchyard,lyceum,cloudflare --deliver copypaste
 ```
 ```
 invite 738258c0-… for Ada Lovelace (delivery=copypaste)
   ✓ Switchyard               succeeded
+  ✓ Lyceum                   succeeded
   ✓ Cloudflare Access (SSO)  succeeded
 
 --- credential block (stdout) ---
 Hi Ada — you've been granted access to the following:
 
-▸ Switchyard
+🚉 Switchyard
     URL:      https://switchyard.zerogravity.industries
     Username: Ada Lovelace
     API token: sw_…
     → Through the tunnel you'll be signed in automatically after the Cloudflare
       email one-time-PIN. On the LAN, paste the API token on the login screen.
 
-▸ Cloudflare Access (SSO)
+📚 Lyceum
+    URL:      https://lyceum.zerogravity.industries
+    Username: Ada Lovelace
+    invite token (single-use, expires in 7 days): lyc_…
+    → Redeem this invite at https://lyceum.zerogravity.industries (Settings → Sign in) within 7 days.
+
+🔐 Cloudflare Access (SSO)
     → Sign in to Switchyard and the other tunneled Construct apps with the email
       one-time-PIN sent to ada@example.com (no password).
 
@@ -38,14 +45,21 @@ Keep any secrets above private — they are shown once and cannot be retrieved l
 See [`docs/architecture.md`](docs/architecture.md) for the full design (this is
 the IDEA-14 canonical reference).
 
-## Why two services for one person?
+## Why several services for one person?
 
-The apps don't share a user model. **Switchyard** is the account *inside* the
-app; **Cloudflare Access** is the SSO gate *in front of* it. Switchyard's SSO
-matches the Cloudflare-verified email to `users.email` and never auto-creates
-the account — so Purser both creates the Switchyard user (with the email set)
-and adds that email to the Cloudflare Access allow-list. Argosy is on the direct
-path with its own login (no Cloudflare Access).
+The apps don't share a user model. **Switchyard** and **Lyceum** are the accounts
+*inside* the apps; **Cloudflare Access** is the SSO gate *in front of* them. Both
+apps match the Cloudflare-verified email against their own user record and
+**never auto-create** the account — so Purser creates the app user (with the
+email set) *and* adds that email to the Cloudflare Access allow-list.
+
+> **The invariant:** both halves or neither. An Access entry without a matching
+> app account is worse than no access at all — the person clears the edge gate,
+> then gets refused by the app with no way to self-serve. Granting Access to a
+> group without provisioning the app accounts is the standard way to create this
+> state; `--to <app>,cloudflare` in one invocation is what avoids it.
+
+Argosy is on the direct path with its own login (no Cloudflare Access).
 
 ## Connectors
 
@@ -53,8 +67,27 @@ path with its own login (no Cloudflare Access).
 |--------------|------------------------------------------------------------------|--------|
 | `switchyard` | create user (email set) → mint API token                         | ✅ |
 | `cloudflare` | add email to a shared Access group (email-OTP SSO)               | ✅ when a CF API token is configured; else prints the manual dashboard step |
+| `lyceum`     | create user (email set) → mint a single-use 7-day `lyc_` invite   | ✅ when `PURSER_LYCEUM_OWNER_TOKEN` is set **and** Lyceum runs with `LYCEUM_AUTH=true`; else registers Unavailable |
 | `argosy`     | pending Argosy's admin create-account endpoint                    | ⏳ |
-| `lyceum`     | future (Lyceum needs a per-user account model first)              | — |
+
+### Lyceum setup
+
+`POST /admin/users` is owner-gated, and `/admin` needs an owner **session**
+token — a `LYCEUM_API_TOKENS` entry cannot reach it. One-time, on the host:
+
+```sh
+docker exec lyceum lyceum mint-token          # → a one-time lyc_ owner invite
+curl -X POST http://localhost:4005/auth/session \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"lyc_…","device_label":"purser"}'
+```
+
+The returned `session_token` **never expires** — set it as
+`PURSER_LYCEUM_OWNER_TOKEN` and recreate `purser`.
+
+Note that with Lyceum behind Cloudflare Access, tunnel users auto-sign-in from
+the CF JWT and never redeem the `lyc_` invite; it matters only for LAN access and
+the native Android/Windows shells.
 
 ## Usage
 
@@ -89,7 +122,12 @@ for `email` the secrets go to the recipient and are not echoed over HTTP.
 
 Env vars, `PURSER_`-prefixed, with a `DATABASE_URL` fallback — see
 [`.env.example`](.env.example). Key ones: `PURSER_DATABASE_URL`,
-`PURSER_API_TOKEN`, `PURSER_SWITCHYARD_TOKEN`, `PURSER_CF_*`, `PURSER_SMTP_*`.
+`PURSER_API_TOKEN`, `PURSER_SWITCHYARD_TOKEN`, `PURSER_LYCEUM_OWNER_TOKEN`,
+`PURSER_CF_*`, `PURSER_SMTP_*`.
+
+Each connector registers as Unavailable rather than failing when its
+credentials are absent, so a partial config is safe — `--to` a service with no
+credentials reports the gap instead of half-provisioning the person.
 
 ## Development
 
@@ -113,7 +151,10 @@ Purser is deployed as a container pulled from
 2. **`postgres` service env** in `docker-compose.yml` — add
    `- PURSER_DB_PASSWORD=${PURSER_DB_PASSWORD}`.
 3. **`.env` / `.env.example`** — add `PURSER_DB_PASSWORD`, `PURSER_API_TOKEN`,
-   `PURSER_SWITCHYARD_TOKEN`, and (optionally) `PURSER_CF_*` / `PURSER_SMTP_*`.
+   `PURSER_SWITCHYARD_TOKEN`, and (optionally) `PURSER_LYCEUM_OWNER_TOKEN` /
+   `PURSER_CF_*` / `PURSER_SMTP_*`. On construct-server, deploys write `.env`
+   from the **`PROD_ENV_FILE`** secret on the `home-server` environment — a var
+   added only to the local `.env` is lost on the next deploy.
 4. Paste the `purser:` service from
    [`deploy/construct-server.compose.yml`](deploy/construct-server.compose.yml)
    into `docker-compose.yml`.

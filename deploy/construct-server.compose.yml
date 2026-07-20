@@ -9,7 +9,8 @@
 #   1. db/init-db.sh   : ensure_db purser_user "$PURSER_DB_PASSWORD" purser
 #   2. postgres env     : add - PURSER_DB_PASSWORD=${PURSER_DB_PASSWORD}
 #   3. .env / .env.example : PURSER_DB_PASSWORD, PURSER_SWITCHYARD_TOKEN,
-#                            PURSER_CF_* , PURSER_SMTP_* , PURSER_API_TOKEN
+#                            PURSER_LYCEUM_OWNER_TOKEN, PURSER_CF_* ,
+#                            PURSER_SMTP_* , PURSER_API_TOKEN
 # Then: docker compose up -d postgres && make db-init && docker compose up -d purser
 
   purser:
@@ -32,6 +33,13 @@
       - PURSER_CF_ACCESS_GROUP_ID=${PURSER_CF_ACCESS_GROUP_ID:-}
       - PURSER_CF_ACCESS_GROUP_NAME=zerogravity-members
       - PURSER_CF_TEAM_DOMAIN=zero-gravity-industries.cloudflareaccess.com
+      # Lyceum connector (create user + mint invite). Needs an owner *session*
+      # token — redeem a `lyceum mint-token` invite via POST /auth/session; a
+      # LYCEUM_API_TOKENS entry can't reach /admin. The lyceum service must also
+      # run with LYCEUM_AUTH=true. Unset => connector registers Unavailable.
+      - PURSER_LYCEUM_BASE_URL=http://lyceum:4005
+      - PURSER_LYCEUM_OWNER_TOKEN=${PURSER_LYCEUM_OWNER_TOKEN:-}
+      - PURSER_LYCEUM_URL=https://lyceum.zerogravity.industries
       # Email delivery (optional)
       - PURSER_SMTP_HOST=${PURSER_SMTP_HOST:-}
       - PURSER_SMTP_PORT=${PURSER_SMTP_PORT:-587}
