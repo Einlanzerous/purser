@@ -120,3 +120,31 @@ and are never retrievable afterward.
 - **Follow-ups (SERV/ARGY tickets):** provision the Cloudflare Access API token
   + shared group; Argosy admin create-account endpoint + connector; Lyceum
   account model + connector; Deprovision; a web UI.
+
+## Future direction: service spin-up (SERV-46)
+
+Everything above provisions **people into existing services** (the person ×
+service axis). A separate, larger direction is standing up the Cloudflare edge
+for a *new* Construct app in one command — DNS record, tunnel ingress route, and
+Access application + policy — so bringing `argosy`, `interlock`, `cook_book`,
+`centrifuge`, etc. online stops being a manual dashboard operation.
+
+This is a **different axis** (keyed on hostname/service, not person × service),
+so it does *not* extend the person-shaped `Connector`. The plan is a parallel
+`ServiceProvisioner` interface (`Ensure(ServiceSpec) / Teardown`) with its own
+orchestrator path — a `purser provision-service` sibling to `purser invite` —
+reusing the existing CF API client, registry, store, and idempotency ethos.
+
+- **Reusable today:** the CF `do()` client (bearer + `{success,errors}`
+  envelope), the registry / `ErrPending`-degrade idiom, config, store/migrator.
+- **New work:** DNS, tunnel-route, and Access-*application* operations (the
+  connector only manages Access *group* membership today); a `ServiceSpec` +
+  resource table recording created CF resource IDs for idempotent teardown.
+- **Token scopes:** Access *Apps & Policies* Edit is already held; **Zone → DNS
+  → Edit** and **Account → Cloudflare Tunnel → Edit** are not yet provisioned.
+- **Open blocker:** whether the cloudflared tunnel is remotely-managed (routes
+  settable via the CF API) or driven by a local `config.yml` (not API-settable).
+  Argosy sidesteps it entirely — it's on the *direct / non-tunnelled* path, so
+  its spin-up is DNS-to-static-IP + Access app only, and is the natural pilot.
+
+See SERV-46 for the full assessment and the proposed epic breakdown.
