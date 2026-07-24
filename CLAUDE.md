@@ -14,7 +14,7 @@ services. See `docs/architecture.md` for the full design (IDEA-14 reference).
   provision_task), 1:1 with the schema.
 - `internal/connector/` — the `Connector` interface + `Registry` +
   `Unavailable` (registered-but-unconfigured) + `ErrPending`.
-- `internal/connectors/{switchyard,cloudflare,argosy}/` — per-service connectors.
+- `internal/connectors/{switchyard,cloudflare,lyceum,argosy}/` — per-service connectors.
 - `internal/invite/` — the orchestrator (`Run`) + credential-block renderer. This
   is where idempotency lives.
 - `internal/store/` — pgx pool, embedded migrator, repo queries.
@@ -57,5 +57,6 @@ services. See `docs/architecture.md` for the full design (IDEA-14 reference).
 ## Status
 
 Phase 0+1 (schema + Switchyard connector) plus the owner-requested Cloudflare
-Access connector and email/copy-paste delivery. Argosy connector is a
-placeholder pending an upstream admin endpoint (ARGY ticket). Lyceum is future.
+Access connector and email/copy-paste delivery. All four connectors are live:
+`switchyard`, `cloudflare`, `lyceum` (SERV-42) and `argosy` (SERV-50) — each of
+the three token-gated ones registers Unavailable when its token is unset.

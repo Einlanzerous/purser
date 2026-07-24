@@ -47,8 +47,8 @@ Deprovision(ctx, Input) error           // remove access (stubbed in Phase 1)
 |--------------|---------------------------------------------------------------------|--------|
 | `switchyard` | `POST /v1/users` (email set) → `POST /v1/users/{id}/tokens`         | ✅ live |
 | `cloudflare` | Adds the email to a shared Access group (email-OTP SSO gate)         | ✅ live when a CF API token is configured; otherwise prints the manual dashboard step |
-| `argosy`     | Placeholder — pending an admin create-account endpoint (ARGY ticket) | ⏳ pending |
-| `lyceum`     | Future — Lyceum needs a per-user account model first                 | — |
+| `lyceum`     | `POST /admin/users` (email set) → single-use 7-day `lyc_` invite      | ✅ live when an owner session token is configured and `LYCEUM_AUTH=true`; otherwise registers Unavailable |
+| `argosy`     | `POST /api/v1/admin/accounts` (email login) → one-time password       | ✅ live when the provisioning token matches argosy's `ARGOSY_PROVISION_TOKEN`; otherwise registers Unavailable |
 
 Switchyard is the account inside the app; Cloudflare Access is the SSO gate in
 front of it. A typical human invite targets **both**: Cloudflare grants the

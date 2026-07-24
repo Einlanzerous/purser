@@ -112,10 +112,10 @@ func setup(ctx context.Context) (*app, error) {
 	return &app{cfg: cfg, store: st, svc: svc, cleanup: pool.Close}, nil
 }
 
-// buildRegistry wires the connectors from config. Switchyard needs a token, so
-// it degrades to an Unavailable connector when unconfigured; Cloudflare and
-// Argosy are always registered (Cloudflare self-degrades to manual
-// instructions, Argosy is pending an upstream endpoint).
+// buildRegistry wires the connectors from config. Switchyard, Lyceum and Argosy
+// each need a token, so they degrade to an Unavailable connector when
+// unconfigured; Cloudflare is always registered and self-degrades to printing
+// the manual dashboard step.
 func buildRegistry(cfg config.Config) *connector.Registry {
 	var conns []connector.Connector
 
@@ -143,7 +143,20 @@ func buildRegistry(cfg config.Config) *connector.Registry {
 		AppsNote:   cfg.Cloudflare.AppsNote,
 	}))
 
-	conns = append(conns, argosy.New())
+	if cfg.Argosy.Configured() {
+		ac, err := argosy.New(argosy.Config{
+			BaseURL:        cfg.Argosy.BaseURL,
+			ProvisionToken: cfg.Argosy.ProvisionToken,
+			AppURL:         cfg.Argosy.AppURL,
+		})
+		if err != nil {
+			log.Fatalf("argosy connector: %v", err)
+		}
+		conns = append(conns, ac)
+	} else {
+		conns = append(conns, connector.NewUnavailable("argosy", "Argosy",
+			"set PURSER_ARGOSY_PROVISION_TOKEN (matching the argosy service's ARGOSY_PROVISION_TOKEN) to enable"))
+	}
 
 	if cfg.Lyceum.Configured() {
 		lc, err := lyceum.New(lyceum.Config{
