@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/Einlanzerous/purser/compare/v0.3.0...v0.4.0) (2026-07-24)
+
+
+### Features
+
+* **argosy:** activate the Argosy connector (SERV-50) ([0b80f2e](https://github.com/Einlanzerous/purser/commit/0b80f2e32df7affc5a3efd44722c56d2f1bb7cd2))
+* **argosy:** activate the Argosy connector (SERV-50) ([77e7f3d](https://github.com/Einlanzerous/purser/commit/77e7f3d126431159768d6056ecc37d7f8f69790d))
+
 ## [0.3.0](https://github.com/Einlanzerous/purser/compare/v0.2.0...v0.3.0) (2026-07-15)
 
 
