@@ -152,18 +152,18 @@ func TestRun_FailedOnlyRetry_IsIdempotent(t *testing.T) {
 func TestRun_PendingConnector_SurfacesPending(t *testing.T) {
 	st := newFakeStore()
 	// pendingErr unwraps to connector.ErrPending, so the outcome is flagged Pending.
-	pending := &fakeConn{key: "argosy", display: "Argosy", fail: pendingErr{}}
+	pending := &fakeConn{key: "unconfigured", display: "Unconfigured Service", fail: pendingErr{}}
 	reg := connector.NewRegistry(pending)
 	svc := New(seededStore(t, st, reg), reg, nil)
 
 	res, err := svc.Run(context.Background(), Request{
-		Name: "Ada", Email: "ada@example.com", Services: []string{"argosy"},
+		Name: "Ada", Email: "ada@example.com", Services: []string{"unconfigured"},
 		Delivery: model.DeliverCopyPaste,
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	o := outcome(res, "argosy")
+	o := outcome(res, "unconfigured")
 	if o.Status != model.TaskFailed || !o.Pending {
 		t.Errorf("want failed+pending, got status=%s pending=%v", o.Status, o.Pending)
 	}
@@ -191,7 +191,7 @@ func TestValidate_Errors(t *testing.T) {
 
 type pendingErr struct{}
 
-func (pendingErr) Error() string { return "argosy pending" }
+func (pendingErr) Error() string { return "connector not configured" }
 func (pendingErr) Unwrap() error { return connector.ErrPending }
 
 func outcome(res *Result, key string) ServiceOutcome {

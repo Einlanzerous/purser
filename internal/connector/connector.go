@@ -10,11 +10,11 @@ import (
 	"fmt"
 )
 
-// ErrPending is returned by a connector that is wired up but whose target
-// system does not yet support programmatic provisioning (e.g. Argosy, which
-// needs an admin create-account endpoint first). The orchestrator surfaces the
-// message to the operator rather than treating it as a hard failure to retry
-// blindly.
+// ErrPending is returned by a connector that is registered but cannot provision
+// right now — most often an Unavailable connector standing in for a service
+// whose token isn't configured, or one whose target system doesn't yet support
+// programmatic provisioning. The orchestrator surfaces the message to the
+// operator rather than treating it as a hard failure to retry blindly.
 var ErrPending = errors.New("connector: provisioning not yet available")
 
 // Input carries everything a connector needs to provision one person. The core

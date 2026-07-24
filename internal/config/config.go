@@ -19,8 +19,19 @@ type Config struct {
 	Switchyard SwitchyardConfig
 	Cloudflare CloudflareConfig
 	Lyceum     LyceumConfig
+	Argosy     ArgosyConfig
 	SMTP       SMTPConfig
 }
+
+// ArgosyConfig configures the Argosy connector.
+type ArgosyConfig struct {
+	BaseURL        string // PURSER_ARGOSY_BASE_URL (internal API base)
+	ProvisionToken string // PURSER_ARGOSY_PROVISION_TOKEN (== argosy's ARGOSY_PROVISION_TOKEN)
+	AppURL         string // PURSER_ARGOSY_URL (public sign-in URL for the block)
+}
+
+// Configured reports whether the Argosy connector can run.
+func (c ArgosyConfig) Configured() bool { return c.BaseURL != "" && c.ProvisionToken != "" }
 
 // LyceumConfig configures the Lyceum connector.
 type LyceumConfig struct {
@@ -88,6 +99,11 @@ func Load() Config {
 			BaseURL:    envOr("PURSER_LYCEUM_BASE_URL", "http://lyceum:4005"),
 			OwnerToken: os.Getenv("PURSER_LYCEUM_OWNER_TOKEN"),
 			AppURL:     os.Getenv("PURSER_LYCEUM_URL"),
+		},
+		Argosy: ArgosyConfig{
+			BaseURL:        envOr("PURSER_ARGOSY_BASE_URL", "http://argosy:8096"),
+			ProvisionToken: os.Getenv("PURSER_ARGOSY_PROVISION_TOKEN"),
+			AppURL:         envOr("PURSER_ARGOSY_URL", "https://argosy.zerogravity.industries"),
 		},
 		SMTP: SMTPConfig{
 			Host:     os.Getenv("PURSER_SMTP_HOST"),

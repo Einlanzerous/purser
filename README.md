@@ -11,12 +11,13 @@ Tailscale/Cloudflare edge).
 
 ```
 purser invite --name "Ada Lovelace" --email ada@example.com \
-    --to switchyard,lyceum,cloudflare --deliver copypaste
+    --to switchyard,lyceum,argosy,cloudflare --deliver copypaste
 ```
 ```
 invite 738258c0-… for Ada Lovelace (delivery=copypaste)
   ✓ Switchyard               succeeded
   ✓ Lyceum                   succeeded
+  ✓ Argosy                   succeeded
   ✓ Cloudflare Access (SSO)  succeeded
 
 --- credential block (stdout) ---
@@ -34,6 +35,13 @@ Hi Ada — you've been granted access to the following:
     Username: Ada Lovelace
     invite token (single-use, expires in 7 days): lyc_…
     → Redeem this invite at https://lyceum.zerogravity.industries (Settings → Sign in) within 7 days.
+
+🎬 Argosy
+    URL:      https://argosy.zerogravity.industries
+    Username: ada@example.com
+    password (shown once — change it after signing in): …
+    → Sign in at https://argosy.zerogravity.industries with this email and password,
+      then pair your devices from the app.
 
 🔐 Cloudflare Access (SSO)
     → Sign in to Switchyard and the other tunneled Construct apps with the email
@@ -68,7 +76,7 @@ Argosy is on the direct path with its own login (no Cloudflare Access).
 | `switchyard` | create user (email set) → mint API token                         | ✅ |
 | `cloudflare` | add email to a shared Access group (email-OTP SSO)               | ✅ when a CF API token is configured; else prints the manual dashboard step |
 | `lyceum`     | create user (email set) → mint a single-use 7-day `lyc_` invite   | ✅ when `PURSER_LYCEUM_OWNER_TOKEN` is set **and** Lyceum runs with `LYCEUM_AUTH=true`; else registers Unavailable |
-| `argosy`     | pending Argosy's admin create-account endpoint                    | ⏳ |
+| `argosy`     | create account (email login) → return the one-time password       | ✅ when `PURSER_ARGOSY_PROVISION_TOKEN` matches the argosy service's `ARGOSY_PROVISION_TOKEN`; else registers Unavailable |
 
 ### Lyceum setup
 
@@ -88,6 +96,34 @@ The returned `session_token` **never expires** — set it as
 Note that with Lyceum behind Cloudflare Access, tunnel users auto-sign-in from
 the CF JWT and never redeem the `lyc_` invite; it matters only for LAN access and
 the native Android/Windows shells.
+
+### Argosy setup
+
+`POST /api/v1/admin/accounts` is gated on a static service secret, not a session
+— a bearer session is always scoped to an existing account, so it can't authorize
+creating a new one. Argosy registers the route **only** when
+`ARGOSY_PROVISION_TOKEN` is set, and 404s it otherwise.
+
+One-time, on the host:
+
+```sh
+signet set --project construct-server --name ARGOSY_PROVISION_TOKEN --generate
+# add ARGOSY_PROVISION_TOKEN to .env, then:
+docker compose up -d --force-recreate argosy purser
+```
+
+Purser reads the same value as `PURSER_ARGOSY_PROVISION_TOKEN`. To confirm the
+route is live, a bogus token should get `401`, not `404`:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  -H 'X-Provision-Token: bogus' -H 'Content-Type: application/json' \
+  -d '{}' http://localhost:8096/api/v1/admin/accounts   # → 401
+```
+
+Argosy is on the direct path (Traefik, no Cloudflare Access), so `--to argosy`
+needs no paired `cloudflare` grant: the invitee signs in with their email and
+the one-time password, then pairs devices from the app.
 
 ## Usage
 

@@ -9,8 +9,8 @@
 #   1. db/init-db.sh   : ensure_db purser_user "$PURSER_DB_PASSWORD" purser
 #   2. postgres env     : add - PURSER_DB_PASSWORD=${PURSER_DB_PASSWORD}
 #   3. .env / .env.example : PURSER_DB_PASSWORD, PURSER_SWITCHYARD_TOKEN,
-#                            PURSER_LYCEUM_OWNER_TOKEN, PURSER_CF_* ,
-#                            PURSER_SMTP_* , PURSER_API_TOKEN
+#                            PURSER_LYCEUM_OWNER_TOKEN, ARGOSY_PROVISION_TOKEN,
+#                            PURSER_CF_* , PURSER_SMTP_* , PURSER_API_TOKEN
 # Then: docker compose up -d postgres && make db-init && docker compose up -d purser
 
   purser:
@@ -40,6 +40,13 @@
       - PURSER_LYCEUM_BASE_URL=http://lyceum:4005
       - PURSER_LYCEUM_OWNER_TOKEN=${PURSER_LYCEUM_OWNER_TOKEN:-}
       - PURSER_LYCEUM_URL=https://lyceum.zerogravity.industries
+      # Argosy connector (create account + return the one-time password). Must
+      # match the argosy service's ARGOSY_PROVISION_TOKEN — argosy registers
+      # POST /api/v1/admin/accounts only when that env is set. Unset here =>
+      # connector registers Unavailable.
+      - PURSER_ARGOSY_BASE_URL=http://argosy:8096
+      - PURSER_ARGOSY_PROVISION_TOKEN=${ARGOSY_PROVISION_TOKEN:-}
+      - PURSER_ARGOSY_URL=https://argosy.zerogravity.industries
       # Email delivery (optional)
       - PURSER_SMTP_HOST=${PURSER_SMTP_HOST:-}
       - PURSER_SMTP_PORT=${PURSER_SMTP_PORT:-587}
