@@ -53,6 +53,7 @@ type inviteRequest struct {
 	Name     string   `json:"name"`
 	Email    string   `json:"email"`
 	Services []string `json:"services"`
+	Bundle   string   `json:"bundle"` // named bundle; with no services, omitting both uses the default
 	Role     string   `json:"role"`
 	Deliver  string   `json:"deliver"`
 }
@@ -72,6 +73,7 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 		Name:     req.Name,
 		Email:    req.Email,
 		Services: req.Services,
+		Bundle:   req.Bundle,
 		Role:     req.Role,
 		Delivery: deliver,
 	}

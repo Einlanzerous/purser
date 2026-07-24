@@ -125,6 +125,48 @@ Argosy is on the direct path (Traefik, no Cloudflare Access), so `--to argosy`
 needs no paired `cloudflare` grant: the invitee signs in with their email and
 the one-time password, then pairs devices from the app.
 
+## Onboarding bundles
+
+Most invites aren't "here's access to app X" — they're "welcome to the family,
+here's everything." A **bundle** is a named service set, so that's one flag:
+
+```sh
+purser invite --name "Ada" --email ada@example.com --bundle all
+purser invite --name "Gran" --email gran@example.com          # default bundle
+```
+
+| Bundle | Services | For |
+|---|---|---|
+| `media` (default) | `cloudflare`, `lyceum`, `argosy` | Household members who just want to watch and read |
+| `all` | `cloudflare`, `switchyard`, `lyceum`, `argosy` | People who'd actually use Switchyard too |
+
+Cloudflare is in both because **Lyceum sits behind the Access gate** — granting
+the app account without the Access entry leaves the person stuck at the edge
+(see the invariant above). Argosy is on the direct path and needs no grant; the
+overlap costs nothing.
+
+`media` is the default deliberately: it's the smaller grant, so an invite that
+names neither `--to` nor `--bundle` can't hand out Switchyard by accident.
+
+**Switchyard access.** A bundle grants `*:user` — Switchyard's *User* project
+level on every project. That's the **project membership role**
+(`viewer|user|editor|admin`), not the instance role (`member|owner`), which
+stays at its preset default: a bundle widens what you can see, it doesn't
+escalate privilege. Override per bundle with
+`PURSER_BUNDLE_<NAME>_PROJECTS=IDEA:editor`, or per invite with `--projects`,
+which always wins.
+
+Bundles are env-configured (`PURSER_BUNDLE_*`) — see
+[`.env.example`](.env.example). Defining any bundle replaces the built-ins
+wholesale rather than merging, so a partial override can't silently inherit half
+a default set.
+
+`--to` still works for one-off grants, and combining it with `--bundle` takes
+the union ("the family set, plus this one extra"). Since idempotency is per
+(person × service), overlapping bundles and re-invites are safe by
+construction — already-provisioned services are skipped and no fresh secret is
+minted.
+
 ## Usage
 
 ### CLI
@@ -132,7 +174,7 @@ the one-time password, then pairs devices from the app.
 ```
 purser                       # run the HTTP server (default)
 purser serve                 # ditto
-purser invite --name NAME --email EMAIL --to svc1,svc2 [--role member|admin] [--deliver copypaste|email]
+purser invite --name NAME --email EMAIL [--to svc1,svc2] [--bundle NAME] [--role member|admin] [--deliver copypaste|email]
 purser migrate               # apply DB migrations and exit
 purser version
 ```
@@ -148,7 +190,8 @@ Bearer-authenticated with `PURSER_API_TOKEN` (also relies on
 construct_net/Tailscale isolation).
 
 - `GET  /healthz`
-- `POST /v1/invites` — `{ "name", "email", "services": [...], "role", "deliver" }`
+- `POST /v1/invites` — `{ "name", "email", "services": [...], "bundle", "role", "deliver" }`
+  (omit both `services` and `bundle` to grant the default bundle)
 - `GET  /v1/invites/{id}` — status
 
 The credential block (with secrets) is returned only for `copypaste` delivery;

@@ -36,7 +36,13 @@ services. See `docs/architecture.md` for the full design (IDEA-14 reference).
 
 - **Idempotency is per (person × service).** `account` has `UNIQUE(person_id,
   service_id)`; the orchestrator skips services with an active account and
-  retries only failed ones. Keep it that way.
+  retries only failed ones. Keep it that way. Bundles (SERV-47) rely on this —
+  a bundle is only a named service list, so overlapping bundles and re-invites
+  are safe without any bundle-specific logic. Don't give bundles their own
+  provisioning path.
+- **A bundle grants project access, not privilege.** The default `*:user` is a
+  Switchyard *project membership* role; the instance role stays at its preset.
+  Don't conflate the two axes.
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
   plaintext lives only in the returned/emailed credential block.
 - **Switchyard needs the email set** on user create — it's the SSO join key

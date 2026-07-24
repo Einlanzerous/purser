@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config is Purser's fully-resolved configuration.
@@ -21,6 +22,114 @@ type Config struct {
 	Lyceum     LyceumConfig
 	Argosy     ArgosyConfig
 	SMTP       SMTPConfig
+	Bundles    BundleConfig
+}
+
+// Bundle is one named onboarding set as configured: the services granted, plus
+// the Switchyard project-grant spec that comes with them.
+type Bundle struct {
+	Services []string // connector keys
+	Projects string   // raw "*:user" spec; empty => the invite layer's default
+}
+
+// BundleConfig holds the named onboarding bundles (SERV-47). A bundle is a
+// named set of services, so the common onboard is one flag instead of a
+// hand-assembled --to list.
+type BundleConfig struct {
+	// Named maps a lowercased bundle name to its definition, loaded from
+	//   PURSER_BUNDLE_<NAME>=svc1,svc2               (services)
+	//   PURSER_BUNDLE_<NAME>_PROJECTS=*:user         (optional project grants)
+	Named map[string]Bundle
+	// Default is the bundle used when an invite names neither services nor a
+	// bundle (PURSER_DEFAULT_BUNDLE).
+	Default string
+}
+
+// DefaultBundleName is the bundle assumed when PURSER_DEFAULT_BUNDLE is unset.
+// `media` is the safer default of the two built-ins: it's the smaller grant, so
+// an unqualified invite can't accidentally hand someone Switchyard.
+const DefaultBundleName = "media"
+
+// Built-in bundles, used when nothing is configured via PURSER_BUNDLE_*.
+//
+//   - media: non-technical household members — the things you watch and read.
+//     Cloudflare is in here because Lyceum sits behind the Access gate; without
+//     it the person clears no edge and can't reach Lyceum at all. Argosy is on
+//     the direct path and needs no Access grant, but the overlap is free.
+//   - all: everything, for people who'd actually want Switchyard too.
+var builtinBundles = map[string]Bundle{
+	"media": {Services: []string{"cloudflare", "lyceum", "argosy"}},
+	"all":   {Services: []string{"cloudflare", "switchyard", "lyceum", "argosy"}},
+}
+
+// bundleEnvPrefix is the env namespace a bundle definition lives under.
+const bundleEnvPrefix = "PURSER_BUNDLE_"
+
+// projectsEnvSuffix marks the project-grant variant of a bundle variable.
+const projectsEnvSuffix = "_PROJECTS"
+
+// loadBundles reads every PURSER_BUNDLE_<NAME> from the environment. When no
+// bundle is defined at all, the built-ins are supplied so a fresh install still
+// has a working onboard. Configuring any bundle replaces the built-in set
+// wholesale rather than merging — partial overrides silently inheriting halves
+// of a default set is worse than an explicit, complete definition.
+func loadBundles() BundleConfig {
+	named := make(map[string]Bundle)
+	projects := make(map[string]string)
+
+	for _, kv := range os.Environ() {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok || !strings.HasPrefix(key, bundleEnvPrefix) {
+			continue
+		}
+		name := strings.TrimPrefix(key, bundleEnvPrefix)
+		if strings.HasSuffix(name, projectsEnvSuffix) {
+			if n := strings.ToLower(strings.TrimSuffix(name, projectsEnvSuffix)); n != "" {
+				projects[n] = strings.TrimSpace(val)
+			}
+			continue
+		}
+		name = strings.ToLower(name)
+		if name == "" {
+			continue
+		}
+		if services := splitCSV(val); len(services) > 0 {
+			named[name] = Bundle{Services: services}
+		} else {
+			log.Printf("config: %s is empty — ignoring bundle %q", key, name)
+		}
+	}
+
+	if len(named) == 0 {
+		for n, b := range builtinBundles {
+			named[n] = b
+		}
+	}
+	// Attach project specs, warning about ones that name no bundle — almost
+	// always a typo, and silently ignoring it would grant the wrong level.
+	for n, spec := range projects {
+		b, ok := named[n]
+		if !ok {
+			log.Printf("config: %s%s%s names unknown bundle %q — ignoring",
+				bundleEnvPrefix, strings.ToUpper(n), projectsEnvSuffix, n)
+			continue
+		}
+		b.Projects = spec
+		named[n] = b
+	}
+
+	return BundleConfig{Named: named, Default: envOr("PURSER_DEFAULT_BUNDLE", DefaultBundleName)}
+}
+
+// splitCSV parses a comma-separated list, trimming blanks.
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // ArgosyConfig configures the Argosy connector.
@@ -105,6 +214,7 @@ func Load() Config {
 			ProvisionToken: os.Getenv("PURSER_ARGOSY_PROVISION_TOKEN"),
 			AppURL:         envOr("PURSER_ARGOSY_URL", "https://argosy.zerogravity.industries"),
 		},
+		Bundles: loadBundles(),
 		SMTP: SMTPConfig{
 			Host:     os.Getenv("PURSER_SMTP_HOST"),
 			Port:     envOrInt("PURSER_SMTP_PORT", 587),
