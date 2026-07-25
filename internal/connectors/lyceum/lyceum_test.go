@@ -3,7 +3,6 @@ package lyceum
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -93,22 +92,64 @@ func TestProvision_RequiresEmail(t *testing.T) {
 	}
 }
 
-// Lyceum has only POST /admin/users, so Reconcile must refuse rather than
-// probe by attempting a create (SERV-54).
-func TestReconcile_IsUnsupportedAndNeverCalls(t *testing.T) {
-	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		w.WriteHeader(http.StatusCreated)
+// Reconcile lists the household read-only: no user created, no invite minted.
+func TestReconcile_FindsUserWithoutCreatingOrMinting(t *testing.T) {
+	var writes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writes++
+			t.Errorf("Reconcile must only read, got %s %s", r.Method, r.URL.Path)
+		}
+		if r.URL.Path != "/admin/users" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[{"id":7,"email":"mara@example.com","display_name":"Mara","is_owner":false}]`))
 	}))
 	defer srv.Close()
 
 	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
-	_, err := c.Reconcile(context.Background(), connector.Input{Email: "ada@example.com"})
-	if !errors.Is(err, connector.ErrReconcileUnsupported) {
-		t.Fatalf("want ErrReconcileUnsupported, got %v", err)
+	res, err := c.Reconcile(context.Background(), connector.Input{Email: "Mara@Example.com"})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
 	}
-	if calls != 0 {
-		t.Errorf("Reconcile must not touch the upstream API, got %d call(s)", calls)
+	if !res.Exists || res.ExternalID != "7" || res.Username != "Mara" {
+		t.Errorf("unexpected reconcile result: %+v", res)
+	}
+	if writes != 0 {
+		t.Errorf("Reconcile performed %d write(s)", writes)
+	}
+}
+
+func TestReconcile_ReportsAbsentUser(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[{"id":1,"email":"someone@else.com","display_name":"Other"}]`))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	res, err := c.Reconcile(context.Background(), connector.Input{Email: "mara@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Exists {
+		t.Error("a non-member should report Exists=false")
+	}
+}
+
+// A 403 must surface the LYCEUM_AUTH hint rather than looking like absence —
+// otherwise a misconfigured owner token would mark every record stale.
+func TestReconcile_ForbiddenIsLoud(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"owner only"}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	if _, err := c.Reconcile(context.Background(), connector.Input{Email: "mara@example.com"}); err == nil ||
+		!strings.Contains(err.Error(), "LYCEUM_AUTH") {
+		t.Fatalf("403 should surface the LYCEUM_AUTH hint, got %v", err)
 	}
 }
