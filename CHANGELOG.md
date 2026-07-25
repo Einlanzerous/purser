@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/Einlanzerous/purser/compare/v0.6.1...v0.7.0) (2026-07-25)
+
+
+### Features
+
+* **argosy:** reconcile via the new lookup endpoint (ARGY-163) ([#11](https://github.com/Einlanzerous/purser/issues/11)) ([7dfe78f](https://github.com/Einlanzerous/purser/commit/7dfe78f32cf918738b613245d19bae4111bcff6f))
+
 ## [0.6.1](https://github.com/Einlanzerous/purser/compare/v0.6.0...v0.6.1) (2026-07-25)
 
 
