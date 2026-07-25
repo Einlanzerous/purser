@@ -215,12 +215,13 @@ Repairs run in both directions:
 left active with no upstream account means the orchestrator skips that person
 forever and no invite can ever fix them. Marking it stale re-arms provisioning.
 
-**Not every service can be checked.** Switchyard and Cloudflare have lookup
-endpoints; Lyceum and Argosy expose create-only admin APIs, so the only
-"does this exist?" signal is a 409 from an attempted create — which `Reconcile`
-must not do. Those report `unverifiable` rather than guessing, because reporting
-"no" would claim people lack access they demonstrably have. Closing that needs
-an upstream lookup endpoint (ARGY-163 for Argosy).
+**Not every service can be checked.** Switchyard, Cloudflare and Lyceum all have
+lookup endpoints. **Argosy** does not — its admin API is create-only, so the
+only "does this exist?" signal is a 409 from an attempted create, which
+`Reconcile` must not do. Argosy therefore reports `unverifiable` rather than
+guessing: answering "no" would claim people lack access they demonstrably have,
+manufacturing the exact drift the audit exists to find. Closing it needs an
+upstream lookup endpoint (ARGY-163).
 
 `purser reconcile` refuses to touch the whole roster without `--all`, since it's
 a bulk write.
