@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/Einlanzerous/purser/compare/v0.4.0...v0.5.0) (2026-07-25)
+
+
+### Features
+
+* **invite:** onboarding bundles — named service sets (SERV-47) ([#5](https://github.com/Einlanzerous/purser/issues/5)) ([002a770](https://github.com/Einlanzerous/purser/commit/002a77097c6e6e533358a52f794a4c09259cf628))
+
 ## [0.4.0](https://github.com/Einlanzerous/purser/compare/v0.3.0...v0.4.0) (2026-07-24)
 
 
