@@ -40,6 +40,15 @@ type AccountStatus string
 const (
 	AccountActive        AccountStatus = "active"
 	AccountDeprovisioned AccountStatus = "deprovisioned"
+	// AccountStale means Purser holds a record but Reconcile found no matching
+	// account upstream — it was deleted or never really existed (SERV-54).
+	//
+	// This is distinct from deprovisioned, which is Purser deliberately removing
+	// access. Stale is drift Purser didn't cause and can't explain. It matters
+	// because the orchestrator's idempotency skip keys on *active*: an account
+	// stuck active with nothing upstream can never be re-provisioned by any
+	// invite, so marking it stale is what re-arms provisioning.
+	AccountStale AccountStatus = "stale"
 )
 
 // DeliveryMethod is how the resulting credential block reaches the person.

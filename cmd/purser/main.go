@@ -8,6 +8,8 @@
 //	purser                      # run the HTTP server (default)
 //	purser serve                # ditto
 //	purser invite --name … --email … --to switchyard,cloudflare
+//	purser audit                # report record-vs-upstream drift (read-only)
+//	purser reconcile --email …  # repair the records; never mints a credential
 //	purser migrate              # apply DB migrations and exit
 //	purser version              # print the build version
 //
@@ -49,13 +51,17 @@ func main() {
 		runServe()
 	case "invite":
 		runInvite(args)
+	case "audit":
+		runAudit(args, false)
+	case "reconcile":
+		runAudit(args, true)
 	case "migrate":
 		runMigrate()
 	case "version":
 		fmt.Println(version.Version)
 	default:
 		fmt.Fprintf(os.Stderr, "purser: unknown command %q\n", cmd)
-		fmt.Fprintln(os.Stderr, "commands: serve, invite, migrate, version")
+		fmt.Fprintln(os.Stderr, "commands: serve, invite, audit, reconcile, migrate, version")
 		os.Exit(2)
 	}
 }

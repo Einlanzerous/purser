@@ -43,6 +43,16 @@ services. See `docs/architecture.md` for the full design (IDEA-14 reference).
 - **A bundle grants project access, not privilege.** The default `*:user` is a
   Switchyard *project membership* role; the instance role stays at its preset.
   Don't conflate the two axes.
+- **`Reconcile` must never mutate.** No create, no mint, no rotate, no revoke —
+  it answers "what does this person already have?" and nothing else. A version
+  that repairs as a side effect can't be used to audit, because running it
+  destroys the drift it's meant to report. A connector with no lookup endpoint
+  returns `ErrReconcileUnsupported` rather than inferring absence: reporting
+  "no" for a question you can't answer generates wrong records.
+- **Never treat unverifiable as absent.** `UpstreamUnknown` is deliberately
+  distinct from `UpstreamNo` throughout the audit, and a failed connector call
+  must never mark records stale — a transient outage would otherwise wipe out
+  everyone's access records.
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
   plaintext lives only in the returned/emailed credential block.
 - **Switchyard needs the email set** on user create — it's the SSO join key

@@ -175,9 +175,55 @@ minted.
 purser                       # run the HTTP server (default)
 purser serve                 # ditto
 purser invite --name NAME --email EMAIL [--to svc1,svc2] [--bundle NAME] [--role member|admin] [--deliver copypaste|email]
+purser audit [--email EMAIL] [--to svc1,svc2]              # report drift, read-only
+purser reconcile --email EMAIL | --all [--to svc1,svc2]    # repair records
 purser migrate               # apply DB migrations and exit
 purser version
 ```
+
+### Auditing and reconciling
+
+Purser's `account` rows record what **Purser provisioned** — not who actually
+has access. Those drift apart whenever someone is set up by hand, or an upstream
+account is deleted. `audit` compares the two:
+
+```
+$ purser audit
+PERSON                SERVICE     RECORDED  UPSTREAM  ACTION
+arin.reese@…          switchyard  no        yes       record
+arin.reese@…          cloudflare  no        yes       record
+old-tester@…          lyceum      yes       no        mark-stale
+
+12 checked: 8 ok, 2 to record, 1 stale, 1 unverifiable, 0 errors
+Dry run — nothing written. Re-run as `purser reconcile` to apply.
+```
+
+`reconcile` applies the same findings. Both go through each connector's
+`Reconcile`, which is **read-only by contract** — it never provisions, mints,
+rotates, or invalidates a credential. That's the difference between this and
+re-inviting someone: a re-invite would hand a Switchyard user who already has
+access a *second* API token.
+
+Repairs run in both directions:
+
+| situation | action |
+|---|---|
+| upstream has it, Purser doesn't | write an `account` row (no secret — Purser never learned theirs) |
+| Purser has it, upstream doesn't | mark the row `stale` |
+
+`stale` matters more than it looks. Idempotency keys on **active**, so a row
+left active with no upstream account means the orchestrator skips that person
+forever and no invite can ever fix them. Marking it stale re-arms provisioning.
+
+**Not every service can be checked.** Switchyard and Cloudflare have lookup
+endpoints; Lyceum and Argosy expose create-only admin APIs, so the only
+"does this exist?" signal is a 409 from an attempted create — which `Reconcile`
+must not do. Those report `unverifiable` rather than guessing, because reporting
+"no" would claim people lack access they demonstrably have. Closing that needs
+an upstream lookup endpoint (ARGY-163 for Argosy).
+
+`purser reconcile` refuses to touch the whole roster without `--all`, since it's
+a bulk write.
 
 `invite` writes a human summary to stderr and the credential block to stdout, so
 `purser invite … | pbcopy` (or `> block.txt`) captures exactly the pasteable

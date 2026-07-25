@@ -115,6 +115,59 @@ func (s *Store) AccountFor(ctx context.Context, personID, serviceID uuid.UUID) (
 	return a, nil
 }
 
+// ListPeople returns every person, oldest first. Used by the audit to walk the
+// whole roster (SERV-54).
+func (s *Store) ListPeople(ctx context.Context) ([]model.Person, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, COALESCE(email, ''), type, created_at, updated_at
+		FROM person ORDER BY created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list people: %w", err)
+	}
+	defer rows.Close()
+	var out []model.Person
+	for rows.Next() {
+		var p model.Person
+		if err := rows.Scan(&p.ID, &p.Name, &p.Email, &p.Type, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("store: scan person: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// PersonByEmail looks a person up by email (lowercased), or ErrNotFound.
+func (s *Store) PersonByEmail(ctx context.Context, email string) (model.Person, error) {
+	var p model.Person
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, name, COALESCE(email, ''), type, created_at, updated_at
+		FROM person WHERE lower(email) = lower($1)`, email).
+		Scan(&p.ID, &p.Name, &p.Email, &p.Type, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.Person{}, ErrNotFound
+	}
+	if err != nil {
+		return model.Person{}, fmt.Errorf("store: person by email: %w", err)
+	}
+	return p, nil
+}
+
+// UpdateAccountStatus changes only an account's status, deliberately leaving
+// secret_hash and identity columns untouched — marking a row stale must not
+// destroy the record of what was provisioned (SERV-54).
+func (s *Store) UpdateAccountStatus(ctx context.Context, accountID uuid.UUID, status model.AccountStatus) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE account SET status = $2, updated_at = now() WHERE id = $1`,
+		accountID, string(status))
+	if err != nil {
+		return fmt.Errorf("store: update account status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // UpsertAccount writes the durable access record for (person, service),
 // updating external_id/username/secret_hash/status on conflict. Returns the
 // stored row (with its id).

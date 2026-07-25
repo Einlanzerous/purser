@@ -3,6 +3,7 @@ package argosy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -143,5 +144,26 @@ func TestProvision_RequiresEmail(t *testing.T) {
 	c, _ := New(Config{BaseURL: "http://x", ProvisionToken: "prov_secret"})
 	if _, err := c.Provision(context.Background(), connector.Input{PersonName: "No Email"}); err == nil {
 		t.Error("expected error when email is missing")
+	}
+}
+
+// Argosy exposes only a create endpoint, so Reconcile must refuse rather than
+// infer absence — claiming people who demonstrably have accounts don't have
+// them is exactly the drift the audit exists to find (SERV-54, ARGY-163).
+func TestReconcile_IsUnsupportedAndNeverCalls(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, ProvisionToken: "prov_secret"})
+	_, err := c.Reconcile(context.Background(), connector.Input{Email: "ada@example.com"})
+	if !errors.Is(err, connector.ErrReconcileUnsupported) {
+		t.Fatalf("want ErrReconcileUnsupported, got %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("Reconcile must not touch the upstream API, got %d call(s)", calls)
 	}
 }

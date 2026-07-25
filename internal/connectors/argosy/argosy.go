@@ -137,8 +137,19 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 	}
 }
 
-// Reconcile is a no-op today.
-func (c *Connector) Reconcile(ctx context.Context, in connector.Input) error { return nil }
+// Reconcile cannot run: Argosy exposes only `POST /api/v1/admin/accounts`, so
+// the sole "does this account exist?" signal is a 409 from an attempted
+// create — and creating is exactly what Reconcile must not do (SERV-54).
+//
+// Reporting Exists=false would be actively harmful: it would claim people who
+// demonstrably have Argosy accounts don't, which is the very drift this is
+// meant to detect. ARGY-163 adds the existing account id to the 409 body; a
+// lookup endpoint (`GET /api/v1/admin/accounts?email=`) would close it fully.
+func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connector.ReconcileResult, error) {
+	return connector.ReconcileResult{}, fmt.Errorf(
+		"%w: argosy has no admin account-lookup endpoint (only POST /api/v1/admin/accounts, see ARGY-163)",
+		connector.ErrReconcileUnsupported)
+}
 
 // Deprovision is not yet implemented (Phase 1 is invite-only). Argosy has no
 // admin delete-account endpoint to call.

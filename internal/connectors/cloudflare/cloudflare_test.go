@@ -98,3 +98,66 @@ func includesEmail(rules []any, email string) bool {
 	}
 	return false
 }
+
+// Reconcile reads the Access group and must not write it back. The previous
+// implementation re-added the email, which made it useless for auditing:
+// running it repaired the drift it was supposed to report (SERV-54).
+func TestReconcile_ReadsGroupWithoutWriting(t *testing.T) {
+	var puts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"success":true,"result":{"name":"zerogravity-members","include":[{"email":{"email":"ada@example.com"}}]}}`))
+		case http.MethodPut:
+			puts++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		default:
+			t.Errorf("unexpected %s", r.Method)
+		}
+	}))
+	defer srv.Close()
+
+	c := newWithBase(t, srv.URL, Config{APIToken: "cf_tok", AccountID: "acc", GroupID: "grp"})
+	res, err := c.Reconcile(context.Background(), connector.Input{Email: "Ada@Example.com"})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !res.Exists {
+		t.Error("email is in the group's include list — should report Exists")
+	}
+	if puts != 0 {
+		t.Errorf("Reconcile wrote the group %d time(s) — it must be read-only", puts)
+	}
+}
+
+func TestReconcile_ReportsNonMember(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("Reconcile must only read, got %s", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true,"result":{"name":"zerogravity-members","include":[{"email":{"email":"someone@else.com"}}]}}`))
+	}))
+	defer srv.Close()
+
+	c := newWithBase(t, srv.URL, Config{APIToken: "cf_tok", AccountID: "acc", GroupID: "grp"})
+	res, err := c.Reconcile(context.Background(), connector.Input{Email: "ada@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Exists {
+		t.Error("a non-member should report Exists=false")
+	}
+}
+
+// Unconfigured must be unverifiable, not "absent" — otherwise an audit run
+// without CF credentials would claim nobody has SSO.
+func TestReconcile_UnconfiguredIsUnsupported(t *testing.T) {
+	c := New(Config{})
+	_, err := c.Reconcile(context.Background(), connector.Input{Email: "ada@example.com"})
+	if !errors.Is(err, connector.ErrReconcileUnsupported) {
+		t.Fatalf("want ErrReconcileUnsupported, got %v", err)
+	}
+}

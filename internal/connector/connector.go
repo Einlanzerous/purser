@@ -17,6 +17,28 @@ import (
 // operator rather than treating it as a hard failure to retry blindly.
 var ErrPending = errors.New("connector: provisioning not yet available")
 
+// ErrReconcileUnsupported is returned by Reconcile when the target system has
+// no way to look a person up without creating them — i.e. the only "does this
+// account exist?" signal available is a 409 from the create endpoint, which is
+// not usable here because Reconcile must never create anything.
+//
+// Lyceum and Argosy are both in this position today (create-only admin APIs).
+// Returning this is deliberately louder than guessing: a reconcile that
+// silently reports "not found" for a service it cannot actually check would
+// produce exactly the wrong records.
+var ErrReconcileUnsupported = errors.New("connector: reconcile requires an upstream lookup endpoint")
+
+// ReconcileResult is what Reconcile reports about a person's *existing* access.
+// It carries identity only — never a secret, because Reconcile never mints one.
+type ReconcileResult struct {
+	// Exists reports whether the person currently has access upstream.
+	Exists bool
+	// ExternalID is the upstream account id, when Exists and the API exposes it.
+	ExternalID string
+	// Username is the upstream login handle, when Exists.
+	Username string
+}
+
 // Input carries everything a connector needs to provision one person. The core
 // fields are system-agnostic; the permission fields below are optional hints a
 // connector may map onto its own model (Switchyard uses all of them; connectors
@@ -76,9 +98,15 @@ type Connector interface {
 	// idempotent where the upstream API allows (treat "already exists" as
 	// success and reuse it) so a failed-only retry is safe.
 	Provision(ctx context.Context, in Input) (Result, error)
-	// Reconcile re-checks/repairs an existing account without minting new
-	// secrets. Default connectors may no-op.
-	Reconcile(ctx context.Context, in Input) error
+	// Reconcile reports whether the person already has access upstream, WITHOUT
+	// creating anything and WITHOUT minting, rotating or invalidating a
+	// credential. That constraint is the whole point: it makes Reconcile safe to
+	// run against real people at any time, which is what lets it back a
+	// record-only backfill and, later, a scheduled consistency check.
+	//
+	// Connectors whose upstream has no lookup endpoint must return
+	// ErrReconcileUnsupported rather than inferring absence.
+	Reconcile(ctx context.Context, in Input) (ReconcileResult, error)
 	// Deprovision removes the person's access. Stubbed for now (Phase 1 is
 	// invite-only); connectors may return a not-implemented error.
 	Deprovision(ctx context.Context, in Input) error

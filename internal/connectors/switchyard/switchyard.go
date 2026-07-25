@@ -366,7 +366,24 @@ func (c *Connector) listProjectKeys(ctx context.Context) ([]string, error) {
 
 // Reconcile is a no-op today: an existing Switchyard user needs no periodic
 // repair from Purser's side.
-func (c *Connector) Reconcile(ctx context.Context, in connector.Input) error { return nil }
+// Reconcile reports whether the Switchyard user already exists, by list lookup
+// only (SERV-54).
+//
+// This is the connector where the distinction matters most: Provision calls
+// ensureUser and then unconditionally mints a token, so re-provisioning someone
+// who already has access hands them a second API token. Reconcile deliberately
+// stops after the lookup — no user created, no token minted — which is what
+// makes a Switchyard backfill safe to run against real people.
+func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connector.ReconcileResult, error) {
+	u, found, err := c.findUser(ctx, in.PersonName, in.Email)
+	if err != nil {
+		return connector.ReconcileResult{}, err
+	}
+	if !found {
+		return connector.ReconcileResult{Exists: false}, nil
+	}
+	return connector.ReconcileResult{Exists: true, ExternalID: u.ID, Username: u.Name}, nil
+}
 
 // Deprovision is not yet implemented (Phase 1 is invite-only).
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {

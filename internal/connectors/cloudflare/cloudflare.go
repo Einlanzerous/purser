@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -144,12 +145,8 @@ func (c *Connector) addEmailToGroup(ctx context.Context, email string) (bool, er
 	if err != nil {
 		return false, err
 	}
-	for _, rule := range g.Include {
-		if em, ok := rule["email"].(map[string]any); ok {
-			if got, _ := em["email"].(string); strings.EqualFold(got, email) {
-				return false, nil // already present — idempotent no-op
-			}
-		}
+	if groupHasEmail(g, email) {
+		return false, nil // already present — idempotent no-op
 	}
 	g.Include = append(g.Include, map[string]any{"email": map[string]any{"email": email}})
 	if err := c.putGroup(ctx, g); err != nil {
@@ -185,13 +182,45 @@ func (c *Connector) putGroup(ctx context.Context, g group) error {
 	return err
 }
 
-// Reconcile re-adds the email to the group (idempotent), repairing drift.
-func (c *Connector) Reconcile(ctx context.Context, in connector.Input) error {
+// Reconcile reports whether the email is already in the Access group, by
+// reading the group only (SERV-54).
+//
+// This used to re-add the email — a write. Reconcile must not mutate upstream
+// state: it is meant to answer "what does this person already have?", and a
+// version that repairs as a side effect can't be used to audit, because running
+// it destroys the very drift it's supposed to report.
+func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connector.ReconcileResult, error) {
 	if !c.configured() {
-		return nil
+		return connector.ReconcileResult{}, fmt.Errorf("%w: cloudflare is not configured (set PURSER_CF_API_TOKEN, PURSER_CF_ACCOUNT_ID, PURSER_CF_ACCESS_GROUP_ID)",
+			connector.ErrReconcileUnsupported)
 	}
-	_, err := c.addEmailToGroup(ctx, strings.ToLower(strings.TrimSpace(in.Email)))
-	return err
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	if email == "" {
+		return connector.ReconcileResult{}, errors.New("cloudflare: an email is required to reconcile")
+	}
+	g, err := c.getGroup(ctx)
+	if err != nil {
+		return connector.ReconcileResult{}, err
+	}
+	if groupHasEmail(g, email) {
+		// The Access group has no per-member id — the email IS the identity.
+		return connector.ReconcileResult{Exists: true, ExternalID: email, Username: email}, nil
+	}
+	return connector.ReconcileResult{Exists: false}, nil
+}
+
+// groupHasEmail reports whether an email include rule for email is present.
+// Shared by Provision's add path and Reconcile's read path so the two can't
+// disagree about what "already a member" means.
+func groupHasEmail(g group, email string) bool {
+	for _, rule := range g.Include {
+		if em, ok := rule["email"].(map[string]any); ok {
+			if got, _ := em["email"].(string); strings.EqualFold(strings.TrimSpace(got), email) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Deprovision removes the email from the Access group.
