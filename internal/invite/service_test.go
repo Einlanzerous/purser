@@ -3,6 +3,7 @@ package invite
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,11 @@ type fakeConn struct {
 	fail    error // when non-nil, Provision returns this
 	result  connector.Result
 	lastIn  connector.Input // the most recent Provision input, for assertions
+
+	// Reconcile behavior (SERV-54). recErr wins over recResult.
+	recResult connector.ReconcileResult
+	recErr    error
+	recCalls  int
 }
 
 func (f *fakeConn) Key() string         { return f.key }
@@ -46,7 +52,25 @@ func (f *fakeConn) lastInput() connector.Input {
 	defer f.mu.Unlock()
 	return f.lastIn
 }
-func (f *fakeConn) Reconcile(context.Context, connector.Input) error   { return nil }
+
+// Reconcile returns whatever the test configured. recErr wins over recResult,
+// so a test can simulate an unverifiable connector.
+func (f *fakeConn) Reconcile(_ context.Context, in connector.Input) (connector.ReconcileResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recCalls++
+	if f.recErr != nil {
+		return connector.ReconcileResult{}, f.recErr
+	}
+	return f.recResult, nil
+}
+
+func (f *fakeConn) reconcileCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.recCalls
+}
+
 func (f *fakeConn) Deprovision(context.Context, connector.Input) error { return nil }
 func (f *fakeConn) callCount() int {
 	f.mu.Lock()
@@ -298,6 +322,42 @@ func (s *fakeStore) EnsureTask(_ context.Context, inviteID, personID, serviceID 
 	t := model.ProvisionTask{ID: uuid.New(), InviteID: inviteID, PersonID: personID, ServiceID: serviceID, Status: model.TaskPending}
 	s.tasks[k] = t
 	return t, nil
+}
+
+// --- AuditStore (SERV-54) ---
+
+func (s *fakeStore) ListPeople(context.Context) ([]model.Person, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Person, 0, len(s.people))
+	for _, p := range s.people {
+		out = append(out, p)
+	}
+	// Stable order so audit findings are deterministic across map iteration.
+	sort.Slice(out, func(i, j int) bool { return out[i].Email < out[j].Email })
+	return out, nil
+}
+
+func (s *fakeStore) PersonByEmail(_ context.Context, email string) (model.Person, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, ok := s.people[strings.ToLower(email)]; ok {
+		return p, nil
+	}
+	return model.Person{}, store.ErrNotFound
+}
+
+func (s *fakeStore) UpdateAccountStatus(_ context.Context, accountID uuid.UUID, status model.AccountStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, a := range s.accounts {
+		if a.ID == accountID {
+			a.Status = status
+			s.accounts[k] = a
+			return nil
+		}
+	}
+	return store.ErrNotFound
 }
 
 func (s *fakeStore) UpdateTask(_ context.Context, t model.ProvisionTask) error {

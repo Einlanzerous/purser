@@ -125,8 +125,20 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 	}
 }
 
-// Reconcile is a no-op today.
-func (c *Connector) Reconcile(ctx context.Context, in connector.Input) error { return nil }
+// Reconcile cannot run: Lyceum exposes only `POST /admin/users`, so the sole
+// "does this user exist?" signal is a 409 from an attempted create — and
+// creating is exactly what Reconcile must not do (SERV-54).
+//
+// Reporting Exists=false here would be worse than refusing: an audit would
+// claim everyone lacks Lyceum access, and a record-only backfill would write
+// nothing while looking like it succeeded. Lyceum needs a lookup endpoint
+// (`GET /admin/users?email=` or an id in the 409 body) — the same gap ARGY-163
+// closes for Argosy.
+func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connector.ReconcileResult, error) {
+	return connector.ReconcileResult{}, fmt.Errorf(
+		"%w: lyceum has no admin user-lookup endpoint (only POST /admin/users)",
+		connector.ErrReconcileUnsupported)
+}
 
 // Deprovision is not yet implemented (Phase 1 is invite-only).
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {

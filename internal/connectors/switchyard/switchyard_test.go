@@ -212,3 +212,66 @@ func TestAssignOne_PatchFallbackWhenAlreadyMember(t *testing.T) {
 		t.Error("expected PATCH fallback when POST returns 409")
 	}
 }
+
+// Reconcile must find the user by lookup and stop — never minting a token.
+// This is the property that makes a Switchyard backfill safe (SERV-54):
+// Provision would hand someone who already has access a second API token.
+func TestReconcile_FindsUserWithoutMintingAToken(t *testing.T) {
+	var mintCalls, createCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/users":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"items":[{"id":"u-42","name":"Ada","email":"ada@example.com"}],"page":{"next_cursor":null}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/tokens"):
+			mintCalls++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"t-1","token":"sw_SHOULD_NOT_HAPPEN"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/users":
+			createCalls++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"u-99","name":"Ada"}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Reconcile(context.Background(), connector.Input{PersonName: "Ada", Email: "ada@example.com"})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !res.Exists || res.ExternalID != "u-42" || res.Username != "Ada" {
+		t.Errorf("unexpected reconcile result: %+v", res)
+	}
+	if mintCalls != 0 {
+		t.Errorf("Reconcile minted %d token(s) — it must never mint", mintCalls)
+	}
+	if createCalls != 0 {
+		t.Errorf("Reconcile created %d user(s) — it must never create", createCalls)
+	}
+}
+
+func TestReconcile_ReportsAbsentUser(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("Reconcile must only read, got %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"items":[],"page":{"next_cursor":null}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	res, err := c.Reconcile(context.Background(), connector.Input{PersonName: "Ada", Email: "ada@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Exists {
+		t.Error("an empty user list should report Exists=false")
+	}
+}

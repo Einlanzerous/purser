@@ -3,6 +3,7 @@ package lyceum
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -89,5 +90,25 @@ func TestProvision_RequiresEmail(t *testing.T) {
 	c, _ := New(Config{BaseURL: "http://x", OwnerToken: "lyc_owner"})
 	if _, err := c.Provision(context.Background(), connector.Input{PersonName: "No Email"}); err == nil {
 		t.Error("expected error when email is missing")
+	}
+}
+
+// Lyceum has only POST /admin/users, so Reconcile must refuse rather than
+// probe by attempting a create (SERV-54).
+func TestReconcile_IsUnsupportedAndNeverCalls(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	_, err := c.Reconcile(context.Background(), connector.Input{Email: "ada@example.com"})
+	if !errors.Is(err, connector.ErrReconcileUnsupported) {
+		t.Fatalf("want ErrReconcileUnsupported, got %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("Reconcile must not touch the upstream API, got %d call(s)", calls)
 	}
 }

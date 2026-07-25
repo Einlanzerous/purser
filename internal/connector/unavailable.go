@@ -33,7 +33,12 @@ func (u *Unavailable) Provision(ctx context.Context, in Input) (Result, error) {
 	return Result{}, fmt.Errorf("%w: %s", ErrPending, u.Reason)
 }
 
-func (u *Unavailable) Reconcile(ctx context.Context, in Input) error { return nil }
+// Reconcile can't check anything for a connector that isn't configured. It
+// reports ErrPending rather than "not found", so an audit shows the service as
+// unknown instead of falsely claiming the person has no access.
+func (u *Unavailable) Reconcile(ctx context.Context, in Input) (ReconcileResult, error) {
+	return ReconcileResult{}, fmt.Errorf("%w: %s", ErrPending, u.Reason)
+}
 
 func (u *Unavailable) Deprovision(ctx context.Context, in Input) error {
 	return fmt.Errorf("%w: %s", ErrPending, u.Reason)
