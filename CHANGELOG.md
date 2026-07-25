@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/Einlanzerous/purser/compare/v0.6.0...v0.6.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **lyceum:** implement Reconcile — the lookup endpoint already exists (SERV-54) ([#9](https://github.com/Einlanzerous/purser/issues/9)) ([b68acfc](https://github.com/Einlanzerous/purser/commit/b68acfca73aecb15013fd22951c5248950c6c3b5))
+
 ## [0.6.0](https://github.com/Einlanzerous/purser/compare/v0.5.0...v0.6.0) (2026-07-25)
 
 
