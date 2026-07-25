@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/Einlanzerous/purser/compare/v0.5.0...v0.6.0) (2026-07-25)
+
+
+### Features
+
+* **audit:** reconcile / record-only mode (SERV-54) ([#7](https://github.com/Einlanzerous/purser/issues/7)) ([57f1d4d](https://github.com/Einlanzerous/purser/commit/57f1d4dc05e99226ee65c9338b8ed5891630f7c2))
+
 ## [0.5.0](https://github.com/Einlanzerous/purser/compare/v0.4.0...v0.5.0) (2026-07-25)
 
 
