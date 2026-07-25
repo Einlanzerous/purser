@@ -24,6 +24,7 @@ type fakeConn struct {
 	calls   int
 	fail    error // when non-nil, Provision returns this
 	result  connector.Result
+	lastIn  connector.Input // the most recent Provision input, for assertions
 }
 
 func (f *fakeConn) Key() string         { return f.key }
@@ -33,10 +34,17 @@ func (f *fakeConn) Provision(_ context.Context, in connector.Input) (connector.R
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	f.lastIn = in
 	if f.fail != nil {
 		return connector.Result{}, f.fail
 	}
 	return f.result, nil
+}
+
+func (f *fakeConn) lastInput() connector.Input {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastIn
 }
 func (f *fakeConn) Reconcile(context.Context, connector.Input) error   { return nil }
 func (f *fakeConn) Deprovision(context.Context, connector.Input) error { return nil }

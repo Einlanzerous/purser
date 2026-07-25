@@ -46,19 +46,38 @@ type Emailer interface {
 type Service struct {
 	store    Store
 	registry *connector.Registry
-	emailer  Emailer // may be nil when SMTP is unconfigured
+	emailer  Emailer   // may be nil when SMTP is unconfigured
+	bundles  BundleSet // named onboarding bundles; zero value = none configured
+}
+
+// Option customizes a Service at construction.
+type Option func(*Service)
+
+// WithBundles supplies the named onboarding bundles (SERV-47). Without it a
+// Service has no bundles and every request must name its services explicitly —
+// which is what the orchestrator tests rely on.
+func WithBundles(bs BundleSet) Option {
+	return func(s *Service) { s.bundles = bs }
 }
 
 // New builds an invite Service. emailer may be nil.
-func New(st Store, reg *connector.Registry, emailer Emailer) *Service {
-	return &Service{store: st, registry: reg, emailer: emailer}
+func New(st Store, reg *connector.Registry, emailer Emailer, opts ...Option) *Service {
+	s := &Service{store: st, registry: reg, emailer: emailer}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
+
+// Bundles exposes the configured bundles (for CLI help and the API surface).
+func (s *Service) Bundles() BundleSet { return s.bundles }
 
 // Request is a single invite: who, into which services, how to deliver.
 type Request struct {
 	Name     string
 	Email    string
-	Services []string // connector keys
+	Services []string // connector keys; combined with Bundle, see BundleSet.resolveServices
+	Bundle   string   // named bundle to expand; "" with no Services uses the default bundle
 	Role     string   // preset permission hint: "" (member) | "admin"
 	Delivery model.DeliveryMethod
 
@@ -94,17 +113,43 @@ type Result struct {
 	Person          model.Person
 	InviteID        uuid.UUID
 	Delivery        model.DeliveryMethod
+	Bundle          string // the bundle that supplied the service list, if any
 	Outcomes        []ServiceOutcome
 	CredentialBlock string // the copy-pasteable block
 	Delivered       bool   // true when an email was actually sent
 }
 
-// Validate checks a request against the registry before any writes.
+// resolve returns a copy of req with Services expanded from its bundle and any
+// bundle-default project grants applied. It also reports which bundle supplied
+// the list (empty when the request named its services explicitly). Callers that
+// need the final request use this; Validate uses it to check without mutating.
+func (s *Service) resolve(req Request) (Request, string, error) {
+	services, applied, err := s.bundles.resolveServices(req.Services, req.Bundle)
+	if err != nil {
+		return req, "", err
+	}
+	grants, err := s.bundles.projectsFor(applied, req.Projects)
+	if err != nil {
+		return req, "", err
+	}
+	req.Services = services
+	req.Projects = grants
+	return req, applied, nil
+}
+
+// Validate checks a request against the registry before any writes. It resolves
+// any bundle first, so an unknown bundle or a bundle naming an unregistered
+// service is caught here — i.e. reported as the caller's error rather than
+// failing midway through provisioning.
 func (s *Service) Validate(req Request) error {
 	if strings.TrimSpace(req.Name) == "" {
 		return errors.New("invite: name is required")
 	}
-	if len(req.Services) == 0 {
+	resolved, _, err := s.resolve(req)
+	if err != nil {
+		return err
+	}
+	if len(resolved.Services) == 0 {
 		return errors.New("invite: at least one service is required")
 	}
 	if req.Delivery == model.DeliverEmail && strings.TrimSpace(req.Email) == "" {
@@ -113,8 +158,12 @@ func (s *Service) Validate(req Request) error {
 	if req.Delivery == model.DeliverEmail && s.emailer == nil {
 		return errors.New("invite: email delivery requested but SMTP is not configured")
 	}
-	for _, key := range req.Services {
+	for _, key := range resolved.Services {
 		if _, ok := s.registry.Get(key); !ok {
+			if req.Bundle != "" {
+				return fmt.Errorf("invite: bundle %q names unknown service %q (known services: %s)",
+					req.Bundle, key, strings.Join(s.registry.Keys(), ", "))
+			}
 			return fmt.Errorf("invite: unknown service %q (known: %s)", key, strings.Join(s.registry.Keys(), ", "))
 		}
 	}
@@ -127,6 +176,13 @@ func (s *Service) Validate(req Request) error {
 // is recorded and the remaining services still run.
 func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 	if err := s.Validate(req); err != nil {
+		return nil, err
+	}
+	// Validate already proved this resolves; re-run it for the expanded request.
+	// appliedBundle is reported back so the operator can see which set was used
+	// — in particular that an unqualified invite got the default bundle.
+	req, appliedBundle, err := s.resolve(req)
+	if err != nil {
 		return nil, err
 	}
 	if req.Delivery == "" {
@@ -143,7 +199,7 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 		return nil, err
 	}
 
-	res := &Result{Person: person, InviteID: inv.ID, Delivery: req.Delivery}
+	res := &Result{Person: person, InviteID: inv.ID, Delivery: req.Delivery, Bundle: appliedBundle}
 
 	for _, key := range req.Services {
 		conn, _ := s.registry.Get(key) // validated

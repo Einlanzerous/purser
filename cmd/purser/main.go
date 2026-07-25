@@ -108,8 +108,22 @@ func setup(ctx context.Context) (*app, error) {
 		log.Printf("email delivery enabled via %s", cfg.SMTP.Host)
 	}
 
-	svc := invite.New(st, registry, emailer)
+	svc := invite.New(st, registry, emailer, invite.WithBundles(bundleSet(cfg)))
 	return &app{cfg: cfg, store: st, svc: svc, cleanup: pool.Close}, nil
+}
+
+// bundleSet converts the configured onboarding bundles into the orchestrator's
+// form (SERV-47). Kept here in the composition root so internal/config stays
+// dependency-free and the invite package doesn't read the environment.
+func bundleSet(cfg config.Config) invite.BundleSet {
+	bs := invite.BundleSet{
+		Named:   make(map[string]invite.Bundle, len(cfg.Bundles.Named)),
+		Default: cfg.Bundles.Default,
+	}
+	for name, b := range cfg.Bundles.Named {
+		bs.Named[name] = invite.Bundle{Services: b.Services, Projects: b.Projects}
+	}
+	return bs
 }
 
 // buildRegistry wires the connectors from config. Switchyard, Lyceum and Argosy

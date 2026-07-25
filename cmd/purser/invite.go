@@ -22,7 +22,8 @@ func runInvite(args []string) {
 	var (
 		name     = fs.String("name", "", "person's display name (required)")
 		email    = fs.String("email", "", "person's email (required for SSO + email delivery)")
-		to       = fs.String("to", "", "comma-separated services, e.g. switchyard,cloudflare (required)")
+		to       = fs.String("to", "", "comma-separated services, e.g. switchyard,cloudflare")
+		bundle   = fs.String("bundle", "", "named onboarding bundle to grant, e.g. media | all (see PURSER_BUNDLE_*)")
 		role     = fs.String("role", "member", "preset: member | admin (shortcut for --instance-role + --scopes)")
 		instRole = fs.String("instance-role", "", "Switchyard instance role: member | owner (overrides --role)")
 		scopes   = fs.String("scopes", "", "explicit token scopes, comma-separated (overrides --role's default)")
@@ -30,15 +31,20 @@ func runInvite(args []string) {
 		deliver  = fs.String("deliver", "copypaste", "delivery method: copypaste | email")
 	)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: purser invite --name NAME --email EMAIL --to svc1,svc2")
+		fmt.Fprintln(os.Stderr, "usage: purser invite --name NAME --email EMAIL [--to svc1,svc2] [--bundle NAME]")
 		fmt.Fprintln(os.Stderr, "       [--role member|admin] [--instance-role member|owner] [--scopes a,b,c]")
 		fmt.Fprintln(os.Stderr, "       [--projects '*:viewer,IDEA:editor'] [--deliver copypaste|email]")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "With neither --to nor --bundle, the default bundle is granted")
+		fmt.Fprintln(os.Stderr, "(PURSER_DEFAULT_BUNDLE). Passing both takes the union.")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
 
 	services := splitServices(*to)
-	if *name == "" || len(services) == 0 {
+	// --to and --bundle are both optional now: an invite with neither falls back
+	// to the default bundle, which is the common "welcome to the family" path.
+	if *name == "" {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -55,6 +61,7 @@ func runInvite(args []string) {
 		Name:         *name,
 		Email:        *email,
 		Services:     services,
+		Bundle:       *bundle,
 		Role:         *role,
 		InstanceRole: *instRole,
 		Scopes:       splitCSV(*scopes),
@@ -81,30 +88,28 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// parseProjects parses "*:viewer,IDEA:editor" into project grants. Malformed
-// entries are warned about and skipped.
+// parseProjects parses "*:viewer,IDEA:editor" into project grants, sharing the
+// parser with bundle definitions so a spec means the same thing in both places.
+// A malformed entry is fatal rather than skipped: silently dropping it would
+// provision the person at the wrong access level, which is worse than a retry.
 func parseProjects(s string) []connector.ProjectGrant {
-	var out []connector.ProjectGrant
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p == "" {
-			continue
-		}
-		key, role, ok := strings.Cut(p, ":")
-		key, role = strings.TrimSpace(key), strings.TrimSpace(role)
-		if !ok || key == "" || role == "" {
-			fmt.Fprintf(os.Stderr, "purser: ignoring malformed --projects entry %q (want KEY:ROLE)\n", p)
-			continue
-		}
-		out = append(out, connector.ProjectGrant{Key: key, Role: role})
+	grants, err := invite.ParseProjectGrants(s)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "purser: --projects: %v\n", err)
+		os.Exit(2)
 	}
-	return out
+	return grants
 }
 
 // printResult writes a human summary to stderr and the credential block to
 // stdout, so `purser invite … | pbcopy` (or piping to a file) captures exactly
 // the copy-pasteable block.
 func printResult(res *invite.Result) {
-	fmt.Fprintf(os.Stderr, "\ninvite %s for %s (delivery=%s)\n", res.InviteID, res.Person.Name, res.Delivery)
+	bundleNote := ""
+	if res.Bundle != "" {
+		bundleNote = fmt.Sprintf(" bundle=%s", res.Bundle)
+	}
+	fmt.Fprintf(os.Stderr, "\ninvite %s for %s (delivery=%s%s)\n", res.InviteID, res.Person.Name, res.Delivery, bundleNote)
 	for _, o := range res.Outcomes {
 		mark := statusMark(o)
 		fmt.Fprintf(os.Stderr, "  %s %-24s %s", mark, o.DisplayName, o.Status)
