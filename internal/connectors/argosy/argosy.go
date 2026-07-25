@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -122,12 +123,22 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 		// Already provisioned — accounts.email is UNIQUE upstream. Reconcile to
 		// success with no new secret, so a failed-only retry doesn't mint a
 		// second password for someone who already has one.
-		return connector.Result{
+		//
+		// ARGY-163 added the existing account to the 409 body, so this can record
+		// the real upstream id. Older Argosy builds send only {"error":…}; fall
+		// back to the email then rather than failing, since the conflict itself
+		// is still valid information.
+		out := connector.Result{
 			ExternalID:   email,
 			Username:     email,
 			LoginURL:     c.cfg.AppURL,
 			Instructions: "Already provisioned — the existing Argosy account and password remain valid.",
-		}, nil
+		}
+		var cr createResponse
+		if err := json.Unmarshal(raw, &cr); err == nil && cr.Account.ID != "" {
+			out.ExternalID = cr.Account.ID
+		}
+		return out, nil
 	case http.StatusUnauthorized:
 		return connector.Result{}, fmt.Errorf("argosy: 401 from /api/v1/admin/accounts — does PURSER_ARGOSY_PROVISION_TOKEN match the argosy service's ARGOSY_PROVISION_TOKEN? (%s)", bodyMsg(raw))
 	case http.StatusNotFound:
@@ -137,18 +148,45 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 	}
 }
 
-// Reconcile cannot run: Argosy exposes only `POST /api/v1/admin/accounts`, so
-// the sole "does this account exist?" signal is a 409 from an attempted
-// create — and creating is exactly what Reconcile must not do (SERV-54).
+// Reconcile reports whether the Argosy account already exists, via the
+// read-only lookup ARGY-163 added (SERV-54).
 //
-// Reporting Exists=false would be actively harmful: it would claim people who
-// demonstrably have Argosy accounts don't, which is the very drift this is
-// meant to detect. ARGY-163 adds the existing account id to the 409 body; a
-// lookup endpoint (`GET /api/v1/admin/accounts?email=`) would close it fully.
+// This was the last connector that couldn't be checked: Argosy's admin API used
+// to be create-only, so the only existence signal was a 409 from an attempted
+// create — which Reconcile must never do. `GET /api/v1/admin/accounts?email=`
+// closes that, gated on the same X-Provision-Token and matching email
+// case-insensitively.
 func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connector.ReconcileResult, error) {
-	return connector.ReconcileResult{}, fmt.Errorf(
-		"%w: argosy has no admin account-lookup endpoint (only POST /api/v1/admin/accounts, see ARGY-163)",
-		connector.ErrReconcileUnsupported)
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	if email == "" {
+		return connector.ReconcileResult{}, errors.New("argosy: an email is required to reconcile")
+	}
+
+	status, raw, err := c.do(ctx, http.MethodGet,
+		"/api/v1/admin/accounts?email="+url.QueryEscape(email), nil)
+	if err != nil {
+		return connector.ReconcileResult{}, err
+	}
+	switch status {
+	case http.StatusOK:
+		var lr createResponse // {account:{id,name}} — same shape as create
+		if err := json.Unmarshal(raw, &lr); err != nil {
+			return connector.ReconcileResult{}, fmt.Errorf("argosy: decode lookup response: %w", err)
+		}
+		return connector.ReconcileResult{
+			Exists: true, ExternalID: lr.Account.ID, Username: email,
+		}, nil
+	case http.StatusNotFound:
+		// A 404 here is a genuine "no such account" — distinct from the route
+		// itself being unregistered, which answers 404 on the *create* path when
+		// ARGOSY_PROVISION_TOKEN is unset. The token is required to reach this
+		// handler at all, so an unconfigured server 401s first.
+		return connector.ReconcileResult{Exists: false}, nil
+	case http.StatusUnauthorized:
+		return connector.ReconcileResult{}, fmt.Errorf("argosy: 401 from the account lookup — does PURSER_ARGOSY_PROVISION_TOKEN match the argosy service's ARGOSY_PROVISION_TOKEN? (%s)", bodyMsg(raw))
+	default:
+		return connector.ReconcileResult{}, apiError("lookup account", status, raw)
+	}
 }
 
 // Deprovision is not yet implemented (Phase 1 is invite-only). Argosy has no
