@@ -125,19 +125,46 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 	}
 }
 
-// Reconcile cannot run: Lyceum exposes only `POST /admin/users`, so the sole
-// "does this user exist?" signal is a 409 from an attempted create — and
-// creating is exactly what Reconcile must not do (SERV-54).
+// Reconcile reports whether the Lyceum user already exists, by listing the
+// household via `GET /admin/users` — read-only, and it neither creates a user
+// nor mints an invite token (SERV-54).
 //
-// Reporting Exists=false here would be worse than refusing: an audit would
-// claim everyone lacks Lyceum access, and a record-only backfill would write
-// nothing while looking like it succeeded. Lyceum needs a lookup endpoint
-// (`GET /admin/users?email=` or an id in the 409 body) — the same gap ARGY-163
-// closes for Argosy.
+// Lyceum's admin surface is richer than the create call this connector used to
+// rely on: it also exposes list, per-user invite, and delete. Only the list is
+// needed here.
 func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connector.ReconcileResult, error) {
-	return connector.ReconcileResult{}, fmt.Errorf(
-		"%w: lyceum has no admin user-lookup endpoint (only POST /admin/users)",
-		connector.ErrReconcileUnsupported)
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	if email == "" {
+		return connector.ReconcileResult{}, errors.New("lyceum: an email is required to reconcile")
+	}
+
+	status, raw, err := c.do(ctx, http.MethodGet, "/admin/users", nil)
+	if err != nil {
+		return connector.ReconcileResult{}, err
+	}
+	switch status {
+	case http.StatusOK:
+		var members []struct {
+			ID          json.Number `json:"id"`
+			Email       string      `json:"email"`
+			DisplayName string      `json:"display_name"`
+		}
+		if err := json.Unmarshal(raw, &members); err != nil {
+			return connector.ReconcileResult{}, fmt.Errorf("lyceum: decode user list: %w", err)
+		}
+		for _, m := range members {
+			if strings.EqualFold(strings.TrimSpace(m.Email), email) {
+				return connector.ReconcileResult{
+					Exists: true, ExternalID: m.ID.String(), Username: m.DisplayName,
+				}, nil
+			}
+		}
+		return connector.ReconcileResult{Exists: false}, nil
+	case http.StatusForbidden:
+		return connector.ReconcileResult{}, fmt.Errorf("lyceum: 403 from /admin/users — is LYCEUM_AUTH=true and is PURSER_LYCEUM_OWNER_TOKEN an owner session token? (%s)", bodyMsg(raw))
+	default:
+		return connector.ReconcileResult{}, apiError("list users", status, raw)
+	}
 }
 
 // Deprovision is not yet implemented (Phase 1 is invite-only).
