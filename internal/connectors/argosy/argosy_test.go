@@ -3,7 +3,6 @@ package argosy
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -147,23 +146,110 @@ func TestProvision_RequiresEmail(t *testing.T) {
 	}
 }
 
-// Argosy exposes only a create endpoint, so Reconcile must refuse rather than
-// infer absence — claiming people who demonstrably have accounts don't have
-// them is exactly the drift the audit exists to find (SERV-54, ARGY-163).
-func TestReconcile_IsUnsupportedAndNeverCalls(t *testing.T) {
-	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		w.WriteHeader(http.StatusCreated)
+// Reconcile uses the read-only lookup (ARGY-163): no account created.
+func TestReconcile_FindsAccountViaLookup(t *testing.T) {
+	var writes int
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writes++
+			t.Errorf("Reconcile must only read, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/v1/admin/accounts" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Provision-Token"); got != "prov_secret" {
+			t.Errorf("provision token header: %q", got)
+		}
+		gotQuery = r.URL.Query().Get("email")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"account":{"id":"acct-uuid","name":"Mara"}}`))
 	}))
 	defer srv.Close()
 
 	c, _ := New(Config{BaseURL: srv.URL, ProvisionToken: "prov_secret"})
-	_, err := c.Reconcile(context.Background(), connector.Input{Email: "ada@example.com"})
-	if !errors.Is(err, connector.ErrReconcileUnsupported) {
-		t.Fatalf("want ErrReconcileUnsupported, got %v", err)
+	res, err := c.Reconcile(context.Background(), connector.Input{Email: "Mara@Example.com"})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
 	}
-	if calls != 0 {
-		t.Errorf("Reconcile must not touch the upstream API, got %d call(s)", calls)
+	if gotQuery != "mara@example.com" {
+		t.Errorf("email should be lowercased in the query, got %q", gotQuery)
+	}
+	if !res.Exists || res.ExternalID != "acct-uuid" {
+		t.Errorf("unexpected result: %+v", res)
+	}
+	if writes != 0 {
+		t.Errorf("Reconcile performed %d write(s)", writes)
+	}
+}
+
+func TestReconcile_404IsAbsentNotAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, ProvisionToken: "prov_secret"})
+	res, err := c.Reconcile(context.Background(), connector.Input{Email: "mara@example.com"})
+	if err != nil {
+		t.Fatalf("a 404 from the lookup means absent, not an error: %v", err)
+	}
+	if res.Exists {
+		t.Error("404 should report Exists=false")
+	}
+}
+
+func TestReconcile_401NamesTheTokenMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"invalid provisioning token"}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, ProvisionToken: "wrong"})
+	_, err := c.Reconcile(context.Background(), connector.Input{Email: "mara@example.com"})
+	if err == nil || !strings.Contains(err.Error(), "ARGOSY_PROVISION_TOKEN") {
+		t.Fatalf("401 should point at the token mismatch, got %v", err)
+	}
+}
+
+// ARGY-163 also put the existing account in the create 409, so the conflict
+// path can record the real upstream id instead of falling back to the email.
+func TestProvision_ConflictRecordsTheRealAccountID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"account":{"id":"acct-uuid","name":"Mara"},"error":"an account with that email already exists"}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, ProvisionToken: "prov_secret"})
+	res, err := c.Provision(context.Background(), connector.Input{Email: "mara@example.com", PersonName: "Mara"})
+	if err != nil {
+		t.Fatalf("409 should reconcile to success: %v", err)
+	}
+	if res.ExternalID != "acct-uuid" {
+		t.Errorf("conflict should record the upstream id, got %q", res.ExternalID)
+	}
+	if res.Secret != "" {
+		t.Errorf("conflict must not mint a password, got %q", res.Secret)
+	}
+}
+
+// Older Argosy builds send only {"error":…} on 409 — still usable.
+func TestProvision_ConflictFallsBackToEmailWhenNoAccountInBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"an account with that email already exists"}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, ProvisionToken: "prov_secret"})
+	res, err := c.Provision(context.Background(), connector.Input{Email: "mara@example.com", PersonName: "Mara"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExternalID != "mara@example.com" {
+		t.Errorf("should fall back to the email, got %q", res.ExternalID)
 	}
 }
