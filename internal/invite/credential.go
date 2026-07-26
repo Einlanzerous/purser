@@ -8,21 +8,31 @@ import (
 	"github.com/Einlanzerous/purser/internal/model"
 )
 
+// accessServiceKey is the connector whose grant puts a person into Cloudflare's
+// App Launcher. Named here as a string rather than imported from the connector
+// package: the orchestrator deals in service keys throughout (bundles are plain
+// key lists), and depending on one concrete connector would undo the point of
+// the interface.
+const accessServiceKey = "cloudflare"
+
 // RenderCredentialBlock builds the copy-pasteable message an operator hands to
-// the invited person (or that Purser emails them). It lists, per service, the
-// login URL, any one-time secret, and how to sign in — including the Cloudflare
-// Access email-OTP flow when a service grants SSO access.
+// the invited person (or that Purser emails them). It leads with the launcher —
+// the one page listing every app they can reach — and then gives the per-service
+// login URL, any one-time secret, and how to sign in.
+//
+// launcher is Cloudflare's App Launcher URL, and is shown only when this invite
+// actually granted Access (see hasAccessGrant). Pointing someone at it without
+// that grant renders them an empty page, which is worse than not linking it.
 //
 // The block is plain text on purpose: it pastes cleanly into Discord, Slack,
 // SMS, or an email body with no rendering surprises.
-func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome) string {
+func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome, launcher string) string {
 	var b strings.Builder
 
 	greeting := "there"
 	if n := strings.TrimSpace(person.Name); n != "" {
 		greeting = strings.Fields(n)[0]
 	}
-	fmt.Fprintf(&b, "Hi %s — you've been granted access to the following:\n", greeting)
 
 	var (
 		succeeded []ServiceOutcome
@@ -38,6 +48,23 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome) strin
 		case model.TaskFailed:
 			failed = append(failed, o)
 		}
+	}
+
+	launcher = strings.TrimSpace(launcher)
+	showLauncher := launcher != "" && hasAccessGrant(succeeded, skipped)
+
+	if showLauncher {
+		fmt.Fprintf(&b, "Hi %s — you've been granted access to the Construct.\n\n", greeting)
+		fmt.Fprintf(&b, "🚀 Start here: %s\n", launcher)
+		if email := strings.TrimSpace(person.Email); email != "" {
+			fmt.Fprintf(&b, "    Sign in with the email one-time-PIN sent to %s — no password.\n", email)
+		} else {
+			b.WriteString("    Sign in with the email one-time-PIN — no password.\n")
+		}
+		b.WriteString("    Every app you can reach is listed on that page.\n")
+		b.WriteString("\nPer-app details, including anything the launcher can't sign you into:\n")
+	} else {
+		fmt.Fprintf(&b, "Hi %s — you've been granted access to the following:\n", greeting)
 	}
 
 	for _, o := range succeeded {
@@ -89,6 +116,23 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome) strin
 	}
 
 	return b.String()
+}
+
+// hasAccessGrant reports whether this invite left the person inside the
+// Cloudflare Access group, which is what makes the App Launcher useful to them.
+//
+// "Skipped" counts: it means they already had the grant, so the launcher works.
+// A *failed* cloudflare task deliberately does not — they can't sign in yet, and
+// linking a page that will reject them reads as a broken invite.
+func hasAccessGrant(succeeded, skipped []ServiceOutcome) bool {
+	for _, group := range [][]ServiceOutcome{succeeded, skipped} {
+		for _, o := range group {
+			if o.ServiceKey == accessServiceKey {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // marker returns the service's emoji, or a bullet fallback when it has none.

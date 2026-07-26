@@ -170,6 +170,23 @@ type CloudflareConfig struct {
 	GroupName  string // PURSER_CF_ACCESS_GROUP_NAME
 	TeamDomain string // PURSER_CF_TEAM_DOMAIN
 	AppsNote   string // PURSER_CF_APPS_NOTE
+	Launcher   string // PURSER_LAUNCHER_URL; empty => derived from TeamDomain
+}
+
+// LauncherURL is Cloudflare's App Launcher — the one page listing every
+// Access-gated app a person can reach. It defaults to the team domain, so the
+// launcher works with no configuration beyond what the connector already needs.
+//
+// Empty means "don't mention a launcher": with no team domain there is nothing
+// to point anyone at, and a blank link is worse than none.
+func (c CloudflareConfig) LauncherURL() string {
+	if u := strings.TrimSpace(c.Launcher); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	if d := strings.TrimSpace(c.TeamDomain); d != "" {
+		return "https://" + strings.TrimRight(d, "/")
+	}
+	return ""
 }
 
 // SMTPConfig configures email delivery.
@@ -203,6 +220,7 @@ func Load() Config {
 			GroupName:  envOr("PURSER_CF_ACCESS_GROUP_NAME", "zerogravity-members"),
 			TeamDomain: envOr("PURSER_CF_TEAM_DOMAIN", "zero-gravity-industries.cloudflareaccess.com"),
 			AppsNote:   envOr("PURSER_CF_APPS_NOTE", "Switchyard and the other tunneled Construct apps"),
+			Launcher:   os.Getenv("PURSER_LAUNCHER_URL"),
 		},
 		Lyceum: LyceumConfig{
 			BaseURL:    envOr("PURSER_LYCEUM_BASE_URL", "http://lyceum:4005"),

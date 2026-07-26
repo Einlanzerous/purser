@@ -33,6 +33,9 @@
       - PURSER_CF_ACCESS_GROUP_ID=${PURSER_CF_ACCESS_GROUP_ID:-}
       - PURSER_CF_ACCESS_GROUP_NAME=zerogravity-members
       - PURSER_CF_TEAM_DOMAIN=zero-gravity-industries.cloudflareaccess.com
+      # App Launcher the credential block leads with (Access-granted invites
+      # only). Defaults to https:// + the team domain above.
+      - PURSER_LAUNCHER_URL=${PURSER_LAUNCHER_URL:-}
       # Lyceum connector (create user + mint invite). Needs an owner *session*
       # token — redeem a `lyceum mint-token` invite via POST /auth/session; a
       # LYCEUM_API_TOKENS entry can't reach /admin. The lyceum service must also

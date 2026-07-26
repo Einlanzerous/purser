@@ -21,7 +21,13 @@ invite 738258c0-… for Ada Lovelace (delivery=copypaste)
   ✓ Cloudflare Access (SSO)  succeeded
 
 --- credential block (stdout) ---
-Hi Ada — you've been granted access to the following:
+Hi Ada — you've been granted access to the Construct.
+
+🚀 Start here: https://zero-gravity-industries.cloudflareaccess.com
+    Sign in with the email one-time-PIN sent to ada@example.com — no password.
+    Every app you can reach is listed on that page.
+
+Per-app details, including anything the launcher can't sign you into:
 
 🚉 Switchyard
     URL:      https://switchyard.zerogravity.industries
@@ -167,6 +173,26 @@ the union ("the family set, plus this one extra"). Since idempotency is per
 construction — already-provisioned services are skipped and no fresh secret is
 minted.
 
+## The launcher
+
+The credential block leads with **Cloudflare's App Launcher** — the one page
+listing every Access-gated app a person can reach — instead of making them keep
+a list of URLs. It's free: Cloudflare already renders it at the team domain, so
+Purser gains no public surface and stays internal-only.
+
+It appears **only when the invite granted Cloudflare Access**. The launcher lists
+Access apps, so pointing an Argosy-only invitee at it would render them an empty
+page; those invites fall back to the plain per-service list. A *failed* Access
+grant doesn't count either — they can't sign in yet, and a link that rejects them
+reads as a broken invite. An already-provisioned (skipped) grant does count.
+
+Direct-path apps still deliver their credentials inline — that's precisely why
+the launcher can't be the whole message. Argosy's one-time password appears under
+its own heading in the same block.
+
+`PURSER_LAUNCHER_URL` overrides the address; unset it defaults to `https://` +
+`PURSER_CF_TEAM_DOMAIN`, so this works with no new configuration.
+
 ## Usage
 
 ### CLI
@@ -252,7 +278,7 @@ for `email` the secrets go to the recipient and are not echoed over HTTP.
 Env vars, `PURSER_`-prefixed, with a `DATABASE_URL` fallback — see
 [`.env.example`](.env.example). Key ones: `PURSER_DATABASE_URL`,
 `PURSER_API_TOKEN`, `PURSER_SWITCHYARD_TOKEN`, `PURSER_LYCEUM_OWNER_TOKEN`,
-`PURSER_CF_*`, `PURSER_SMTP_*`.
+`PURSER_CF_*`, `PURSER_LAUNCHER_URL`, `PURSER_SMTP_*`.
 
 Each connector registers as Unavailable rather than failing when its
 credentials are absent, so a partial config is safe — `--to` a service with no

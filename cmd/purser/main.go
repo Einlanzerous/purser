@@ -114,7 +114,10 @@ func setup(ctx context.Context) (*app, error) {
 		log.Printf("email delivery enabled via %s", cfg.SMTP.Host)
 	}
 
-	svc := invite.New(st, registry, emailer, invite.WithBundles(bundleSet(cfg)))
+	svc := invite.New(st, registry, emailer,
+		invite.WithBundles(bundleSet(cfg)),
+		invite.WithLauncher(cfg.Cloudflare.LauncherURL()),
+	)
 	return &app{cfg: cfg, store: st, svc: svc, cleanup: pool.Close}, nil
 }
 

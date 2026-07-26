@@ -90,3 +90,29 @@ func TestLoadBundles_DefaultOverridable(t *testing.T) {
 		t.Errorf("PURSER_DEFAULT_BUNDLE should win, got %q", got)
 	}
 }
+
+func TestLauncherURL_DerivesFromTeamDomain(t *testing.T) {
+	c := CloudflareConfig{TeamDomain: "zero-gravity-industries.cloudflareaccess.com"}
+	if got := c.LauncherURL(); got != "https://zero-gravity-industries.cloudflareaccess.com" {
+		t.Errorf("LauncherURL() = %q", got)
+	}
+}
+
+func TestLauncherURL_ExplicitOverrides(t *testing.T) {
+	c := CloudflareConfig{
+		TeamDomain: "zero-gravity-industries.cloudflareaccess.com",
+		Launcher:   "https://launch.example.com/",
+	}
+	// Trailing slash trimmed so the URL reads cleanly in the credential block.
+	if got := c.LauncherURL(); got != "https://launch.example.com" {
+		t.Errorf("LauncherURL() = %q", got)
+	}
+}
+
+// No team domain and no override means there is nothing to point anyone at; a
+// blank link in the credential block is worse than no link.
+func TestLauncherURL_EmptyWhenNothingConfigured(t *testing.T) {
+	if got := (CloudflareConfig{}).LauncherURL(); got != "" {
+		t.Errorf("LauncherURL() = %q, want empty", got)
+	}
+}
