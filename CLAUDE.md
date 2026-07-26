@@ -6,6 +6,10 @@ SSO, and returns a copy-pasteable credential block (or emails it). Single static
 Go binary (CLI + thin HTTP API), sibling to the other construct-server Go
 services. See `docs/architecture.md` for the full design (IDEA-14 reference).
 
+Tracked in Switchyard under the **PRSR** project (epic `PRSR-1`). It graduated
+there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
+`SERV-` reference in an older commit or comment as historical.
+
 ## Layout
 
 - `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `migrate`,
@@ -36,7 +40,7 @@ services. See `docs/architecture.md` for the full design (IDEA-14 reference).
 
 - **Idempotency is per (person × service).** `account` has `UNIQUE(person_id,
   service_id)`; the orchestrator skips services with an active account and
-  retries only failed ones. Keep it that way. Bundles (SERV-47) rely on this —
+  retries only failed ones. Keep it that way. Bundles (PRSR-12) rely on this —
   a bundle is only a named service list, so overlapping bundles and re-invites
   are safe without any bundle-specific logic. Don't give bundles their own
   provisioning path.
@@ -74,5 +78,16 @@ services. See `docs/architecture.md` for the full design (IDEA-14 reference).
 
 Phase 0+1 (schema + Switchyard connector) plus the owner-requested Cloudflare
 Access connector and email/copy-paste delivery. All four connectors are live:
-`switchyard`, `cloudflare`, `lyceum` (SERV-42) and `argosy` (SERV-50) — each of
+`switchyard`, `cloudflare`, `lyceum` (PRSR-10) and `argosy` (PRSR-13) — each of
 the three token-gated ones registers Unavailable when its token is unset.
+
+Also shipped: onboarding bundles + the launcher-led credential block (PRSR-12),
+and `audit` / `reconcile` (PRSR-15), which retired 15 (person × service) pairs of
+real drift with zero upstream mutation.
+
+Open, in rough priority order: `Deprovision` is unimplemented on every connector
+but Cloudflare (PRSR-17) — so `stale` can re-arm provisioning but cannot revoke;
+there's no way to add a person without provisioning them (PRSR-16); nothing runs
+the audit on a schedule (PRSR-18); Purser still authenticates to Switchyard as
+the instance bootstrap token rather than a dedicated one (PRSR-3); and service
+spin-up is a separate axis, not started (PRSR-11).
