@@ -50,7 +50,7 @@
       - PURSER_ARGOSY_BASE_URL=http://argosy:8096
       - PURSER_ARGOSY_PROVISION_TOKEN=${ARGOSY_PROVISION_TOKEN:-}
       - PURSER_ARGOSY_URL=https://argosy.zerogravity.industries
-      # Onboarding bundles (SERV-47). Omitted => the built-in media/all sets.
+      # Onboarding bundles (PRSR-12). Omitted => the built-in media/all sets.
       # Defining ANY PURSER_BUNDLE_* replaces the built-ins wholesale, so list
       # them all if you override. Bundles grant *:user on Switchyard projects by
       # default (project role, not instance role).
