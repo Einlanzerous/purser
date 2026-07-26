@@ -14,10 +14,11 @@ The Construct's apps do not share a user model:
 
 - **Switchyard** (Jira replacement) has its own `users` table + API tokens, and
   logs people in via Cloudflare Access SSO (email → `users.email`).
-- **Argosy** (media server) has accounts (username + password) → profiles →
-  device bearer tokens, on the *direct* (non-tunnelled) path — its own login, no
-  Cloudflare Access.
-- **Lyceum** (ebooks) has no per-user account model yet.
+- **Argosy** (media server) has accounts (email + password, post-ARGY-159) →
+  profiles → device bearer tokens, on the *direct* (non-tunnelled) path — its own
+  login, no Cloudflare Access.
+- **Lyceum** (ebooks) has per-user accounts (LYCM-804) and sits behind the same
+  Access gate as Switchyard, matching the verified email to its own user record.
 
 Onboarding a person means touching each system by hand, plus adding their email
 to the Cloudflare Access gate. Purser collapses that into one command.
@@ -38,10 +39,23 @@ purser invite --name "Ada Lovelace" --email ada@example.com \
 Each service hides its own user model behind a `Connector`:
 
 ```go
-Provision(ctx, Input) (Result, error)   // create/ensure the account, return a one-time secret
-Reconcile(ctx, Input) error             // repair drift (idempotent)
-Deprovision(ctx, Input) error           // remove access (stubbed in Phase 1)
+Provision(ctx, Input) (Result, error)             // create/ensure the account, return a one-time secret
+Reconcile(ctx, Input) (ReconcileResult, error)    // READ-ONLY: does this person already have access?
+Deprovision(ctx, Input) error                     // remove access (unimplemented — PRSR-17)
 ```
+
+**`Reconcile` must never mutate.** No create, no mint, no rotate, no revoke — it
+answers "what does this person already have?" and nothing else. That constraint
+is the whole point: a version that repairs as a side effect cannot be used to
+audit, because running it destroys the drift it exists to report. It is what
+makes the audit safe to run against real people at any time.
+
+A connector whose upstream has no lookup endpoint returns
+`ErrReconcileUnsupported` rather than inferring absence. Reporting "no" for a
+question you cannot answer would claim people lack access they demonstrably
+have — manufacturing exactly the drift the audit exists to find. Nothing is in
+that state today (all four have lookups), but the contract keeps a future
+connector honest.
 
 | Connector    | What it does                                                        | Status |
 |--------------|---------------------------------------------------------------------|--------|
@@ -66,14 +80,15 @@ through Cloudflare Access. Purser does exactly these two things.
 
 The Zero Gravity edge uses Cloudflare's **built-in email one-time-PIN IdP** with
 **Allow-by-email** policies, team domain
-`zero-gravity-industries.cloudflareaccess.com`. Today, adding a person is a
-manual dashboard operation — the host has a tunnel token and a DNS-01 token but
-**no Access-scoped API token**. The `cloudflare` connector is written against
-the real Cloudflare Access API and works the moment such a token + a shared
-Access group are provisioned (see the SERV follow-up ticket); until then it
-degrades to printing the exact manual step. Recommended model: one shared Access
-**group** referenced by every app's policy, so a single grant covers all apps
-and Purser has one place to add/remove people.
+`zero-gravity-industries.cloudflareaccess.com`.
+
+Grants are **programmatic as of PRSR-4**: an Access-scoped API token and the
+shared group `zerogravity-members` exist, and every tunnelled app's policy
+references that group — so one grant covers all of them and Purser has a single
+place to add or remove people. `purser invite --to cloudflare` adds the email to
+the group idempotently. With the token absent the connector still degrades to
+printing the exact manual dashboard step, which is what keeps a partial config
+safe rather than half-provisioning someone.
 
 ## Data model
 
@@ -83,7 +98,9 @@ and Purser has one place to add/remove people.
 - `service` — target systems, seeded from the connector registry on boot.
 - `account` — durable "person P has access to service S"; **unique (person,
   service)** — the idempotency key. Secrets are never stored plaintext, only a
-  sha256 hash (`secret_ref` is reserved for a future vault).
+  sha256 hash (`secret_ref` is reserved for a future vault). `status` is
+  `active | stale | deprovisioned`; `stale` was added by `0002` (see
+  [Audit & reconcile](#audit--reconcile)).
 - `invite` — one provisioning run for a person across services.
 - `provision_task` — one service's slice of an invite; tracks attempts +
   last_error so a re-run retries only what failed.
@@ -96,12 +113,82 @@ duplicate upstream user, no fresh secret — while a previously-failed service i
 retried. Per-service connector failures never abort the whole invite; they are
 recorded and surfaced in the credential block's operator note.
 
+## Onboarding bundles
+
+The dominant invite is not "here's access to app X" but "welcome to the family."
+A **bundle** is a named service set, so that's one flag or none:
+
+| Bundle | Services | For |
+|---|---|---|
+| `media` (default) | `cloudflare`, `lyceum`, `argosy` | Household members who just want to watch and read |
+| `all` | `cloudflare`, `switchyard`, `lyceum`, `argosy` | People who'd use Switchyard too |
+
+Cloudflare is in both because Lyceum sits behind the Access gate: the app account
+without the Access entry strands the person at the edge. `media` is the default
+deliberately — it's the smaller grant, so an unqualified invite can't hand out
+Switchyard by accident.
+
+**A bundle is only a named list**, expanded into the existing per-service
+orchestration. It introduces no new provisioning path and no new idempotency
+rules, which is what makes overlapping bundles, a bundle overlapping an explicit
+`--to`, and re-inviting someone who already has half the set all safe by
+construction. Giving bundles their own provisioning path would forfeit that.
+
+A bundle grants `*:user` — Switchyard's **project membership** role, not the
+instance role, which stays at its preset. Those are independent axes: a bundle
+widens what you can see, it does not escalate privilege.
+
+Bundles are env-configured (`PURSER_BUNDLE_*`). Defining any bundle replaces the
+built-ins wholesale rather than merging, so a partial override can't silently
+inherit half a default set.
+
+## Audit & reconcile
+
+`account` rows record what **Purser provisioned** — not who actually has access.
+Those diverge whenever someone is set up by hand or an upstream account is
+deleted. `purser audit` compares the two through each connector's read-only
+`Reconcile`; `purser reconcile` applies the same findings. One code path, so the
+dry run is exactly what the repair does.
+
+| situation | action |
+|---|---|
+| upstream has it, Purser doesn't | write an `account` row (no secret — Purser never learned theirs) |
+| Purser has it, upstream doesn't | mark the row `stale` |
+
+`stale` matters more than it looks. Idempotency keys on **active**, so a row left
+active with no upstream account means the orchestrator skips that person forever
+and no invite can ever fix them. Marking it stale re-arms provisioning.
+
+Three guardrails, because an audit that damages records is worse than no audit:
+
+- **Never treat unverifiable as absent.** `UpstreamUnknown` is deliberately
+  distinct from `UpstreamNo` throughout.
+- **A failed connector call never marks anything stale** — a transient outage
+  would otherwise wipe out everyone's access records.
+- **Rows already in agreement are never rewritten**, preserving `secret_hash` on
+  genuinely Purser-provisioned accounts.
+
+Why this is not just a re-invite: re-inviting someone who already has Switchyard
+mints them a *second* API token. Reconcile mints nothing and contacts nobody.
+
 ## Delivery
 
 The credential block is plain text (pastes cleanly into any chat platform).
 `--deliver copypaste` (default) returns it for the operator to paste;
 `--deliver email` sends it over SMTP to the person. One-time secrets appear once
 and are never retrievable afterward.
+
+The block **leads with Cloudflare's App Launcher** — the one page listing every
+Access-gated app a person can reach — and then gives per-service detail. That
+page is Cloudflare's, rendered at the team domain, so Purser gains no public
+surface and stays internal-only.
+
+The link is conditional: the launcher lists *Access* apps, so it appears only for
+invites that actually granted Access. An Argosy-only invitee would otherwise be
+sent to an empty page, and a *failed* Access grant doesn't count either — a link
+that rejects them reads as a broken invite. Direct-path apps deliver their
+secrets inline in the same block, which is precisely what the launcher cannot
+carry through.
 
 ## Security notes
 
@@ -113,15 +200,40 @@ and are never retrievable afterward.
 
 ## Phasing
 
-- **Phase 0+1 (this repo, IDEA-14):** spine — schema, connector interface,
-  Switchyard connector, idempotent invites, credential block. **Extended per the
-  owner's ask** with the Cloudflare Access connector and email/copy-paste
-  delivery.
-- **Follow-ups (SERV/ARGY tickets):** provision the Cloudflare Access API token
-  + shared group; Argosy admin create-account endpoint + connector; Lyceum
-  account model + connector; Deprovision; a web UI.
+Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
 
-## Future direction: service spin-up (SERV-46)
+**Delivered:**
+
+- **Phase 0+1:** spine — schema, connector interface, Switchyard connector,
+  idempotent invites, credential block. Extended per the owner's ask with the
+  Cloudflare Access connector and email/copy-paste delivery.
+- **All four connectors live** — `switchyard`, `cloudflare`, `lyceum` (PRSR-6 /
+  PRSR-10), `argosy` (PRSR-13). Each token-gated one registers Unavailable when
+  its credential is unset.
+- **Permissions:** project memberships at invite time (PRSR-7), explicit
+  `--instance-role` + `--scopes` (PRSR-9).
+- **Onboarding bundles** (PRSR-12) and the launcher-led credential block.
+- **Audit & reconcile** (PRSR-15), which retired 15 (person × service) pairs of
+  real drift with zero upstream mutation (PRSR-14).
+
+**Open:**
+
+- **PRSR-17 — Deprovision.** Declared on the interface, unimplemented on every
+  connector except Cloudflare. Purser can onboard across the stack in one command
+  and cannot remove anyone. This is why `stale` currently means "re-arm
+  provisioning" and cannot mean "revoke".
+- **PRSR-16 — add a person without provisioning them.** Every path to a `person`
+  row goes through `invite`, so anyone onboarded outside Purser is invisible to
+  the audit until someone hand-inserts them.
+- **PRSR-18 — run the audit on a schedule.** It exists and nothing triggers it,
+  so drift will reaccumulate and be found the same way it was last time: by
+  accident.
+- **PRSR-3 — a dedicated Switchyard provisioning token.** Purser currently
+  authenticates as the instance bootstrap token: functional, but not attributable
+  and not independently revocable.
+- **PRSR-11 — service spin-up** (below).
+
+## Future direction: service spin-up (PRSR-11)
 
 Everything above provisions **people into existing services** (the person ×
 service axis). A separate, larger direction is standing up the Cloudflare edge
@@ -147,4 +259,4 @@ reusing the existing CF API client, registry, store, and idempotency ethos.
   Argosy sidesteps it entirely — it's on the *direct / non-tunnelled* path, so
   its spin-up is DNS-to-static-IP + Access app only, and is the natural pilot.
 
-See SERV-46 for the full assessment and the proposed epic breakdown.
+See PRSR-11 for the full assessment and the proposed epic breakdown.
