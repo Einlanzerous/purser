@@ -90,3 +90,61 @@ func TestLoadBundles_DefaultOverridable(t *testing.T) {
 		t.Errorf("PURSER_DEFAULT_BUNDLE should win, got %q", got)
 	}
 }
+
+func TestLauncherURL_DerivesFromTeamDomain(t *testing.T) {
+	c := CloudflareConfig{TeamDomain: "zero-gravity-industries.cloudflareaccess.com"}
+	if got := c.LauncherURL(); got != "https://zero-gravity-industries.cloudflareaccess.com" {
+		t.Errorf("LauncherURL() = %q", got)
+	}
+}
+
+func TestLauncherURL_ExplicitOverrides(t *testing.T) {
+	c := CloudflareConfig{
+		TeamDomain: "zero-gravity-industries.cloudflareaccess.com",
+		Launcher:   "https://launch.example.com/",
+	}
+	// Trailing slash trimmed so the URL reads cleanly in the credential block.
+	if got := c.LauncherURL(); got != "https://launch.example.com" {
+		t.Errorf("LauncherURL() = %q", got)
+	}
+}
+
+// Guard for a zero-value config. Note this is NOT a state Load can produce —
+// it gives TeamDomain a hardcoded default — so it protects direct callers only.
+func TestLauncherURL_EmptyForZeroValueConfig(t *testing.T) {
+	if got := (CloudflareConfig{}).LauncherURL(); got != "" {
+		t.Errorf("LauncherURL() = %q, want empty", got)
+	}
+}
+
+// Load always produces a launcher, which is the flip side of that default:
+// there is no "unset" deployment, only a possibly-wrong one.
+func TestLauncherURL_LoadAlwaysYieldsOne(t *testing.T) {
+	t.Setenv("PURSER_CF_TEAM_DOMAIN", "")
+	t.Setenv("PURSER_LAUNCHER_URL", "")
+	if got := Load().Cloudflare.LauncherURL(); got == "" {
+		t.Error("Load() should still yield a launcher via the TeamDomain default")
+	}
+}
+
+// A bare host has to become a link — the credential block is plain text, so an
+// unclickable string is a dead end for the recipient.
+func TestLauncherURL_AddsSchemeToBareHost(t *testing.T) {
+	c := CloudflareConfig{Launcher: "launch.example.com"}
+	if got := c.LauncherURL(); got != "https://launch.example.com" {
+		t.Errorf("LauncherURL() = %q", got)
+	}
+}
+
+// ...and a value that already carries one must not get a second.
+func TestLauncherURL_DoesNotDoublePrefixAScheme(t *testing.T) {
+	for _, in := range []string{
+		"https://zero-gravity-industries.cloudflareaccess.com",
+		"http://launch.internal",
+	} {
+		c := CloudflareConfig{TeamDomain: in}
+		if got := c.LauncherURL(); got != in {
+			t.Errorf("LauncherURL() for %q = %q", in, got)
+		}
+	}
+}

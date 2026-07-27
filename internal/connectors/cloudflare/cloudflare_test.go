@@ -101,7 +101,7 @@ func includesEmail(rules []any, email string) bool {
 
 // Reconcile reads the Access group and must not write it back. The previous
 // implementation re-added the email, which made it useless for auditing:
-// running it repaired the drift it was supposed to report (SERV-54).
+// running it repaired the drift it was supposed to report (PRSR-15).
 func TestReconcile_ReadsGroupWithoutWriting(t *testing.T) {
 	var puts int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

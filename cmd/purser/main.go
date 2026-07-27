@@ -114,12 +114,15 @@ func setup(ctx context.Context) (*app, error) {
 		log.Printf("email delivery enabled via %s", cfg.SMTP.Host)
 	}
 
-	svc := invite.New(st, registry, emailer, invite.WithBundles(bundleSet(cfg)))
+	svc := invite.New(st, registry, emailer,
+		invite.WithBundles(bundleSet(cfg)),
+		invite.WithLauncher(cfg.Cloudflare.LauncherURL()),
+	)
 	return &app{cfg: cfg, store: st, svc: svc, cleanup: pool.Close}, nil
 }
 
 // bundleSet converts the configured onboarding bundles into the orchestrator's
-// form (SERV-47). Kept here in the composition root so internal/config stays
+// form (PRSR-12). Kept here in the composition root so internal/config stays
 // dependency-free and the invite package doesn't read the environment.
 func bundleSet(cfg config.Config) invite.BundleSet {
 	bs := invite.BundleSet{

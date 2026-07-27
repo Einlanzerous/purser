@@ -48,16 +48,24 @@ type Service struct {
 	registry *connector.Registry
 	emailer  Emailer   // may be nil when SMTP is unconfigured
 	bundles  BundleSet // named onboarding bundles; zero value = none configured
+	launcher string    // Cloudflare App Launcher URL; empty = don't mention one
 }
 
 // Option customizes a Service at construction.
 type Option func(*Service)
 
-// WithBundles supplies the named onboarding bundles (SERV-47). Without it a
+// WithBundles supplies the named onboarding bundles (PRSR-12). Without it a
 // Service has no bundles and every request must name its services explicitly —
 // which is what the orchestrator tests rely on.
 func WithBundles(bs BundleSet) Option {
 	return func(s *Service) { s.bundles = bs }
+}
+
+// WithLauncher supplies Cloudflare's App Launcher URL, which the credential
+// block leads with for anyone this invite granted Access to. Without it the
+// block falls back to the plain per-service list.
+func WithLauncher(url string) Option {
+	return func(s *Service) { s.launcher = url }
 }
 
 // New builds an invite Service. emailer may be nil.
@@ -210,7 +218,7 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 		res.Outcomes = append(res.Outcomes, outcome)
 	}
 
-	res.CredentialBlock = RenderCredentialBlock(person, res.Outcomes)
+	res.CredentialBlock = RenderCredentialBlock(person, res.Outcomes, s.launcher)
 
 	if req.Delivery == model.DeliverEmail {
 		subject := fmt.Sprintf("Your access to %s", strings.Join(displayNames(res.Outcomes), ", "))

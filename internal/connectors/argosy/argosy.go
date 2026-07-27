@@ -1,6 +1,6 @@
 // Package argosy is Purser's connector for Argosy (the media server). Argosy
 // shipped the admin create-account endpoint in ARGY-132, exposing
-// `POST /api/v1/admin/accounts` as the hook this connector calls (SERV-50).
+// `POST /api/v1/admin/accounts` as the hook this connector calls (PRSR-13).
 //
 // Provisioning a person creates their Argosy account (email is the login
 // identity as of ARGY-159) plus its initial admin profile, and hands back the
@@ -149,7 +149,7 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 }
 
 // Reconcile reports whether the Argosy account already exists, via the
-// read-only lookup ARGY-163 added (SERV-54).
+// read-only lookup ARGY-163 added (PRSR-15).
 //
 // This was the last connector that couldn't be checked: Argosy's admin API used
 // to be create-only, so the only existence signal was a 409 from an attempted

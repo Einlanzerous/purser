@@ -91,7 +91,7 @@ func (r *AuditResult) Counts() map[AuditAction]int {
 // It never provisions and never mints: every upstream call goes through
 // Reconcile, which is read-only by contract. That's what makes this safe to run
 // against real people, and it's the difference between this and a re-invite,
-// which would hand Switchyard users a second API token (SERV-54).
+// which would hand Switchyard users a second API token (PRSR-15).
 //
 // Repairs are records-only, in two directions:
 //

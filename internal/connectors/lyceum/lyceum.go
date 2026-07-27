@@ -1,6 +1,6 @@
 // Package lyceum is Purser's connector for Lyceum (the ebook reader + sync
 // service). Lyceum shipped a per-user account model in LYCM-801, exposing
-// `POST /admin/users` as the hook this connector calls (SERV-38) — mirroring the
+// `POST /admin/users` as the hook this connector calls (PRSR-6) — mirroring the
 // Switchyard connector.
 //
 // Provisioning a person creates their Lyceum user (email is the join key, as in
@@ -127,7 +127,7 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 
 // Reconcile reports whether the Lyceum user already exists, by listing the
 // household via `GET /admin/users` — read-only, and it neither creates a user
-// nor mints an invite token (SERV-54).
+// nor mints an invite token (PRSR-15).
 //
 // Lyceum's admin surface is richer than the create call this connector used to
 // rely on: it also exposes list, per-user invite, and delete. Only the list is

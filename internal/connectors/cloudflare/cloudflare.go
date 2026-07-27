@@ -183,7 +183,7 @@ func (c *Connector) putGroup(ctx context.Context, g group) error {
 }
 
 // Reconcile reports whether the email is already in the Access group, by
-// reading the group only (SERV-54).
+// reading the group only (PRSR-15).
 //
 // This used to re-add the email — a write. Reconcile must not mutate upstream
 // state: it is meant to answer "what does this person already have?", and a

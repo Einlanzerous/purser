@@ -27,7 +27,7 @@ type fakeConn struct {
 	result  connector.Result
 	lastIn  connector.Input // the most recent Provision input, for assertions
 
-	// Reconcile behavior (SERV-54). recErr wins over recResult.
+	// Reconcile behavior (PRSR-15). recErr wins over recResult.
 	recResult connector.ReconcileResult
 	recErr    error
 	recCalls  int
@@ -324,7 +324,7 @@ func (s *fakeStore) EnsureTask(_ context.Context, inviteID, personID, serviceID 
 	return t, nil
 }
 
-// --- AuditStore (SERV-54) ---
+// --- AuditStore (PRSR-15) ---
 
 func (s *fakeStore) ListPeople(context.Context) ([]model.Person, error) {
 	s.mu.Lock()

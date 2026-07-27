@@ -105,7 +105,7 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 			"or if SSO is ever unavailable.",
 	}
 
-	// Assign project memberships (SERV-39). Best-effort: the account + token
+	// Assign project memberships (PRSR-7). Best-effort: the account + token
 	// already exist, so a membership hiccup is surfaced in the block rather than
 	// failing the whole provision.
 	if len(in.Projects) > 0 {
@@ -367,7 +367,7 @@ func (c *Connector) listProjectKeys(ctx context.Context) ([]string, error) {
 // Reconcile is a no-op today: an existing Switchyard user needs no periodic
 // repair from Purser's side.
 // Reconcile reports whether the Switchyard user already exists, by list lookup
-// only (SERV-54).
+// only (PRSR-15).
 //
 // This is the connector where the distinction matters most: Provision calls
 // ensureUser and then unconditionally mints a token, so re-provisioning someone
