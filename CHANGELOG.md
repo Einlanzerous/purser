@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/Einlanzerous/purser/compare/v0.7.0...v0.8.0) (2026-07-27)
+
+
+### Features
+
+* **invite:** lead the credential block with the Access launcher (PRSR-12) ([#13](https://github.com/Einlanzerous/purser/issues/13)) ([0bd88ad](https://github.com/Einlanzerous/purser/commit/0bd88ad0a75a94edfbbd48e892674eb062b851c3))
+
 ## [0.7.0](https://github.com/Einlanzerous/purser/compare/v0.6.1...v0.7.0) (2026-07-25)
 
 
