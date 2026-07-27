@@ -32,7 +32,7 @@ type Bundle struct {
 	Projects string   // raw "*:user" spec; empty => the invite layer's default
 }
 
-// BundleConfig holds the named onboarding bundles (SERV-47). A bundle is a
+// BundleConfig holds the named onboarding bundles (PRSR-12). A bundle is a
 // named set of services, so the common onboard is one flag instead of a
 // hand-assembled --to list.
 type BundleConfig struct {
@@ -173,20 +173,38 @@ type CloudflareConfig struct {
 	Launcher   string // PURSER_LAUNCHER_URL; empty => derived from TeamDomain
 }
 
-// LauncherURL is Cloudflare's App Launcher — the one page listing every
-// Access-gated app a person can reach. It defaults to the team domain, so the
-// launcher works with no configuration beyond what the connector already needs.
+// LauncherURL is Cloudflare's App Launcher — the page listing the Access-gated
+// apps a person can reach. It falls back to the team domain, so the launcher
+// works with no configuration beyond what the connector already needs.
 //
-// Empty means "don't mention a launcher": with no team domain there is nothing
-// to point anyone at, and a blank link is worse than none.
+// It returns "" for a zero-value config, which is a guard for direct callers
+// rather than a reachable production state: Load gives TeamDomain a hardcoded
+// default, so a deployment always has *some* launcher. That cuts both ways — a
+// tenant that sets PURSER_CF_* but leaves PURSER_CF_TEAM_DOMAIN unset inherits
+// this repo's default domain rather than getting no link. Set the team domain
+// explicitly when pointing the connector at a different Cloudflare account.
 func (c CloudflareConfig) LauncherURL() string {
 	if u := strings.TrimSpace(c.Launcher); u != "" {
-		return strings.TrimRight(u, "/")
+		return normalizeURL(u)
 	}
-	if d := strings.TrimSpace(c.TeamDomain); d != "" {
-		return "https://" + strings.TrimRight(d, "/")
+	return normalizeURL(c.TeamDomain)
+}
+
+// normalizeURL turns a configured host-or-URL into something clickable. The two
+// sources disagree on shape by nature — a team domain is a bare host, an
+// explicit override is usually a full URL — and the credential block is plain
+// text, so whatever lands here has to already be a working link. Applying
+// "https://" blindly would produce https://https://… for a scheme-bearing
+// value; applying it never would emit unclickable text for a bare host.
+func normalizeURL(v string) string {
+	v = strings.TrimRight(strings.TrimSpace(v), "/")
+	if v == "" {
+		return ""
 	}
-	return ""
+	if strings.HasPrefix(v, "https://") || strings.HasPrefix(v, "http://") {
+		return v
+	}
+	return "https://" + v
 }
 
 // SMTPConfig configures email delivery.

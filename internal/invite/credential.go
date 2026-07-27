@@ -8,12 +8,16 @@ import (
 	"github.com/Einlanzerous/purser/internal/model"
 )
 
-// accessServiceKey is the connector whose grant puts a person into Cloudflare's
+// AccessServiceKey is the connector whose grant puts a person into Cloudflare's
 // App Launcher. Named here as a string rather than imported from the connector
 // package: the orchestrator deals in service keys throughout (bundles are plain
 // key lists), and depending on one concrete connector would undo the point of
 // the interface.
-const accessServiceKey = "cloudflare"
+//
+// Exported so the wiring can be pinned to the connector's own Key() in a test —
+// otherwise renaming that key would silently switch the launcher off and leave
+// the suite green.
+const AccessServiceKey = "cloudflare"
 
 // RenderCredentialBlock builds the copy-pasteable message an operator hands to
 // the invited person (or that Purser emails them). It leads with the launcher —
@@ -51,18 +55,31 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome, launc
 	}
 
 	launcher = strings.TrimSpace(launcher)
-	showLauncher := launcher != "" && hasAccessGrant(succeeded, skipped)
+
+	// The launcher leads only when this invite left the person able to actually
+	// use it: they're in the Access group, and nothing else in the invite failed.
+	//
+	// The len(failed) check is the important half. A half-provisioned invite is
+	// exactly where a confident "start here" is worst: Access admits them to the
+	// edge, the app whose provisioning failed then refuses them, and they have no
+	// way to self-serve. That's the state the both-halves-or-neither invariant
+	// exists to prevent, so the block must not present it as a finished welcome.
+	showLauncher := launcher != "" && len(failed) == 0 && hasAccessGrant(succeeded, skipped)
 
 	if showLauncher {
+		// person.Email is necessarily non-empty here: the Cloudflare connector
+		// refuses to provision without one, so an Access grant implies an email.
 		fmt.Fprintf(&b, "Hi %s — you've been granted access to the Construct.\n\n", greeting)
 		fmt.Fprintf(&b, "🚀 Start here: %s\n", launcher)
-		if email := strings.TrimSpace(person.Email); email != "" {
-			fmt.Fprintf(&b, "    Sign in with the email one-time-PIN sent to %s — no password.\n", email)
-		} else {
-			b.WriteString("    Sign in with the email one-time-PIN — no password.\n")
-		}
-		b.WriteString("    Every app you can reach is listed on that page.\n")
+		fmt.Fprintf(&b, "    Sign in with the email one-time-PIN sent to %s — no password.\n", person.Email)
+		b.WriteString("    The Construct apps behind single sign-on are listed there.\n")
 		b.WriteString("\nPer-app details, including anything the launcher can't sign you into:\n")
+
+		// With the launcher leading, a standalone Cloudflare entry would repeat
+		// the same email-OTP instruction under a second heading. It carries no
+		// URL and no secret of its own, so the header fully replaces it.
+		succeeded = withoutAccessEntry(succeeded)
+		skipped = withoutAccessEntry(skipped)
 	} else {
 		fmt.Fprintf(&b, "Hi %s — you've been granted access to the following:\n", greeting)
 	}
@@ -127,12 +144,25 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome, launc
 func hasAccessGrant(succeeded, skipped []ServiceOutcome) bool {
 	for _, group := range [][]ServiceOutcome{succeeded, skipped} {
 		for _, o := range group {
-			if o.ServiceKey == accessServiceKey {
+			if o.ServiceKey == AccessServiceKey {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// withoutAccessEntry drops the Cloudflare outcome, whose whole content is the
+// sign-in instruction the launcher header already carries. It copies rather than
+// filtering in place so the caller's Outcomes slice is left alone.
+func withoutAccessEntry(outcomes []ServiceOutcome) []ServiceOutcome {
+	out := make([]ServiceOutcome, 0, len(outcomes))
+	for _, o := range outcomes {
+		if o.ServiceKey != AccessServiceKey {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // marker returns the service's emoji, or a bullet fallback when it has none.

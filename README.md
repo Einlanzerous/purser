@@ -25,7 +25,7 @@ Hi Ada — you've been granted access to the Construct.
 
 🚀 Start here: https://zero-gravity-industries.cloudflareaccess.com
     Sign in with the email one-time-PIN sent to ada@example.com — no password.
-    Every app you can reach is listed on that page.
+    The Construct apps behind single sign-on are listed there.
 
 Per-app details, including anything the launcher can't sign you into:
 
@@ -48,10 +48,6 @@ Per-app details, including anything the launcher can't sign you into:
     password (shown once — change it after signing in): …
     → Sign in at https://argosy.zerogravity.industries with this email and password,
       then pair your devices from the app.
-
-🔐 Cloudflare Access (SSO)
-    → Sign in to Switchyard and the other tunneled Construct apps with the email
-      one-time-PIN sent to ada@example.com (no password).
 
 Keep any secrets above private — they are shown once and cannot be retrieved later.
 ```
@@ -180,15 +176,33 @@ listing every Access-gated app a person can reach — instead of making them kee
 a list of URLs. It's free: Cloudflare already renders it at the team domain, so
 Purser gains no public surface and stays internal-only.
 
-It appears **only when the invite granted Cloudflare Access**. The launcher lists
-Access apps, so pointing an Argosy-only invitee at it would render them an empty
-page; those invites fall back to the plain per-service list. A *failed* Access
-grant doesn't count either — they can't sign in yet, and a link that rejects them
-reads as a broken invite. An already-provisioned (skipped) grant does count.
+It appears only when the invite left the person able to use it — two conditions:
+
+1. **They're in the Access group.** The launcher lists Access apps, so pointing
+   an Argosy-only invitee at it would render them an empty page. A *failed*
+   Access grant doesn't count either; a link that rejects them reads as a broken
+   invite. An already-provisioned (skipped) grant does count.
+2. **Nothing else in the invite failed.** This is the half-open case: Access
+   admits them to the edge, then the app whose provisioning failed refuses them,
+   with no way to self-serve. That's the state the both-halves-or-neither
+   invariant exists to prevent, so the block must not present it as a finished
+   welcome. Those invites fall back to the plain per-service list, with the
+   failures in the operator note.
+
+When the launcher leads, the standalone Cloudflare entry is dropped — it carries
+no URL and no secret of its own, so it would only repeat the sign-in instruction
+under a second heading.
 
 Direct-path apps still deliver their credentials inline — that's precisely why
 the launcher can't be the whole message. Argosy's one-time password appears under
 its own heading in the same block.
+
+> **Operational caveat:** Cloudflare's App Launcher is itself an Access
+> application with its own policy. Membership in `zerogravity-members` gets
+> someone into the *apps*, but the launcher admits them only if its own policy
+> also allows the group. Purser can't detect that from the API surface it uses,
+> so confirm it once in the Zero Trust dashboard — otherwise the credential
+> block's first instruction leads to a refusal.
 
 `PURSER_LAUNCHER_URL` overrides the address; unset it defaults to `https://` +
 `PURSER_CF_TEAM_DOMAIN`, so this works with no new configuration.

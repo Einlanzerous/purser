@@ -54,7 +54,7 @@ type Service struct {
 // Option customizes a Service at construction.
 type Option func(*Service)
 
-// WithBundles supplies the named onboarding bundles (SERV-47). Without it a
+// WithBundles supplies the named onboarding bundles (PRSR-12). Without it a
 // Service has no bundles and every request must name its services explicitly —
 // which is what the orchestrator tests rely on.
 func WithBundles(bs BundleSet) Option {

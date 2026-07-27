@@ -41,7 +41,7 @@ const (
 	AccountActive        AccountStatus = "active"
 	AccountDeprovisioned AccountStatus = "deprovisioned"
 	// AccountStale means Purser holds a record but Reconcile found no matching
-	// account upstream — it was deleted or never really existed (SERV-54).
+	// account upstream — it was deleted or never really existed (PRSR-15).
 	//
 	// This is distinct from deprovisioned, which is Purser deliberately removing
 	// access. Stale is drift Purser didn't cause and can't explain. It matters

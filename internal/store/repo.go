@@ -116,7 +116,7 @@ func (s *Store) AccountFor(ctx context.Context, personID, serviceID uuid.UUID) (
 }
 
 // ListPeople returns every person, oldest first. Used by the audit to walk the
-// whole roster (SERV-54).
+// whole roster (PRSR-15).
 func (s *Store) ListPeople(ctx context.Context) ([]model.Person, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, COALESCE(email, ''), type, created_at, updated_at
@@ -154,7 +154,7 @@ func (s *Store) PersonByEmail(ctx context.Context, email string) (model.Person, 
 
 // UpdateAccountStatus changes only an account's status, deliberately leaving
 // secret_hash and identity columns untouched — marking a row stale must not
-// destroy the record of what was provisioned (SERV-54).
+// destroy the record of what was provisioned (PRSR-15).
 func (s *Store) UpdateAccountStatus(ctx context.Context, accountID uuid.UUID, status model.AccountStatus) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE account SET status = $2, updated_at = now() WHERE id = $1`,

@@ -214,7 +214,7 @@ func TestAssignOne_PatchFallbackWhenAlreadyMember(t *testing.T) {
 }
 
 // Reconcile must find the user by lookup and stop — never minting a token.
-// This is the property that makes a Switchyard backfill safe (SERV-54):
+// This is the property that makes a Switchyard backfill safe (PRSR-15):
 // Provision would hand someone who already has access a second API token.
 func TestReconcile_FindsUserWithoutMintingAToken(t *testing.T) {
 	var mintCalls, createCalls int

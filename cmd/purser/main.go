@@ -122,7 +122,7 @@ func setup(ctx context.Context) (*app, error) {
 }
 
 // bundleSet converts the configured onboarding bundles into the orchestrator's
-// form (SERV-47). Kept here in the composition root so internal/config stays
+// form (PRSR-12). Kept here in the composition root so internal/config stays
 // dependency-free and the invite package doesn't read the environment.
 func bundleSet(cfg config.Config) invite.BundleSet {
 	bs := invite.BundleSet{

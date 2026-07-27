@@ -9,7 +9,7 @@ import (
 )
 
 // DefaultProjectRole is the Switchyard *project membership* role a bundle grants
-// when the invite doesn't say otherwise (SERV-47, owner's call).
+// when the invite doesn't say otherwise (PRSR-12, owner's call).
 //
 // Note this is the project role (viewer | user | editor | admin), not the
 // instance role (member | owner) — Switchyard has both, and they're set
@@ -33,7 +33,7 @@ type Bundle struct {
 	Projects string
 }
 
-// BundleSet is the named onboarding bundles available to invites (SERV-47).
+// BundleSet is the named onboarding bundles available to invites (PRSR-12).
 //
 // A bundle is a named list of service keys expanded into the existing
 // per-service orchestration — it introduces no new provisioning path and no new
