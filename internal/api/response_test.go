@@ -84,6 +84,36 @@ func TestNewInviteResponse_OmitsEmptyOperatorNote(t *testing.T) {
 	}
 }
 
+// A name disagreement is reported, not silently resolved (PRSR-20). Over HTTP
+// there is no stderr to warn on, so the field is the only channel.
+func TestNewInviteResponse_SurfacesNameConflict(t *testing.T) {
+	res := result(model.DeliverCopyPaste)
+	res.NameConflict = &invite.NameConflict{
+		Email: "ada@example.com", Stored: "Ada Lovelace", Requested: "Ada Lovelacce",
+	}
+	body, err := json.Marshal(newInviteResponse(res))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, want := range []string{`"name_conflict"`, `"stored":"Ada Lovelace"`, `"requested":"Ada Lovelacce"`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("missing %s:\n%s", want, body)
+		}
+	}
+}
+
+// No disagreement => the key is absent, so a caller can test for it rather than
+// comparing names itself.
+func TestNewInviteResponse_OmitsAbsentNameConflict(t *testing.T) {
+	body, err := json.Marshal(newInviteResponse(result(model.DeliverCopyPaste)))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(body), "name_conflict") {
+		t.Errorf("no conflict, so no key:\n%s", body)
+	}
+}
+
 // Per-service errors are operator-facing too, but they ride in the structured
 // outcomes where a caller can key off them — that's deliberate, and distinct
 // from the block, which is the only field that ever reaches an invitee.

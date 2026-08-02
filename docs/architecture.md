@@ -196,6 +196,33 @@ name it replaced, so the command cannot announce a rename the database didn't
 perform. The same rule covers `--type`: omitted, it leaves an existing person
 alone; supplied and disagreeing, it is refused rather than silently dropped.
 
+`invite` is held to the same rule *for names* (PRSR-20). It used to call
+`UpsertPerson` directly, so a mistyped `--name` on a re-invite — an ordinary
+thing to do, since invites are idempotent per (person × service) — renamed
+whoever held that address. It now keeps the stored name and reports the
+disagreement as `Result.NameConflict`: a warning on stderr, `name_conflict` over
+HTTP, and a server-side log line so a caller that ignores the field still leaves
+a record. Renaming stays exclusively with `person add --rename`.
+
+**The two delivery paths resolve that signal differently.** Copy-paste warns:
+the operator is the gate, nothing has left the building, and failing the
+provision over a name mismatch punishes the wrong action. Email **refuses**,
+before writing an invite row or provisioning anything. A name mismatch is the
+only evidence that a mistyped `--email` landed on a *different existing person*,
+and email delivery would mail that person working credentials before the
+operator could read a warning about it. Refusing costs a re-run; not refusing
+costs a credential sent to the wrong human. Over HTTP that refusal is a `409`
+carrying the disagreeing names, not a generic 500.
+
+The comparison ignores differences nobody can see — surrounding and repeated
+whitespace — but not case: a doubled space would otherwise block delivery
+forever, while `ada lovelace` against `Ada Lovelace` is visible in the warning
+and worth an operator's decision.
+
+Unlike `person add`, `invite` does **not** compare `--type`. It never asserts
+what kind of identity this is; it passes `human` only as the default for a row
+that may not exist yet, and an existing row keeps its own type untouched.
+
 Email is required even for `--type agent`, though the schema allows it to be
 null: it is the conflict target that makes the add idempotent and the key the
 audit looks people up by, so a row without one could be added twice and

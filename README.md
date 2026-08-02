@@ -325,6 +325,32 @@ purser: pass --rename to change the recorded name
 one inferred from a prior read. Omitting `--type` leaves an existing person's
 type alone; passing one that disagrees is refused the same way.
 
+`invite` never renames either, but what it does about a mismatch depends on how
+the credentials are being delivered. On `--deliver copypaste` it warns and
+carries on — the operator is the gate, and failing the provision over a name
+typo punishes the wrong action:
+
+```
+$ purser invite --name "Ada Lovelacce" --email ada@example.com --to switchyard
+
+invite 6f1c… for Ada Lovelace (delivery=copypaste)
+  ! ada@example.com is recorded as "Ada Lovelace", not "Ada Lovelacce" — kept the recorded name
+    to change it: purser person add --email ada@example.com --name "Ada Lovelacce" --rename
+  ✓ Switchyard              succeeded
+```
+
+On `--deliver email` it **refuses**, before provisioning or sending anything. A
+mismatch is the only sign that a mistyped `--email` landed on a *different*
+person, and that path mails them working credentials:
+
+```
+$ purser invite --name "Bob Smith" --email ada@example.com --to switchyard --deliver email
+purser: invite: refusing email delivery for a name that disagrees with the record: ada@example.com
+is recorded as "Ada Lovelace", not "Bob Smith" — … re-run with the recorded name, or rename first
+```
+
+`person add --rename` is the only way to change a recorded name.
+
 `--email` is required even with `--type agent`: it's the conflict target that
 makes the add idempotent and the key the audit looks people up by, so a row
 without one could be added twice and reconciled never. It is validated as an
@@ -358,6 +384,18 @@ for `email` the secrets go to the recipient and are not echoed over HTTP.
 `operator_note` — the list of services that failed to provision — is returned on
 both paths and is never part of `credential_block`, so nothing addressed to the
 operator can travel to the invitee.
+
+`name_conflict` is present when the request's `name` disagreed with the stored
+person; the stored name was kept and the invite ran anyway. It is also written
+to the server log, so a caller that ignores the field still leaves a record.
+
+```json
+"name_conflict": { "email": "ada@example.com", "stored": "Ada Lovelace", "requested": "Ada Lovelacce" }
+```
+
+The same disagreement on `"deliver": "email"` is a **`409 Conflict`** instead —
+nothing is provisioned and no mail is sent. The response body names both sides
+so the caller can correct the address or the name.
 
 ## Configuration
 
