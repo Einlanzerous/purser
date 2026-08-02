@@ -355,6 +355,9 @@ construct_net/Tailscale isolation).
 
 The credential block (with secrets) is returned only for `copypaste` delivery;
 for `email` the secrets go to the recipient and are not echoed over HTTP.
+`operator_note` — the list of services that failed to provision — is returned on
+both paths and is never part of `credential_block`, so nothing addressed to the
+operator can travel to the invitee.
 
 ## Configuration
 

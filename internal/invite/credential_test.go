@@ -153,6 +153,53 @@ func TestRenderCredentialBlockDoesNotRepeatTheAccessEntry(t *testing.T) {
 	}
 }
 
+// The credential block is the recipient's message; the failure list is the
+// operator's. They are rendered separately so that handing the block to an
+// invitee — by paste or by email — cannot carry connector error text with it.
+func TestRenderCredentialBlockExcludesTheOperatorNote(t *testing.T) {
+	failed := ServiceOutcome{
+		ServiceKey: "switchyard", DisplayName: "Switchyard", Icon: "🚉",
+		Status: model.TaskFailed, Error: "switchyard: 500",
+	}
+	outcomes := []ServiceOutcome{argosyOutcome(), failed}
+
+	block := RenderCredentialBlock(testPerson(), outcomes, testLauncher)
+	if strings.Contains(block, "Operator note") || strings.Contains(block, "switchyard: 500") {
+		t.Errorf("the recipient's block must not carry the failure list:\n%s", block)
+	}
+
+	note := RenderOperatorNote(outcomes)
+	if !strings.Contains(note, "switchyard: 500") {
+		t.Errorf("operator note missing the failure:\n%s", note)
+	}
+	// Only failures — the operator reads this to see what needs a retry.
+	if strings.Contains(note, "Argosy") {
+		t.Errorf("operator note should list failures only:\n%s", note)
+	}
+}
+
+// An empty note is how the CLI and API tell "nothing broke" from "something did"
+// without re-walking the outcomes.
+func TestRenderOperatorNoteEmptyWhenNothingFailed(t *testing.T) {
+	note := RenderOperatorNote([]ServiceOutcome{argosyOutcome(), cfOutcome(model.TaskSkipped)})
+	if note != "" {
+		t.Errorf("nothing failed, so there is nothing to tell the operator:\n%s", note)
+	}
+}
+
+// A connector that is wired but not yet ready upstream is not a breakage, and
+// the note says so — retrying it won't help.
+func TestRenderOperatorNoteMarksPendingSeparately(t *testing.T) {
+	pending := ServiceOutcome{
+		ServiceKey: "lyceum", DisplayName: "Lyceum", Status: model.TaskFailed,
+		Error: "lyceum: connector not configured", Pending: true,
+	}
+	note := RenderOperatorNote([]ServiceOutcome{pending})
+	if !strings.Contains(note, "(pending)") {
+		t.Errorf("a pending connector should read as pending, not failed:\n%s", note)
+	}
+}
+
 // Without this the launcher silently switches off if the connector's key is ever
 // renamed, and every test above still passes because they hardcode the literal.
 func TestAccessServiceKeyMatchesTheConnector(t *testing.T) {

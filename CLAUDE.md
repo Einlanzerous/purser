@@ -73,6 +73,13 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   human, which the audit then populated twice.
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
   plaintext lives only in the returned/emailed credential block.
+- **The credential block is the recipient's; the operator note is the
+  operator's.** `Result.CredentialBlock` is the only thing `--deliver email` may
+  ever send, and `RenderCredentialBlock` must stay free of operator-facing
+  content. The failure list was once a trailing section of the block, so a single
+  failed connector mailed an invitee raw `err.Error()` text under a heading
+  saying it wasn't for them (PRSR-19). Don't re-merge them or filter the rendered
+  string — the split is at the source so the emailer has nothing to get wrong.
 - **Switchyard needs the email set** on user create — it's the SSO join key
   (`users.email`). Don't drop it.
 - Connectors should treat "already exists" upstream as success (reconcile) so a
@@ -97,8 +104,9 @@ the three token-gated ones registers Unavailable when its token is unset.
 
 Also shipped: onboarding bundles + the launcher-led credential block (PRSR-12),
 `audit` / `reconcile` (PRSR-15), which retired 15 (person × service) pairs of
-real drift with zero upstream mutation, and `person add` (PRSR-16), the roster
-entry point that provisions nothing.
+real drift with zero upstream mutation, `person add` (PRSR-16), the roster entry
+point that provisions nothing, and the recipient/operator split in the invite
+result (PRSR-19).
 
 Open, in rough priority order: `Deprovision` is unimplemented on every connector
 but Cloudflare (PRSR-17) — so `stale` can re-arm provisioning but cannot revoke;

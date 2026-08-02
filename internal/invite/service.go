@@ -120,13 +120,18 @@ type ServiceOutcome struct {
 }
 
 // Result is the outcome of an invite.
+//
+// CredentialBlock and OperatorNote have different audiences and are kept apart
+// for that reason: the block is the invitee's message and is the only thing that
+// may ever be emailed, while the note is for whoever ran the invite (PRSR-19).
 type Result struct {
 	Person          model.Person
 	InviteID        uuid.UUID
 	Delivery        model.DeliveryMethod
 	Bundle          string // the bundle that supplied the service list, if any
 	Outcomes        []ServiceOutcome
-	CredentialBlock string // the copy-pasteable block
+	CredentialBlock string // the copy-pasteable block, for the recipient
+	OperatorNote    string // failure list for the operator; "" when nothing failed
 	Delivered       bool   // true when an email was actually sent
 }
 
@@ -222,9 +227,11 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 
 	res.CredentialBlock = RenderCredentialBlock(person, res.Outcomes, s.launcher)
+	res.OperatorNote = RenderOperatorNote(res.Outcomes)
 
 	if req.Delivery == model.DeliverEmail {
 		subject := fmt.Sprintf("Your access to %s", strings.Join(displayNames(res.Outcomes), ", "))
+		// CredentialBlock only — OperatorNote must not reach the invitee.
 		if err := s.emailer.Send(ctx, email, subject, res.CredentialBlock); err != nil {
 			return nil, fmt.Errorf("invite: deliver email: %w", err)
 		}

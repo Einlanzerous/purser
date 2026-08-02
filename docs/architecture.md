@@ -111,7 +111,8 @@ Re-running the same invite is safe and **retries only failed services**: a
 service with an active `account` row (upstream id present) is *skipped* — no
 duplicate upstream user, no fresh secret — while a previously-failed service is
 retried. Per-service connector failures never abort the whole invite; they are
-recorded and surfaced in the credential block's operator note.
+recorded and surfaced in the operator note — a field of its own, separate from
+the credential block, because only the block is ever emailed (PRSR-19).
 
 ## Onboarding bundles
 

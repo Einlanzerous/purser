@@ -24,6 +24,10 @@ const AccessServiceKey = "cloudflare"
 // the one page listing every app they can reach — and then gives the per-service
 // login URL, any one-time secret, and how to sign in.
 //
+// Everything here is addressed to the recipient and to nobody else. What went
+// wrong is the operator's business and lives in RenderOperatorNote, which is
+// never emailed — see the comment there for why the two are separate strings.
+//
 // launcher is Cloudflare's App Launcher URL, and is shown only when this invite
 // actually granted Access (see hasAccessGrant). Pointing someone at it without
 // that grant renders them an empty page, which is worse than not linking it.
@@ -121,18 +125,36 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome, launc
 
 	b.WriteString("\nKeep any secrets above private — they are shown once and cannot be retrieved later.\n")
 
-	if len(failed) > 0 {
-		b.WriteString("\n(Operator note — not for the recipient)\n")
-		for _, o := range failed {
-			status := "failed"
-			if o.Pending {
-				status = "pending"
-			}
-			fmt.Fprintf(&b, "  ✗ %s: %s (%s)\n", o.DisplayName, o.Error, status)
-		}
-	}
-
 	return b.String()
+}
+
+// RenderOperatorNote lists the services this invite could not provision, for
+// whoever ran it. It returns "" when nothing failed.
+//
+// This is a separate string from the credential block rather than a trailing
+// section of it, and that separation is the whole point. The two were one string
+// once, headed "(Operator note — not for the recipient)" — and `--deliver email`
+// mails that string verbatim, so a single failed connector sent an external
+// invitee a failure list that announced it wasn't for them, carrying raw
+// `err.Error()` text: status codes, upstream bodies, whatever a connector chose
+// to put there (PRSR-19). Splitting at the source leaves the emailer nothing to
+// filter and no way to get the audience wrong.
+func RenderOperatorNote(outcomes []ServiceOutcome) string {
+	var b strings.Builder
+	for _, o := range outcomes {
+		if o.Status != model.TaskFailed {
+			continue
+		}
+		status := "failed"
+		if o.Pending {
+			status = "pending"
+		}
+		fmt.Fprintf(&b, "  ✗ %s: %s (%s)\n", o.DisplayName, o.Error, status)
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return "Operator note — not for the recipient:\n" + b.String()
 }
 
 // hasAccessGrant reports whether this invite left the person inside the

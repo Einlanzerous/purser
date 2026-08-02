@@ -104,6 +104,11 @@ func parseProjects(s string) []connector.ProjectGrant {
 // printResult writes a human summary to stderr and the credential block to
 // stdout, so `purser invite … | pbcopy` (or piping to a file) captures exactly
 // the copy-pasteable block.
+//
+// The failure list stays on stderr, where the per-outcome loop below already
+// renders it with each connector's error — so res.OperatorNote is not printed a
+// second time. That split is what PRSR-19 is about: stdout is the recipient's
+// message and nothing else, stderr is the operator's.
 func printResult(res *invite.Result) {
 	bundleNote := ""
 	if res.Bundle != "" {
