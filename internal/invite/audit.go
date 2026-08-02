@@ -17,7 +17,6 @@ import (
 // AuditStore is the extra persistence surface the audit needs on top of Store.
 type AuditStore interface {
 	ListPeople(ctx context.Context) ([]model.Person, error)
-	PersonByEmail(ctx context.Context, email string) (model.Person, error)
 	UpdateAccountStatus(ctx context.Context, accountID uuid.UUID, status model.AccountStatus) error
 }
 
@@ -130,7 +129,7 @@ func (s *Service) Audit(ctx context.Context, req AuditRequest) (*AuditResult, er
 // auditScope resolves which people to audit.
 func (s *Service) auditScope(ctx context.Context, astore AuditStore, req AuditRequest) ([]model.Person, error) {
 	if email := strings.TrimSpace(req.Email); email != "" {
-		p, err := astore.PersonByEmail(ctx, email)
+		p, err := s.store.PersonByEmail(ctx, email)
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, fmt.Errorf("invite: no person with email %q", email)
 		}

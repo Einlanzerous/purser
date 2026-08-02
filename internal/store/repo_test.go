@@ -55,6 +55,103 @@ func TestUpsertPerson_IdempotentByEmail(t *testing.T) {
 	}
 }
 
+// The bug PRSR-16's migration 0003 closes: person_email_key was case-sensitive
+// while every lookup matched lower(email), so a row that arrived by hand as
+// 'Ada@Example.com' did not collide with the lowercased address the code
+// writes. The upsert then inserted a *second* person for the same human — the
+// duplicate identity `person add` exists to prevent.
+//
+// This can only be caught against a real index; an in-memory fake keyed by a
+// lowercased string is case-insensitive by construction.
+func TestPersonEmail_UniqueCaseInsensitively(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO person (name, email, type) VALUES ('Ada', 'Ada@Example.com', 'human')`); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := st.UpsertPerson(ctx, "Ada Lovelace", "ada@example.com", model.PersonHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	people, err := st.ListPeople(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(people) != 1 {
+		t.Fatalf("got %d person rows for one human, want 1 (duplicate identity)", len(people))
+	}
+	if people[0].ID != p.ID {
+		t.Error("upsert returned a row that is not the one in the table")
+	}
+	if people[0].Name != "Ada Lovelace" {
+		t.Errorf("name = %q, want the upsert to have matched the mixed-case row", people[0].Name)
+	}
+}
+
+// InsertPersonIfAbsent must never modify an occupied address — that is the
+// whole difference from UpsertPerson, and what lets `person add` refuse.
+func TestInsertPersonIfAbsent(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	p, created, err := st.InsertPersonIfAbsent(ctx, "Ada", "ada@example.com", model.PersonHuman)
+	if err != nil || !created {
+		t.Fatalf("first insert: created=%v err=%v", created, err)
+	}
+
+	// Same address in different case: taken, and left exactly as it was.
+	got, created, err := st.InsertPersonIfAbsent(ctx, "Someone Else", "ADA@Example.com", model.PersonAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Error("created a second row for the same address in different case")
+	}
+	if got.ID != (model.Person{}).ID {
+		t.Error("a non-create should not return a person")
+	}
+	existing, err := st.PersonByEmail(ctx, "ada@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing.ID != p.ID || existing.Name != "Ada" || existing.Type != model.PersonHuman {
+		t.Errorf("existing row was modified: %+v", existing)
+	}
+}
+
+// RenamePerson reports the name it replaced, read in the same statement that
+// replaced it — so a caller can't announce a rename that didn't land.
+func TestRenamePerson(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	p, _, err := st.InsertPersonIfAbsent(ctx, "Ada", "ada@example.com", model.PersonHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, previous, err := st.RenamePerson(ctx, "ADA@Example.com", "Ada Lovelace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if previous != "Ada" {
+		t.Errorf("previous = %q, want %q", previous, "Ada")
+	}
+	if got.ID != p.ID {
+		t.Error("rename hit a different row")
+	}
+	if got.Name != "Ada Lovelace" {
+		t.Errorf("name = %q, want the new one", got.Name)
+	}
+
+	if _, _, err := st.RenamePerson(ctx, "nobody@example.com", "Ghost"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("renaming an absent person: err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestAccountAndTask_Idempotency(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

@@ -17,6 +17,11 @@ var ErrNotFound = errors.New("store: not found")
 // UpsertPerson inserts a person, or returns the existing one matched by email.
 // When email is empty (agent identities), it always inserts a new row. Email is
 // lowercased by the caller; name updates are applied on conflict.
+//
+// The conflict target is lower(email), matching person_email_key as rebuilt by
+// migration 0003 and the case-insensitive lookups below. Inferring on the bare
+// column instead would miss a differently-cased row and insert a duplicate
+// identity for the same human (PRSR-16).
 func (s *Store) UpsertPerson(ctx context.Context, name, email string, typ model.PersonType) (model.Person, error) {
 	var p model.Person
 	if email == "" {
@@ -33,7 +38,7 @@ func (s *Store) UpsertPerson(ctx context.Context, name, email string, typ model.
 
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO person (name, email, type) VALUES ($1, $2, $3)
-		ON CONFLICT (email) WHERE email IS NOT NULL
+		ON CONFLICT (lower(email)) WHERE email IS NOT NULL
 		DO UPDATE SET name = EXCLUDED.name, updated_at = now()
 		RETURNING id, name, COALESCE(email, ''), type, created_at, updated_at`,
 		name, email, string(typ)).
@@ -42,6 +47,62 @@ func (s *Store) UpsertPerson(ctx context.Context, name, email string, typ model.
 		return model.Person{}, fmt.Errorf("store: upsert person: %w", err)
 	}
 	return p, nil
+}
+
+// InsertPersonIfAbsent inserts a person and reports whether it created the row.
+// Unlike UpsertPerson it never touches an existing one — no rename, no
+// updated_at bump — which is what lets `person add` treat an occupied email as
+// a decision to refuse rather than an edit to apply (PRSR-16).
+//
+// It is a single statement resolved by the unique index, so two concurrent adds
+// cannot both create the same person: the loser is told created=false and
+// re-reads.
+func (s *Store) InsertPersonIfAbsent(ctx context.Context, name, email string, typ model.PersonType) (model.Person, bool, error) {
+	if email == "" {
+		// Without an email there is no conflict target, so this would insert
+		// unconditionally — the duplicate-minting behavior it exists to avoid.
+		return model.Person{}, false, errors.New("store: insert person: email is required")
+	}
+	var p model.Person
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO person (name, email, type) VALUES ($1, $2, $3)
+		ON CONFLICT (lower(email)) WHERE email IS NOT NULL DO NOTHING
+		RETURNING id, name, COALESCE(email, ''), type, created_at, updated_at`,
+		name, email, string(typ)).
+		Scan(&p.ID, &p.Name, &p.Email, &p.Type, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.Person{}, false, nil // taken — the caller decides what that means
+	}
+	if err != nil {
+		return model.Person{}, false, fmt.Errorf("store: insert person: %w", err)
+	}
+	return p, true, nil
+}
+
+// RenamePerson changes an existing person's name, matched case-insensitively on
+// email. It returns the updated row and the name it replaced, both read inside
+// the same statement.
+//
+// Returning them rather than trusting an earlier SELECT is the point: a caller
+// that infers "renamed X to Y" from a prior lookup will happily report a rename
+// that landed on a different row, or on no row at all.
+func (s *Store) RenamePerson(ctx context.Context, email, name string) (model.Person, string, error) {
+	var p model.Person
+	var previous string
+	err := s.pool.QueryRow(ctx, `
+		UPDATE person p SET name = $2, updated_at = now()
+		FROM person old
+		WHERE old.id = p.id AND lower(p.email) = lower($1)
+		RETURNING old.name, p.id, p.name, COALESCE(p.email, ''), p.type, p.created_at, p.updated_at`,
+		email, name).
+		Scan(&previous, &p.ID, &p.Name, &p.Email, &p.Type, &p.CreatedAt, &p.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.Person{}, "", ErrNotFound
+	}
+	if err != nil {
+		return model.Person{}, "", fmt.Errorf("store: rename person: %w", err)
+	}
+	return p, previous, nil
 }
 
 // EnsureService inserts the service if absent and returns the row. Used to seed

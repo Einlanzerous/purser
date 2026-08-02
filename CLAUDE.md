@@ -12,8 +12,9 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 
 ## Layout
 
-- `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `migrate`,
-  `version`). Composition root: `setup()` wires store + connectors + orchestrator.
+- `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `person add`,
+  `audit`, `reconcile`, `migrate`, `version`). Composition root: `setup()` wires
+  store + connectors + orchestrator.
 - `internal/model/` — domain types (person, service, account, invite,
   provision_task), 1:1 with the schema.
 - `internal/connector/` — the `Connector` interface + `Registry` +
@@ -57,6 +58,19 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   distinct from `UpstreamNo` throughout the audit, and a failed connector call
   must never mark records stale — a transient outage would otherwise wipe out
   everyone's access records.
+- **`person add` provisions nothing.** The add writes a `person` row and nothing
+  else — no `account` rows, no credentials, no `Provision`. It exists so the
+  audit can see people onboarded outside Purser, and it stops being useful the
+  moment it starts doing invite's job. (`--audit` then runs the ordinary
+  read-only audit, which does call `Reconcile`; that's the preview, not the add.)
+- **An occupied email is a conflict, not an edit.** `UpsertPerson` is
+  `ON CONFLICT … DO UPDATE SET name`, so any command taking `--name` renames
+  whoever holds that address unless it refuses first — `person add` uses
+  `InsertPersonIfAbsent` and requires `--rename`. `invite` still has this trap.
+- **`person.email` is unique case-insensitively** (migration 0003), and every
+  conflict target must infer on `lower(email)`. The index and the store's
+  lookups disagreed once; the gap inserted duplicate identities for the same
+  human, which the audit then populated twice.
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
   plaintext lives only in the returned/emailed credential block.
 - **Switchyard needs the email set** on user create — it's the SSO join key
@@ -82,12 +96,12 @@ Access connector and email/copy-paste delivery. All four connectors are live:
 the three token-gated ones registers Unavailable when its token is unset.
 
 Also shipped: onboarding bundles + the launcher-led credential block (PRSR-12),
-and `audit` / `reconcile` (PRSR-15), which retired 15 (person × service) pairs of
-real drift with zero upstream mutation.
+`audit` / `reconcile` (PRSR-15), which retired 15 (person × service) pairs of
+real drift with zero upstream mutation, and `person add` (PRSR-16), the roster
+entry point that provisions nothing.
 
 Open, in rough priority order: `Deprovision` is unimplemented on every connector
 but Cloudflare (PRSR-17) — so `stale` can re-arm provisioning but cannot revoke;
-there's no way to add a person without provisioning them (PRSR-16); nothing runs
-the audit on a schedule (PRSR-18); Purser still authenticates to Switchyard as
-the instance bootstrap token rather than a dedicated one (PRSR-3); and service
-spin-up is a separate axis, not started (PRSR-11).
+nothing runs the audit on a schedule (PRSR-18); Purser still authenticates to
+Switchyard as the instance bootstrap token rather than a dedicated one (PRSR-3);
+and service spin-up is a separate axis, not started (PRSR-11).
