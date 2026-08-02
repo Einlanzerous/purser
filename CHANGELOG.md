@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/Einlanzerous/purser/compare/v0.9.0...v0.9.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* **invite:** keep the operator's failure list out of emailed invites (PRSR-19) ([#18](https://github.com/Einlanzerous/purser/issues/18)) ([31e1ec2](https://github.com/Einlanzerous/purser/commit/31e1ec281aa1a5eb09383afe48527ae2a8c9849f))
+* **invite:** stop silently renaming an existing person (PRSR-20) ([#20](https://github.com/Einlanzerous/purser/issues/20)) ([fc0d027](https://github.com/Einlanzerous/purser/commit/fc0d0274793d9bb323b48eb86882812828efc6c9))
+
 ## [0.9.0](https://github.com/Einlanzerous/purser/compare/v0.8.0...v0.9.0) (2026-08-02)
 
 
