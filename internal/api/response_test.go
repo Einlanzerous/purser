@@ -29,8 +29,9 @@ func result(delivery model.DeliveryMethod) *invite.Result {
 			},
 		},
 		CredentialBlock: "Hi Ada — …\n    API token: sw_TOKEN\n",
-		OperatorNote:    "Operator note — not for the recipient:\n  ✗ Lyceum: lyceum: 502 from lyceum.internal:8080 (failed)\n",
-		Delivered:       delivery == model.DeliverEmail,
+		OperatorNote: "Operator note — not for the recipient:\n\n  Failed — worth a retry once fixed:\n" +
+			"    ✗ Lyceum: lyceum: 502 from lyceum.internal:8080\n",
+		Delivered: delivery == model.DeliverEmail,
 	}
 }
 
@@ -131,5 +132,28 @@ func TestNewInviteResponse_OutcomesCarryErrorsButNeverSecrets(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "lyceum: 502") {
 		t.Errorf("outcomes should carry the connector error:\n%s", body)
+	}
+}
+
+// A registered-but-unconfigured connector reports its own status over HTTP
+// rather than "failed" plus a `pending` flag beside it (PRSR-21). One field
+// answers the question; a caller bucketing by status can't get it wrong by
+// forgetting the second one existed.
+func TestNewInviteResponse_UnavailableIsAStatusNotAFlag(t *testing.T) {
+	res := result(model.DeliverCopyPaste)
+	res.Outcomes[1] = invite.ServiceOutcome{
+		ServiceKey: "lyceum", DisplayName: "Lyceum", Status: model.TaskUnavailable,
+		Error: "connector: provisioning not yet available: PURSER_LYCEUM_TOKEN is unset",
+	}
+
+	body, err := json.Marshal(newInviteResponse(res))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(body), `"status":"unavailable"`) {
+		t.Errorf("unavailable should ride in the status field:\n%s", body)
+	}
+	if strings.Contains(string(body), `"pending"`) {
+		t.Errorf("the pending flag is gone; status carries it now:\n%s", body)
 	}
 }

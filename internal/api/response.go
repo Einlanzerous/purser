@@ -48,11 +48,16 @@ type personDTO struct {
 
 // outcomeDTO is the per-service result. Secrets are never serialized here; they
 // live only in the credential block.
+//
+// A connector that was registered but couldn't provision reports
+// status="unavailable" — it used to be status="failed" alongside pending=true,
+// and that field is gone (PRSR-21). Deriving it back from the new status would
+// have kept every caller compatible, at the cost of handing each of them the
+// same two-fields-one-question ambiguity this change exists to remove.
 type outcomeDTO struct {
 	Service      string `json:"service"`
 	DisplayName  string `json:"display_name"`
 	Status       string `json:"status"`
-	Pending      bool   `json:"pending,omitempty"`
 	Error        string `json:"error,omitempty"`
 	Username     string `json:"username,omitempty"`
 	LoginURL     string `json:"login_url,omitempty"`
@@ -78,7 +83,6 @@ func newInviteResponse(res *invite.Result) inviteResponse {
 			Service:      o.ServiceKey,
 			DisplayName:  o.DisplayName,
 			Status:       string(o.Status),
-			Pending:      o.Pending,
 			Error:        o.Error,
 			Username:     o.Username,
 			LoginURL:     o.LoginURL,

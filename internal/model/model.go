@@ -23,15 +23,35 @@ const (
 
 // TaskStatus is the lifecycle of a single per-service provisioning attempt.
 // Idempotent re-runs act only on tasks that are not Succeeded (see the invite
-// orchestrator): Failed tasks are retried, Succeeded ones are skipped.
+// orchestrator): Failed and Unavailable tasks are retried, Succeeded ones are
+// skipped.
+//
+// Failed and Unavailable are separate states because they answer different
+// questions. Failed means something broke and someone should look at it;
+// Unavailable means the connector was never in a position to try. Both are
+// retryable and neither provisioned anything, which is why they were one state
+// for a while — but every consumer that buckets by status (the operator note,
+// the launcher gate, the CLI marks) needs to tell them apart, and doing that on
+// a bool riding alongside the status meant each new consumer had to remember the
+// bool existed (PRSR-21).
 type TaskStatus string
 
 const (
-	TaskPending   TaskStatus = "pending"   // created, not yet run
-	TaskRunning   TaskStatus = "running"   // connector.Provision in flight
-	TaskSucceeded TaskStatus = "succeeded" // account provisioned
-	TaskFailed    TaskStatus = "failed"    // connector returned an error; retryable
-	TaskSkipped   TaskStatus = "skipped"   // already provisioned on a prior invite
+	TaskPending TaskStatus = "pending" // created, not yet run
+	TaskRunning TaskStatus = "running" // connector.Provision in flight
+	// TaskUnavailable — the connector returned connector.ErrPending: it is
+	// registered but could not provision, because it isn't configured or its
+	// upstream has no provisioning API yet. Retryable, but retrying changes
+	// nothing until a human configures something.
+	//
+	// Named for connector.Unavailable, which is the usual source, rather than
+	// "pending" — TaskPending is already the *queued* state, and having the same
+	// word mean both "not run yet" and "can't be run" is the collision this
+	// status exists to avoid.
+	TaskUnavailable TaskStatus = "unavailable"
+	TaskSucceeded   TaskStatus = "succeeded" // account provisioned
+	TaskFailed      TaskStatus = "failed"    // connector returned an error; retryable
+	TaskSkipped     TaskStatus = "skipped"   // already provisioned on a prior invite
 )
 
 // AccountStatus tracks whether a person currently holds access to a service.

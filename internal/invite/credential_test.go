@@ -188,15 +188,108 @@ func TestRenderOperatorNoteEmptyWhenNothingFailed(t *testing.T) {
 }
 
 // A connector that is wired but not yet ready upstream is not a breakage, and
-// the note says so — retrying it won't help.
-func TestRenderOperatorNoteMarksPendingSeparately(t *testing.T) {
-	pending := ServiceOutcome{
-		ServiceKey: "lyceum", DisplayName: "Lyceum", Status: model.TaskFailed,
-		Error: "lyceum: connector not configured", Pending: true,
+// the note files it under its own heading — retrying it won't help, so it does
+// not belong on the list of things a retry would fix (PRSR-21).
+func TestRenderOperatorNoteSeparatesUnavailableFromFailed(t *testing.T) {
+	outcomes := []ServiceOutcome{
+		{
+			ServiceKey: "switchyard", DisplayName: "Switchyard", Status: model.TaskFailed,
+			Error: "switchyard: 500",
+		},
+		{
+			ServiceKey: "lyceum", DisplayName: "Lyceum", Status: model.TaskUnavailable,
+			Error: "connector: provisioning not yet available: PURSER_LYCEUM_TOKEN is unset",
+		},
 	}
-	note := RenderOperatorNote([]ServiceOutcome{pending})
-	if !strings.Contains(note, "(pending)") {
-		t.Errorf("a pending connector should read as pending, not failed:\n%s", note)
+	note := RenderOperatorNote(outcomes)
+
+	// Both are reported: the unavailable one carries the operator's instruction
+	// for finishing the invite (for Cloudflare, the literal dashboard step).
+	for _, want := range []string{"switchyard: 500", "PURSER_LYCEUM_TOKEN is unset"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("operator note missing %q:\n%s", want, note)
+		}
+	}
+	// …but under separate headings, and the retryable one leads. Matched as whole
+	// heading lines: a bare "Failed" would also match inside a display name or an
+	// error string, so the test could pass with no headings rendered at all.
+	failedAt := strings.Index(note, "\n  Failed — worth a retry once fixed:\n")
+	unavailAt := strings.Index(note, "\n  Not available — a retry changes nothing until these are configured:\n")
+	if failedAt < 0 || unavailAt < 0 {
+		t.Fatalf("both sections must be labelled:\n%s", note)
+	}
+	if failedAt > unavailAt {
+		t.Errorf("what needs a retry should lead:\n%s", note)
+	}
+	// The old shape put the unavailable service on the failure list with a
+	// "(pending)" suffix, which is the conflation this test exists to prevent.
+	if strings.Contains(note, "(pending)") {
+		t.Errorf("unavailable is a status now, not a suffix on a failure:\n%s", note)
+	}
+}
+
+// An invite whose only problem is an unconfigured connector still has something
+// to tell the operator — nothing was granted, and they're the one who can fix it.
+func TestRenderOperatorNoteReportsAnUnavailableOnlyInvite(t *testing.T) {
+	note := RenderOperatorNote([]ServiceOutcome{{
+		ServiceKey: "lyceum", DisplayName: "Lyceum", Status: model.TaskUnavailable,
+		Error: "connector: provisioning not yet available: PURSER_LYCEUM_TOKEN is unset",
+	}})
+	if note == "" {
+		t.Error("an invite that granted nothing must not report an empty note")
+	}
+	if strings.Contains(note, "\n  Failed — worth a retry once fixed:\n") {
+		t.Errorf("nothing failed, so no failure heading:\n%s", note)
+	}
+}
+
+// The operator note is the only account of what didn't provision, so a status
+// that matches none of the renderer's arms must not vanish from it. The switch
+// defaults to reporting for that reason; this is what holds the default in place
+// if someone later turns it back into an exhaustive list of the bad statuses.
+func TestRenderOperatorNoteReportsAnUnrecognizedStatus(t *testing.T) {
+	note := RenderOperatorNote([]ServiceOutcome{{
+		ServiceKey: "argosy", DisplayName: "Argosy", Status: model.TaskStatus("quarantined"),
+		Error: "argosy: held for review",
+	}})
+	if !strings.Contains(note, "argosy: held for review") {
+		t.Errorf("an unrecognized status must still reach the operator:\n%s", note)
+	}
+}
+
+// The same question asked of the launcher gate. A status the gate doesn't know
+// is not a grant, so it must close — the failure mode of an exhaustive bad-status
+// list is silent, and it re-opens exactly the half-open invite the gate exists
+// to catch.
+func TestRenderCredentialBlockSuppressesLauncherForAnUnrecognizedStatus(t *testing.T) {
+	block := RenderCredentialBlock(testPerson(), []ServiceOutcome{
+		cfOutcome(model.TaskSucceeded),
+		{ServiceKey: "argosy", DisplayName: "Argosy", Status: model.TaskStatus("quarantined")},
+	}, testLauncher)
+
+	if strings.Contains(block, testLauncher) {
+		t.Errorf("an unrecognized status is not a grant, so the launcher must not lead:\n%s", block)
+	}
+}
+
+// The recipient can't act on the difference between a broken connector and an
+// unconfigured one — either way the app refuses them — so an unavailable service
+// suppresses the launcher exactly as a failed one does.
+func TestRenderCredentialBlockSuppressesLauncherWhenAServiceIsUnavailable(t *testing.T) {
+	block := RenderCredentialBlock(testPerson(), []ServiceOutcome{
+		cfOutcome(model.TaskSucceeded),
+		{
+			ServiceKey: "lyceum", DisplayName: "Lyceum", Status: model.TaskUnavailable,
+			Error: "connector: provisioning not yet available: PURSER_LYCEUM_TOKEN is unset",
+		},
+	}, testLauncher)
+
+	if strings.Contains(block, testLauncher) {
+		t.Errorf("a half-open invite must not lead with a confident start-here:\n%s", block)
+	}
+	// And the reason it isn't there stays the operator's business.
+	if strings.Contains(block, "PURSER_LYCEUM_TOKEN") {
+		t.Errorf("the recipient's block must not carry connector error text:\n%s", block)
 	}
 }
 

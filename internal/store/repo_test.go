@@ -6,6 +6,9 @@ import (
 	"os"
 	"testing"
 
+	"github.com/google/uuid"
+
+	"github.com/Einlanzerous/purser/internal/connector"
 	"github.com/Einlanzerous/purser/internal/model"
 )
 
@@ -218,5 +221,134 @@ func TestAccountAndTask_Idempotency(t *testing.T) {
 	}
 	if gotInv.ID != inv.ID || len(tasks) != 1 || tasks[0].Status != model.TaskSucceeded {
 		t.Errorf("InviteWithTasks wrong: inv=%s tasks=%+v", gotInv.ID, tasks)
+	}
+}
+
+// provision_task.status is CHECK-constrained, not free text, so PRSR-21's new
+// status needed migration 0004 to exist at all. Without it every unavailable
+// connector turns a cosmetic modelling fix into a hard write failure on the
+// invite path — and no fake store can catch that, because the constraint is the
+// thing being tested.
+func TestUpdateTask_PersistsUnavailableStatus(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	svc, err := st.EnsureService(ctx, "lyceum", "Lyceum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := st.UpsertPerson(ctx, "Ada", "ada@example.com", model.PersonHuman)
+	inv, err := st.CreateInvite(ctx, p.ID, model.DeliverCopyPaste, "member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk, err := st.EnsureTask(ctx, inv.ID, p.ID, svc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tk.Status = model.TaskUnavailable
+	tk.Attempts = 1
+	tk.LastError = "connector: provisioning not yet available: PURSER_LYCEUM_TOKEN is unset"
+	if err := st.UpdateTask(ctx, tk); err != nil {
+		t.Fatalf("UpdateTask with %s: %v", model.TaskUnavailable, err)
+	}
+	_, tasks, err := st.InviteWithTasks(ctx, inv.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != model.TaskUnavailable {
+		t.Errorf("status did not round-trip: %+v", tasks)
+	}
+}
+
+// The one-shot backfill in migration 0004. Tasks recorded as 'failed' whose
+// error came from connector.ErrPending were never failures, and leaving them
+// that way means the split this migration introduces reads the past wrong
+// forever.
+//
+// The migration has already run by the time testStore returns, so this re-execs
+// its SQL — which is safe by construction (DROP … IF EXISTS, ADD, UPDATE … WHERE
+// status = 'failed') and is loaded from the embedded file rather than retyped,
+// so the test cannot drift from what actually ships.
+func TestMigration0004_ReclassifiesOnlyErrPendingFailures(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Setup errors are checked rather than discarded: EnsureTask returning a
+	// zero-value task would make UpdateTask a no-op UPDATE … WHERE id = NULL that
+	// reports no error, and the assertions below would then fail on a status that
+	// was never written — pointing at the migration instead of at the setup.
+	svc, err := st.EnsureService(ctx, "lyceum", "Lyceum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := st.UpsertPerson(ctx, "Ada", "ada@example.com", model.PersonHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv, err := st.CreateInvite(ctx, p.ID, model.DeliverCopyPaste, "member")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two rows as the pre-0004 orchestrator would have left them: both 'failed',
+	// distinguishable only by whether the error came from ErrPending.
+	unavailable, err := st.EnsureTask(ctx, inv.ID, p.ID, svc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailable.Status = model.TaskFailed
+	unavailable.LastError = connector.ErrPending.Error() + ": PURSER_LYCEUM_TOKEN is unset"
+	if err := st.UpdateTask(ctx, unavailable); err != nil {
+		t.Fatal(err)
+	}
+
+	other, err := st.EnsureService(ctx, "switchyard", "Switchyard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken, err := st.EnsureTask(ctx, inv.ID, p.ID, other.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken.Status = model.TaskFailed
+	broken.LastError = "switchyard: 500 Internal Server Error"
+	if err := st.UpdateTask(ctx, broken); err != nil {
+		t.Fatal(err)
+	}
+
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.version == "0004" {
+			sql = m.sql
+		}
+	}
+	if sql == "" {
+		t.Fatal("migration 0004 not found in the embedded FS")
+	}
+	if _, err := st.pool.Exec(ctx, sql); err != nil {
+		t.Fatalf("re-apply 0004: %v", err)
+	}
+
+	_, tasks, err := st.InviteWithTasks(ctx, inv.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[uuid.UUID]model.TaskStatus{}
+	for _, tk := range tasks {
+		got[tk.ID] = tk.Status
+	}
+	if got[unavailable.ID] != model.TaskUnavailable {
+		t.Errorf("an ErrPending task should reclassify, got %s", got[unavailable.ID])
+	}
+	// The conservative half, and the one worth protecting: a real failure whose
+	// text we can't attribute stays a failure rather than being guessed at.
+	if got[broken.ID] != model.TaskFailed {
+		t.Errorf("a genuine failure must not be reclassified, got %s", got[broken.ID])
 	}
 }
