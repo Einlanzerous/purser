@@ -215,6 +215,7 @@ its own heading in the same block.
 purser                       # run the HTTP server (default)
 purser serve                 # ditto
 purser invite --name NAME --email EMAIL [--to svc1,svc2] [--bundle NAME] [--role member|admin] [--deliver copypaste|email]
+purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]
 purser audit [--email EMAIL] [--to svc1,svc2]              # report drift, read-only
 purser reconcile --email EMAIL | --all [--to svc1,svc2]    # repair records
 purser migrate               # apply DB migrations and exit
@@ -268,6 +269,74 @@ is what keeps a future connector honest.
 
 `purser reconcile` refuses to touch the whole roster without `--all`, since it's
 a bulk write.
+
+### Adding someone Purser didn't provision
+
+The audit walks the `person` table, so it only sees people Purser already knows.
+Someone onboarded by hand is omitted entirely — and the report still says
+`0 errors`, which reads as complete when it isn't. `person add` writes the row
+and nothing else:
+
+```
+$ purser person add --name "Ada Lovelace" --email ada@example.com --audit
+added Ada Lovelace <ada@example.com> (human)
+
+No accounts written; the add itself called no connectors.
+
+--- audit --email ada@example.com (read-only) ---
+PERSON           SERVICE     RECORDED  UPSTREAM  ACTION
+ada@example.com  argosy      no        unknown   unverifiable
+ada@example.com  cloudflare  no        unknown   unverifiable
+ada@example.com  lyceum      no        unknown   unverifiable
+ada@example.com  switchyard  no        yes       record
+
+4 checked: 0 ok, 1 to record, 0 stale, 3 unverifiable, 0 errors
+
+Dry run — nothing written. Re-run as `purser reconcile` to apply.
+Unverifiable services have no upstream lookup endpoint; they are left untouched.
+  …
+
+Next:
+  purser reconcile --email ada@example.com                     # apply the 1 change above
+  purser invite --name "Ada Lovelace" --email ada@example.com  # provision what they lack
+```
+
+(Only Switchyard is configured in that example, hence three unverifiable rows;
+the per-service reasons are elided at `…`.)
+
+The add itself writes no `account` rows, calls no connectors, and mints no
+credentials — use `invite` to provision. `--audit` then runs the same read-only
+preview `purser audit --email …` would print; that half *does* reach connectors,
+through `Reconcile`, which never mutates. The `reconcile` hint appears only when
+the preview actually found something to record.
+
+An email that already exists is a **conflict, not an edit** — for both the name
+and the type. Purser's older `UpsertPerson` renames on conflict, so a command
+taking `--name` would otherwise rename whoever holds that address silently; `add`
+uses an insert-if-absent instead and refuses:
+
+```
+$ purser person add --name "A. Lovelace" --email ada@example.com
+purser: invite: person already recorded under a different name: ada@example.com is recorded as "Ada Lovelace", not "A. Lovelace"
+purser: pass --rename to change the recorded name
+```
+
+`--rename` opts in, and reports the name the write actually replaced rather than
+one inferred from a prior read. Omitting `--type` leaves an existing person's
+type alone; passing one that disagrees is refused the same way.
+
+`--email` is required even with `--type agent`: it's the conflict target that
+makes the add idempotent and the key the audit looks people up by, so a row
+without one could be added twice and reconciled never. It is validated as an
+address, which rejects a fragment or a `Name <addr>` form — it cannot, of
+course, catch a plausible typo like `ada@exmaple.com`.
+
+Emails are unique **case-insensitively** (migration `0003`). They were not
+before: the index was case-sensitive while every lookup matched `lower(email)`,
+so a row entered by hand as `Ada@Example.com` didn't collide with the lowercased
+address the code writes, and an upsert would insert a second person for the same
+human. That is the duplicate-identity failure this command exists to prevent, so
+it had to be fixed in the schema, not worked around above it.
 
 `invite` writes a human summary to stderr and the credential block to stdout, so
 `purser invite … | pbcopy` (or `> block.txt`) captures exactly the pasteable

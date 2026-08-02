@@ -171,6 +171,48 @@ Three guardrails, because an audit that damages records is worse than no audit:
 Why this is not just a re-invite: re-inviting someone who already has Switchyard
 mints them a *second* API token. Reconcile mints nothing and contacts nobody.
 
+### Getting people into the roster (PRSR-16)
+
+The audit walks the `person` table, so it can only ask about people Purser
+already knows. Anyone onboarded outside Purser is simply omitted — and the
+report says "0 errors" while being silently incomplete, which is the failure
+mode the audit exists to prevent.
+
+`purser person add --name … --email …` writes that row and nothing else: no
+`account` rows, no connector calls, no credentials. It makes someone
+*auditable* without claiming to have provisioned them, which is what neither
+`invite` (it would try to create accounts they may already hold) nor hand-written
+SQL (a typo'd email mints a duplicate identity that reconcile then dutifully
+populates) can do. `--audit` follows the add with the same read-only preview
+`purser audit --email …` prints.
+
+An email that already exists is a **conflict, not an edit**. `UpsertPerson` does
+`ON CONFLICT … DO UPDATE SET name`, so any command taking `--name` would
+otherwise rename whoever holds that address without ever saying so. `add` uses
+`InsertPersonIfAbsent`, which never touches an occupied row, and `--rename` is
+the explicit opt-in — served by a single `UPDATE … RETURNING` that reports the
+name it replaced, so the command cannot announce a rename the database didn't
+perform. The same rule covers `--type`: omitted, it leaves an existing person
+alone; supplied and disagreeing, it is refused rather than silently dropped.
+
+Email is required even for `--type agent`, though the schema allows it to be
+null: it is the conflict target that makes the add idempotent and the key the
+audit looks people up by, so a row without one could be added twice and
+reconciled never.
+
+**Emails are unique case-insensitively** (migration 0003). They weren't
+originally: `person_email_key` indexed the bare column while every store lookup
+matched `lower(email)`. A row entered by hand as `Ada@Example.com` therefore did
+not collide with the lowercased address the code writes, and the upsert inserted
+a *second* person for the same human — precisely the duplicate identity this
+command exists to prevent, and one the audit would then walk and populate twice.
+That had to be fixed in the schema: a guard in `AddPerson` would have left
+`invite` minting the duplicates instead.
+
+Deploying 0003 requires that no such pair already exists, since the index cannot
+be built over one. It fails loudly and transactionally if so — the migration
+carries the query that finds them.
+
 ## Delivery
 
 The credential block is plain text (pastes cleanly into any chat platform).
@@ -215,6 +257,8 @@ Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
 - **Onboarding bundles** (PRSR-12) and the launcher-led credential block.
 - **Audit & reconcile** (PRSR-15), which retired 15 (person × service) pairs of
   real drift with zero upstream mutation (PRSR-14).
+- **`purser person add`** (PRSR-16) — a roster entry point that provisions
+  nothing, so people onboarded outside Purser stop being invisible to the audit.
 
 **Open:**
 
@@ -222,9 +266,6 @@ Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
   connector except Cloudflare. Purser can onboard across the stack in one command
   and cannot remove anyone. This is why `stale` currently means "re-arm
   provisioning" and cannot mean "revoke".
-- **PRSR-16 — add a person without provisioning them.** Every path to a `person`
-  row goes through `invite`, so anyone onboarded outside Purser is invisible to
-  the audit until someone hand-inserts them.
 - **PRSR-18 — run the audit on a schedule.** It exists and nothing triggers it,
   so drift will reaccumulate and be found the same way it was last time: by
   accident.

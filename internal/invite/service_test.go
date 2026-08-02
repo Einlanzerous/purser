@@ -273,6 +273,37 @@ func (s *fakeStore) UpsertPerson(_ context.Context, name, email string, typ mode
 	return p, nil
 }
 
+// InsertPersonIfAbsent mirrors the real store: the email is unique
+// case-insensitively, and an occupied one is never modified.
+func (s *fakeStore) InsertPersonIfAbsent(_ context.Context, name, email string, typ model.PersonType) (model.Person, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if email == "" {
+		return model.Person{}, false, errors.New("store: insert person: email is required")
+	}
+	k := strings.ToLower(email)
+	if _, ok := s.people[k]; ok {
+		return model.Person{}, false, nil
+	}
+	p := model.Person{ID: uuid.New(), Name: name, Email: k, Type: typ}
+	s.people[k] = p
+	return p, true, nil
+}
+
+func (s *fakeStore) RenamePerson(_ context.Context, email, name string) (model.Person, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := strings.ToLower(email)
+	p, ok := s.people[k]
+	if !ok {
+		return model.Person{}, "", store.ErrNotFound
+	}
+	previous := p.Name
+	p.Name = name
+	s.people[k] = p
+	return p, previous, nil
+}
+
 func (s *fakeStore) ServiceByKey(_ context.Context, key string) (model.Service, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

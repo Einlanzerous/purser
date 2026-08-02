@@ -27,6 +27,9 @@ import (
 // satisfies it; tests supply an in-memory fake.
 type Store interface {
 	UpsertPerson(ctx context.Context, name, email string, typ model.PersonType) (model.Person, error)
+	InsertPersonIfAbsent(ctx context.Context, name, email string, typ model.PersonType) (model.Person, bool, error)
+	RenamePerson(ctx context.Context, email, name string) (model.Person, string, error)
+	PersonByEmail(ctx context.Context, email string) (model.Person, error)
 	ServiceByKey(ctx context.Context, key string) (model.Service, error)
 	CreateInvite(ctx context.Context, personID uuid.UUID, delivery model.DeliveryMethod, role string) (model.Invite, error)
 	MarkInviteDelivered(ctx context.Context, inviteID uuid.UUID) error
