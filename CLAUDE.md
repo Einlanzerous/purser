@@ -80,6 +80,11 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   failed connector mailed an invitee raw `err.Error()` text under a heading
   saying it wasn't for them (PRSR-19). Don't re-merge them or filter the rendered
   string — the split is at the source so the emailer has nothing to get wrong.
+- **An invite that provisioned nothing sends no email.** With the operator note
+  split out, an all-failed invite's block is a greeting and nothing else, so
+  mailing it announces access that wasn't granted — and marks the invite
+  delivered, so "did they get it?" answers yes. `deliverable()` gates the send;
+  `Delivered` stays false and the CLI says so. A *partial* failure still sends.
 - **Switchyard needs the email set** on user create — it's the SSO join key
   (`users.email`). Don't drop it.
 - Connectors should treat "already exists" upstream as success (reconcile) so a

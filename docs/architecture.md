@@ -221,6 +221,11 @@ The credential block is plain text (pastes cleanly into any chat platform).
 `--deliver email` sends it over SMTP to the person. One-time secrets appear once
 and are never retrievable afterward.
 
+An invite where *every* service failed sends no email at all: there is nothing to
+tell the recipient, and a greeting on its own announces access that wasn't
+granted. The invite stays undelivered, the operator is told why, and the next run
+retries only what failed.
+
 The block **leads with Cloudflare's App Launcher** — the one page listing every
 Access-gated app a person can reach — and then gives per-service detail. That
 page is Cloudflare's, rendered at the team domain, so Purser gains no public

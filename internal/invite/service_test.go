@@ -251,6 +251,11 @@ func TestRun_EmailDelivery_OmitsTheOperatorNote(t *testing.T) {
 	if mail.sent != 1 {
 		t.Fatalf("want exactly 1 email sent, got %d", mail.sent)
 	}
+	// Who received it is the point of the whole ticket — assert it, don't just
+	// capture it.
+	if mail.to != "ada@example.com" {
+		t.Errorf("emailed the wrong recipient: %q", mail.to)
+	}
 	for _, leak := range []string{"lyceum.internal", "502", "Operator note", "✗"} {
 		if strings.Contains(mail.body, leak) {
 			t.Errorf("emailed body leaks operator-only text %q:\n%s", leak, mail.body)
@@ -269,6 +274,65 @@ func TestRun_EmailDelivery_OmitsTheOperatorNote(t *testing.T) {
 	}
 	if !res.Delivered {
 		t.Error("a per-service failure must not block delivery of the rest")
+	}
+}
+
+// Removing the operator note from the credential block left the all-failed case
+// with an empty envelope: a greeting, and nothing else. Mailing that tells the
+// invitee they've been granted access while granting them none, and marks the
+// invite delivered — so a later "did they get it?" answers yes.
+func TestRun_EmailDelivery_SendsNothingWhenEveryServiceFailed(t *testing.T) {
+	st := newFakeStore()
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", icon: "🚉", fail: errors.New("switchyard: 500")}
+	lyc := &fakeConn{key: "lyceum", display: "Lyceum", icon: "📚", fail: errors.New("lyceum: 502")}
+	reg := connector.NewRegistry(sw, lyc)
+	mail := &fakeEmailer{}
+	svc := New(seededStore(t, st, reg), reg, mail)
+
+	res, err := svc.Run(context.Background(), Request{
+		Name: "Ada Lovelace", Email: "ada@example.com",
+		Services: []string{"switchyard", "lyceum"}, Delivery: model.DeliverEmail,
+	})
+	// Still not an error: per-service failures don't abort the invite, and the
+	// caller needs the Result to see what broke.
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if mail.sent != 0 {
+		t.Errorf("sent %d emails for an invite that provisioned nothing:\n%s", mail.sent, mail.body)
+	}
+	if res.Delivered {
+		t.Error("Delivered must stay false when no email was sent")
+	}
+	// The operator still gets the full picture.
+	for _, want := range []string{"switchyard: 500", "lyceum: 502"} {
+		if !strings.Contains(res.OperatorNote, want) {
+			t.Errorf("operator note missing %q:\n%s", want, res.OperatorNote)
+		}
+	}
+}
+
+// The partial case still sends: the recipient gets what they actually got, which
+// is why a per-service failure doesn't abort the invite in the first place.
+func TestRun_EmailDelivery_SendsWhenSomethingSucceeded(t *testing.T) {
+	st := newFakeStore()
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", icon: "🚉", result: connector.Result{
+		ExternalID: "u-1", Username: "Ada", Secret: "sw_TOKEN",
+	}}
+	lyc := &fakeConn{key: "lyceum", display: "Lyceum", icon: "📚", fail: errors.New("lyceum: 502")}
+	reg := connector.NewRegistry(sw, lyc)
+	mail := &fakeEmailer{}
+	svc := New(seededStore(t, st, reg), reg, mail)
+
+	res, err := svc.Run(context.Background(), Request{
+		Name: "Ada Lovelace", Email: "ada@example.com",
+		Services: []string{"switchyard", "lyceum"}, Delivery: model.DeliverEmail,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if mail.sent != 1 || !res.Delivered {
+		t.Fatalf("a partly-successful invite must still be delivered (sent=%d delivered=%v)", mail.sent, res.Delivered)
 	}
 }
 

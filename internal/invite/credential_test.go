@@ -200,6 +200,39 @@ func TestRenderOperatorNoteMarksPendingSeparately(t *testing.T) {
 	}
 }
 
+// A launcher-only invite has no per-app details left once the Cloudflare entry
+// is dropped, so the heading would announce a section that never arrives — and
+// the secrets warning would send the reader hunting for a secret SSO never
+// issued.
+func TestRenderCredentialBlockLauncherOnlyInviteHasNoEmptySections(t *testing.T) {
+	block := RenderCredentialBlock(testPerson(), []ServiceOutcome{cfOutcome(model.TaskSucceeded)}, testLauncher)
+
+	if strings.Contains(block, "Per-app details") {
+		t.Errorf("no per-app entries survive, so the heading must not print:\n%s", block)
+	}
+	if strings.Contains(block, "Keep any secrets") {
+		t.Errorf("an SSO-only invite carries no secret to warn about:\n%s", block)
+	}
+	// The part that matters is still there.
+	if !strings.Contains(block, testLauncher) {
+		t.Errorf("launcher missing:\n%s", block)
+	}
+}
+
+// The heading earns its place as soon as one entry survives the suppression.
+func TestRenderCredentialBlockKeepsThePerAppHeadingWhenEntriesRemain(t *testing.T) {
+	block := RenderCredentialBlock(testPerson(), []ServiceOutcome{
+		cfOutcome(model.TaskSucceeded), argosyOutcome(),
+	}, testLauncher)
+
+	if !strings.Contains(block, "Per-app details") {
+		t.Errorf("Argosy survives the suppression, so it needs its heading:\n%s", block)
+	}
+	if !strings.Contains(block, "Keep any secrets") {
+		t.Errorf("Argosy ships a password, so the warning applies:\n%s", block)
+	}
+}
+
 // Without this the launcher silently switches off if the connector's key is ever
 // renamed, and every test above still passes because they hardcode the literal.
 func TestAccessServiceKeyMatchesTheConnector(t *testing.T) {

@@ -127,6 +127,11 @@ func printResult(res *invite.Result) {
 	if res.Delivery == model.DeliverEmail {
 		if res.Delivered {
 			fmt.Fprintf(os.Stderr, "\nCredential block emailed to %s.\n", res.Person.Email)
+		} else {
+			// Not sending is deliberate when nothing succeeded, but it must never
+			// be silent — the operator would otherwise assume the invite landed.
+			fmt.Fprintf(os.Stderr, "\nNothing emailed to %s — no service provisioned successfully.\n", res.Person.Email)
+			fmt.Fprintln(os.Stderr, "Re-run the same invite once the failures above are fixed; it retries only what failed.")
 		}
 		return
 	}
