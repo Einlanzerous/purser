@@ -96,6 +96,18 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   mailing it announces access that wasn't granted — and marks the invite
   delivered, so "did they get it?" answers yes. `deliverable()` gates the send;
   `Delivered` stays false and the CLI says so. A *partial* failure still sends.
+- **`unavailable` is a task status, not a flavour of `failed`.** A connector
+  returning `connector.ErrPending` — registered but unconfigured, or with no
+  upstream provisioning API — records `TaskUnavailable` (PRSR-21). It used to be
+  `TaskFailed` plus a `Pending bool`, and every consumer that buckets by status
+  then had to remember the bool: the operator note filed it under "what failed"
+  and then labelled the line `(pending)`. Don't reintroduce a modifier alongside
+  the status, and don't reuse `TaskPending` for it — that's the *queued* state,
+  and "hasn't run yet" vs "can't be run" is the collision that caused this. The
+  split is only ever consulted for the difference, so let it switch on a status:
+  the note groups the two under separate headings, the CLI marks them `…` and
+  `✗`. `provision_task.status` is CHECK-constrained (not free text) — a new
+  status needs a migration.
 - **Switchyard needs the email set** on user create — it's the SSO join key
   (`users.email`). Don't drop it.
 - Connectors should treat "already exists" upstream as success (reconcile) so a
@@ -122,8 +134,9 @@ Also shipped: onboarding bundles + the launcher-led credential block (PRSR-12),
 `audit` / `reconcile` (PRSR-15), which retired 15 (person × service) pairs of
 real drift with zero upstream mutation, `person add` (PRSR-16), the roster entry
 point that provisions nothing, the recipient/operator split in the invite result
-(PRSR-19), and the end of `invite`'s silent rename (PRSR-20), which also made a
-name mismatch fatal on the email path.
+(PRSR-19), the end of `invite`'s silent rename (PRSR-20), which also made a
+name mismatch fatal on the email path, and `TaskUnavailable` (PRSR-21), which
+stopped a not-yet-configured connector counting as a breakage.
 
 Open, in rough priority order: `Deprovision` is unimplemented on every connector
 but Cloudflare (PRSR-17) — so `stale` can re-arm provisioning but cannot revoke;

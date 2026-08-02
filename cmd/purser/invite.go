@@ -129,8 +129,7 @@ func printResult(res *invite.Result) {
 		fmt.Fprintf(os.Stderr, "    to change it: purser person add --email %s --name %q --rename\n", c.Email, c.Requested)
 	}
 	for _, o := range res.Outcomes {
-		mark := statusMark(o)
-		fmt.Fprintf(os.Stderr, "  %s %-24s %s", mark, o.DisplayName, o.Status)
+		fmt.Fprintf(os.Stderr, "  %s %-24s %s", statusMark(o.Status), o.DisplayName, o.Status)
 		if o.Error != "" {
 			fmt.Fprintf(os.Stderr, " — %s", o.Error)
 		}
@@ -144,7 +143,7 @@ func printResult(res *invite.Result) {
 			// Not sending is deliberate when nothing succeeded, but it must never
 			// be silent — the operator would otherwise assume the invite landed.
 			fmt.Fprintf(os.Stderr, "\nNothing emailed to %s — no service provisioned successfully.\n", res.Person.Email)
-			fmt.Fprintln(os.Stderr, "Re-run the same invite once the failures above are fixed; it retries only what failed.")
+			fmt.Fprintln(os.Stderr, retryAdvice(res.Outcomes))
 		}
 		return
 	}
@@ -153,16 +152,43 @@ func printResult(res *invite.Result) {
 	fmt.Println(res.CredentialBlock)
 }
 
-func statusMark(o invite.ServiceOutcome) string {
-	switch o.Status {
+// retryAdvice says what actually stands between this invite and a working one.
+//
+// An invite can provision nothing without anything having *failed*: every
+// service unavailable means nothing broke and nothing above needs fixing, so
+// telling the operator to fix the failures sends them hunting for a breakage
+// that isn't there. This is the operator's primary surface, and it was the last
+// place still calling every non-success a failure (PRSR-21).
+func retryAdvice(outcomes []invite.ServiceOutcome) string {
+	var failed, unavailable bool
+	for _, o := range outcomes {
+		switch o.Status {
+		case model.TaskSucceeded, model.TaskSkipped:
+		case model.TaskUnavailable:
+			unavailable = true
+		default:
+			failed = true
+		}
+	}
+	switch {
+	case failed && unavailable:
+		return "Re-run once the failures are fixed and the unavailable connectors are configured; it retries only what didn't provision."
+	case unavailable:
+		return "Nothing failed — those connectors aren't configured yet. Re-run once they are; it retries only what didn't provision."
+	default:
+		return "Re-run the same invite once the failures above are fixed; it retries only what failed."
+	}
+}
+
+func statusMark(status model.TaskStatus) string {
+	switch status {
 	case model.TaskSucceeded:
 		return "✓"
 	case model.TaskSkipped:
 		return "•"
+	case model.TaskUnavailable:
+		return "…"
 	default:
-		if o.Pending {
-			return "…"
-		}
 		return "✗"
 	}
 }

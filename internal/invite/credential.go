@@ -42,10 +42,12 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome, launc
 		greeting = strings.Fields(n)[0]
 	}
 
+	// Only the two statuses that mean "the person can use this" are collected.
+	// Everything else is absent from both slices by construction, which is what
+	// lets the launcher gate below ask its question positively.
 	var (
 		succeeded []ServiceOutcome
 		skipped   []ServiceOutcome
-		failed    []ServiceOutcome
 	)
 	for _, o := range outcomes {
 		switch o.Status {
@@ -53,22 +55,31 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome, launc
 			succeeded = append(succeeded, o)
 		case model.TaskSkipped:
 			skipped = append(skipped, o)
-		case model.TaskFailed:
-			failed = append(failed, o)
 		}
 	}
 
 	launcher = strings.TrimSpace(launcher)
 
 	// The launcher leads only when this invite left the person able to actually
-	// use it: they're in the Access group, and nothing else in the invite failed.
+	// use it: they're in the Access group, and every service in the invite came
+	// through.
 	//
-	// The len(failed) check is the important half. A half-provisioned invite is
-	// exactly where a confident "start here" is worst: Access admits them to the
-	// edge, the app whose provisioning failed then refuses them, and they have no
-	// way to self-serve. That's the state the both-halves-or-neither invariant
-	// exists to prevent, so the block must not present it as a finished welcome.
-	showLauncher := launcher != "" && len(failed) == 0 && hasAccessGrant(succeeded, skipped)
+	// allGranted is the important half. A half-provisioned invite is exactly
+	// where a confident "start here" is worst: Access admits them to the edge, the
+	// app whose provisioning failed then refuses them, and they have no way to
+	// self-serve. That's the state the both-halves-or-neither invariant exists to
+	// prevent, so the block must not present it as a finished welcome.
+	//
+	// It counts what *did* provision rather than enumerating what didn't, and
+	// that direction is deliberate. An unavailable service closes the gate for the
+	// same reason a failed one does — the door it stands behind is just as shut to
+	// the person reading this — but it closes because it isn't a grant, not
+	// because it appears on a list of bad statuses. A list would have to be
+	// re-audited every time TaskStatus gains a member, and the failure mode of
+	// forgetting is silent: the gate re-opens on the half-open invite it exists to
+	// catch. Two statuses mean "granted", and they are the ones spelled out.
+	allGranted := len(succeeded)+len(skipped) == len(outcomes)
+	showLauncher := launcher != "" && allGranted && hasAccessGrant(succeeded, skipped)
 
 	if showLauncher {
 		// With the launcher leading, a standalone Cloudflare entry would repeat
@@ -154,7 +165,7 @@ func hasSecret(succeeded []ServiceOutcome) bool {
 }
 
 // RenderOperatorNote lists the services this invite could not provision, for
-// whoever ran it. It returns "" when nothing failed.
+// whoever ran it. It returns "" when every service came through.
 //
 // This is a separate string from the credential block rather than a trailing
 // section of it, and that separation is the whole point. The two were one string
@@ -164,22 +175,51 @@ func hasSecret(succeeded []ServiceOutcome) bool {
 // `err.Error()` text: status codes, upstream bodies, whatever a connector chose
 // to put there (PRSR-19). Splitting at the source leaves the emailer nothing to
 // filter and no way to get the audience wrong.
+//
+// Failures and unavailable connectors are listed under separate headings because
+// they ask the operator for different things: a failure wants investigating and
+// a retry, while an unavailable connector wants a token set and will report the
+// same thing on every retry until someone does. Listing them together under
+// "what failed" — which is what a `(pending)` suffix on a failure line amounted
+// to — puts the one item nobody needs to act on today at the top of the list of
+// things to act on (PRSR-21).
+//
+// Neither section is dropped as uninteresting. Unavailable is not always "a
+// token you already know you didn't set": Cloudflare returns ErrPending carrying
+// the exact dashboard step to perform by hand, which is the operator's whole
+// instruction for finishing that invite.
 func RenderOperatorNote(outcomes []ServiceOutcome) string {
-	var b strings.Builder
+	var failed, unavailable strings.Builder
 	for _, o := range outcomes {
-		if o.Status != model.TaskFailed {
-			continue
+		switch o.Status {
+		case model.TaskSucceeded, model.TaskSkipped:
+			// The person got it. Nothing here is the operator's problem.
+		case model.TaskUnavailable:
+			fmt.Fprintf(&unavailable, "    … %s: %s\n", o.DisplayName, o.Error)
+		default:
+			// Failed, plus anything a later change adds to TaskStatus. Reported
+			// rather than dropped, and for the same reason the launcher gate above
+			// enumerates the good statuses: this note is the operator's only
+			// account of what didn't provision, so a status that falls through
+			// every arm silently reads as "everything worked".
+			fmt.Fprintf(&failed, "    ✗ %s: %s\n", o.DisplayName, o.Error)
 		}
-		status := "failed"
-		if o.Pending {
-			status = "pending"
-		}
-		fmt.Fprintf(&b, "  ✗ %s: %s (%s)\n", o.DisplayName, o.Error, status)
 	}
-	if b.Len() == 0 {
+	if failed.Len() == 0 && unavailable.Len() == 0 {
 		return ""
 	}
-	return "Operator note — not for the recipient:\n" + b.String()
+
+	var b strings.Builder
+	b.WriteString("Operator note — not for the recipient:\n")
+	if failed.Len() > 0 {
+		b.WriteString("\n  Failed — worth a retry once fixed:\n")
+		b.WriteString(failed.String())
+	}
+	if unavailable.Len() > 0 {
+		b.WriteString("\n  Not available — a retry changes nothing until these are configured:\n")
+		b.WriteString(unavailable.String())
+	}
+	return b.String()
 }
 
 // hasAccessGrant reports whether this invite left the person inside the

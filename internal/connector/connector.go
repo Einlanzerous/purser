@@ -15,6 +15,12 @@ import (
 // whose token isn't configured, or one whose target system doesn't yet support
 // programmatic provisioning. The orchestrator surfaces the message to the
 // operator rather than treating it as a hard failure to retry blindly.
+//
+// It records the task as model.TaskUnavailable, not model.TaskFailed. Anything
+// wrapping this sentinel is therefore asserting "nobody has wired this up yet",
+// which is a different claim from "this broke" — don't reach for it to soften a
+// genuine error. The message is also matched as a literal prefix by migration
+// 0004's one-shot backfill, so changing its text is a schema-adjacent edit.
 var ErrPending = errors.New("connector: provisioning not yet available")
 
 // ErrReconcileUnsupported is returned by Reconcile when the target system has

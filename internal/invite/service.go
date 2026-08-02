@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/google/uuid"
@@ -106,8 +107,7 @@ type ServiceOutcome struct {
 	DisplayName string
 	Icon        string // emoji shown next to the service in the credential block
 	Status      model.TaskStatus
-	Error       string // set when Status == failed
-	Pending     bool   // connector is wired but upstream support is not ready
+	Error       string // set when Status is failed or unavailable
 
 	// Credential material (present on success; Secret is one-time plaintext and
 	// is never persisted — only its hash is).
@@ -154,7 +154,7 @@ type Result struct {
 	Bundle          string // the bundle that supplied the service list, if any
 	Outcomes        []ServiceOutcome
 	CredentialBlock string // the copy-pasteable block, for the recipient
-	OperatorNote    string // failure list for the operator; "" when nothing failed
+	OperatorNote    string // what didn't provision, for the operator; "" when everything did
 	Delivered       bool   // true when an email was actually sent
 
 	// NameConflict is set when --name disagreed with the stored record. The
@@ -440,14 +440,35 @@ func (s *Service) provisionOne(ctx context.Context, inv model.Invite, person mod
 		InviteRef: fmt.Sprintf("purser-%s-%s", person.ID, conn.Key()),
 	})
 	if provErr != nil {
-		task.Status = model.TaskFailed
-		task.LastError = provErr.Error()
-		if err := s.store.UpdateTask(ctx, task); err != nil {
-			return out, err
+		// ErrPending is its own status, not a flag on failure: the connector
+		// didn't break, it was never in a position to try. Both are retryable and
+		// neither wrote an account, so nothing downstream of here changes — but
+		// what the operator is being told does (PRSR-21).
+		status := model.TaskFailed
+		if errors.Is(provErr, connector.ErrPending) {
+			status = model.TaskUnavailable
 		}
-		out.Status = model.TaskFailed
+		task.Status = status
+		task.LastError = provErr.Error()
+		// Failing to write down a failure must not abort the invite.
+		//
+		// This UPDATE records that a service *didn't* provision. The run it
+		// belongs to may already be holding plaintext secrets minted for other
+		// services, and those exist in exactly one place — the Result being
+		// assembled by the caller, which is discarded the moment this function
+		// returns an error. So a rejected write here (a schema older than the
+		// binary, a constraint this status doesn't satisfy) would strand a live
+		// upstream credential that nobody has a copy of and nobody can re-read.
+		//
+		// Losing a task row's status is recoverable — the next run re-attempts it,
+		// since the idempotency skip keys on an active account and not on this
+		// column. Losing the secret is not. Per-service failures don't abort the
+		// invite; neither does failing to record one.
+		if err := s.store.UpdateTask(ctx, task); err != nil {
+			log.Printf("purser: invite %s: recording %s task for %s: %v", inv.ID, status, conn.Key(), err)
+		}
+		out.Status = status
 		out.Error = provErr.Error()
-		out.Pending = errors.Is(provErr, connector.ErrPending)
 		return out, nil
 	}
 
@@ -502,6 +523,12 @@ func hashSecret(secret string) string {
 //
 // A *partial* failure still sends. The recipient gets what they actually got,
 // which is the whole reason per-service failures don't abort the invite.
+//
+// The test is "did anything succeed", not "did anything fail", and that is the
+// deliberate reading of an all-unavailable invite too (PRSR-21): a connector
+// nobody configured granted no access, so there is exactly as little to send as
+// when one broke. Asking the positive question is what makes the two cases agree
+// without either of them being special-cased.
 func deliverable(outcomes []ServiceOutcome) bool {
 	for _, o := range outcomes {
 		if o.Status == model.TaskSucceeded || o.Status == model.TaskSkipped {

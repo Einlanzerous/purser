@@ -182,12 +182,14 @@ It appears only when the invite left the person able to use it — two condition
    an Argosy-only invitee at it would render them an empty page. A *failed*
    Access grant doesn't count either; a link that rejects them reads as a broken
    invite. An already-provisioned (skipped) grant does count.
-2. **Nothing else in the invite failed.** This is the half-open case: Access
-   admits them to the edge, then the app whose provisioning failed refuses them,
-   with no way to self-serve. That's the state the both-halves-or-neither
+2. **Everything else in the invite came through.** This is the half-open case:
+   Access admits them to the edge, then the app whose provisioning failed refuses
+   them, with no way to self-serve. That's the state the both-halves-or-neither
    invariant exists to prevent, so the block must not present it as a finished
-   welcome. Those invites fall back to the plain per-service list, with the
-   failures in the operator note.
+   welcome. An `unavailable` service counts here too — the recipient can't act on
+   the difference between a broken connector and an unconfigured one, since
+   either way the app turns them away. Those invites fall back to the plain
+   per-service list, with the details in the operator note.
 
 When the launcher leads, the standalone Cloudflare entry is dropped — it carries
 no URL and no secret of its own, so it would only repeat the sign-in instruction
@@ -381,9 +383,27 @@ construct_net/Tailscale isolation).
 
 The credential block (with secrets) is returned only for `copypaste` delivery;
 for `email` the secrets go to the recipient and are not echoed over HTTP.
-`operator_note` — the list of services that failed to provision — is returned on
+`operator_note` — the list of services that didn't provision — is returned on
 both paths and is never part of `credential_block`, so nothing addressed to the
 operator can travel to the invitee.
+
+In `POST /v1/invites`, each entry in `outcomes` has a terminal `status`:
+`succeeded`, `skipped`, `failed`, or `unavailable`. The last means the connector
+is registered but wasn't in a position to try — no token configured, or an
+upstream with no provisioning API yet — and it's a separate status precisely so a
+caller bucketing by `status` doesn't read "nobody wired this up" as "this broke".
+Both are retryable, but only a `failed` one is worth retrying before someone
+changes a config. The note groups them under separate headings for the same
+reason.
+
+`GET /v1/invites/{id}` reports the stored `provision_task` rows instead, so its
+`tasks[].status` can also be `pending` (created, not yet run) or `running` — the
+two non-terminal states an outcome never carries. Note that `pending` there means
+*queued*, which is why the new status is `unavailable` and not `pending`.
+
+> `unavailable` replaced a `pending: true` flag that rode alongside
+> `status: "failed"`; the flag is gone rather than derived, so there is exactly
+> one field to read.
 
 `name_conflict` is present when the request's `name` disagreed with the stored
 person; the stored name was kept and the invite ran anyway. It is also written

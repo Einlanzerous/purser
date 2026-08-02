@@ -181,9 +181,14 @@ func TestRun_FailedOnlyRetry_IsIdempotent(t *testing.T) {
 	}
 }
 
-func TestRun_PendingConnector_SurfacesPending(t *testing.T) {
+// A connector that is registered but not configured gets its own status, not
+// `failed` with a flag beside it (PRSR-21). The distinction is checked on the
+// persisted task as well as the outcome: the task row is what a later audit or
+// report reads, and it is the half that a status-shaped fix could most easily
+// leave behind.
+func TestRun_UnavailableConnector_IsNotAFailure(t *testing.T) {
 	st := newFakeStore()
-	// pendingErr unwraps to connector.ErrPending, so the outcome is flagged Pending.
+	// pendingErr unwraps to connector.ErrPending.
 	pending := &fakeConn{key: "unconfigured", display: "Unconfigured Service", fail: pendingErr{}}
 	reg := connector.NewRegistry(pending)
 	svc := New(seededStore(t, st, reg), reg, nil)
@@ -196,8 +201,72 @@ func TestRun_PendingConnector_SurfacesPending(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	o := outcome(res, "unconfigured")
-	if o.Status != model.TaskFailed || !o.Pending {
-		t.Errorf("want failed+pending, got status=%s pending=%v", o.Status, o.Pending)
+	if o.Status != model.TaskUnavailable {
+		t.Errorf("want status=%s, got %s", model.TaskUnavailable, o.Status)
+	}
+	// The error text still rides along — it's the operator's "why", and for
+	// Cloudflare it's the manual step to perform.
+	if o.Error == "" {
+		t.Error("an unavailable outcome must still carry the connector's reason")
+	}
+	if got := st.taskStatus(res.InviteID, "unconfigured"); got != model.TaskUnavailable {
+		t.Errorf("persisted task status = %s, want %s", got, model.TaskUnavailable)
+	}
+}
+
+// A connector that genuinely broke keeps `failed`. The pair of tests is the
+// point: one status each, neither borrowing the other's.
+func TestRun_BrokenConnector_IsAFailure(t *testing.T) {
+	st := newFakeStore()
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", fail: errors.New("switchyard: 500")}
+	reg := connector.NewRegistry(sw)
+	svc := New(seededStore(t, st, reg), reg, nil)
+
+	res, err := svc.Run(context.Background(), Request{
+		Name: "Ada", Email: "ada@example.com", Services: []string{"switchyard"},
+		Delivery: model.DeliverCopyPaste,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if o := outcome(res, "switchyard"); o.Status != model.TaskFailed {
+		t.Errorf("want status=%s, got %s", model.TaskFailed, o.Status)
+	}
+	if got := st.taskStatus(res.InviteID, "switchyard"); got != model.TaskFailed {
+		t.Errorf("persisted task status = %s, want %s", got, model.TaskFailed)
+	}
+}
+
+// An unavailable service is retried like a failed one: the idempotency skip keys
+// on an *active account*, not on the task status, so giving ErrPending its own
+// status must not have quietly parked those tasks. This is the invariant that
+// makes "configure the token, re-run the same invite" work.
+func TestRun_UnavailableConnector_IsRetriedOnRerun(t *testing.T) {
+	st := newFakeStore()
+	conn := &fakeConn{key: "lyceum", display: "Lyceum", fail: pendingErr{}}
+	reg := connector.NewRegistry(conn)
+	svc := New(seededStore(t, st, reg), reg, nil)
+
+	req := Request{
+		Name: "Ada", Email: "ada@example.com", Services: []string{"lyceum"},
+		Delivery: model.DeliverCopyPaste,
+	}
+	if _, err := svc.Run(context.Background(), req); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// The token gets configured between runs.
+	conn.fail = nil
+	conn.result = connector.Result{ExternalID: "u-1", Username: "Ada"}
+
+	res, err := svc.Run(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := outcome(res, "lyceum").Status; got != model.TaskSucceeded {
+		t.Errorf("re-run after configuring the connector should provision, got %s", got)
+	}
+	if conn.callCount() != 2 {
+		t.Errorf("lyceum provisioned %d times, want 2 (the unavailable task is retryable)", conn.callCount())
 	}
 }
 
@@ -770,4 +839,18 @@ func (s *fakeStore) UpdateTask(_ context.Context, t model.ProvisionTask) error {
 	defer s.mu.Unlock()
 	s.tasks[keyOf(t.InviteID, t.ServiceID)] = t
 	return nil
+}
+
+// taskStatus reads back what was persisted for one service of an invite, so a
+// test can assert on the durable record rather than only on the returned
+// outcome. They are set from the same value and could drift apart in exactly one
+// edit; this is what notices.
+func (s *fakeStore) taskStatus(inviteID uuid.UUID, serviceKey string) model.TaskStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	svc, ok := s.services[serviceKey]
+	if !ok {
+		return ""
+	}
+	return s.tasks[keyOf(inviteID, svc.ID)].Status
 }

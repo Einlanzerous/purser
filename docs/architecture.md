@@ -103,7 +103,9 @@ safe rather than half-provisioning someone.
   [Audit & reconcile](#audit--reconcile)).
 - `invite` — one provisioning run for a person across services.
 - `provision_task` — one service's slice of an invite; tracks attempts +
-  last_error so a re-run retries only what failed.
+  last_error so a re-run retries only what failed. `status` is `pending |
+  running | succeeded | skipped | failed | unavailable`; `unavailable` was added
+  by `0004` (see [Task status](#task-status)).
 
 ## Idempotency
 
@@ -113,6 +115,41 @@ duplicate upstream user, no fresh secret — while a previously-failed service i
 retried. Per-service connector failures never abort the whole invite; they are
 recorded and surfaced in the operator note — a field of its own, separate from
 the credential block, because only the block is ever emailed (PRSR-19).
+
+## Task status
+
+`provision_task.status` distinguishes two ways of not being provisioned:
+
+| status        | meaning                                              | retry helps        |
+| ------------- | ---------------------------------------------------- | ------------------ |
+| `failed`      | the connector tried and something broke               | yes                |
+| `unavailable` | the connector never tried — `connector.ErrPending`    | only after a fix   |
+
+`ErrPending` means a connector is registered but not in a position to provision:
+its token isn't configured, or its upstream has no provisioning API yet. Both
+states are retryable and neither writes an `account` row, which is why they were
+one state — `failed` carrying a `Pending bool` — until PRSR-21.
+
+The reason to split them is that the difference is *all* they are ever consulted
+for. The operator note groups them under separate headings ("worth a retry once
+fixed" against "a retry changes nothing until these are configured"), the CLI
+marks them `✗` and `…`, and the HTTP outcome reports them as distinct `status`
+values. Every one of those consumers had to either special-case the bool or
+accidentally get the right answer by lumping them together; a status they can
+switch on costs the next consumer nothing.
+
+It is *not* called `pending`: that name is taken by the queued state ("created,
+not yet run"), and one word meaning both "hasn't run yet" and "can't be run" is
+the collision that put this on a bool in the first place. `unavailable` matches
+`connector.Unavailable`, which is already the term for a registered-but-
+unconfigured connector.
+
+Idempotency is unaffected — the re-run skip keys on an **active account**, never
+on task status — so an unavailable service is retried by the next invite exactly
+as a failed one is. Migration `0004` adds the status and backfills history:
+`failed` rows whose `last_error` begins with `ErrPending`'s message become
+`unavailable`, and rows that can't be positively identified stay `failed` rather
+than being guessed at.
 
 ## Onboarding bundles
 
@@ -248,10 +285,13 @@ The credential block is plain text (pastes cleanly into any chat platform).
 `--deliver email` sends it over SMTP to the person. One-time secrets appear once
 and are never retrievable afterward.
 
-An invite where *every* service failed sends no email at all: there is nothing to
+An invite that provisioned *nothing* sends no email at all: there is nothing to
 tell the recipient, and a greeting on its own announces access that wasn't
 granted. The invite stays undelivered, the operator is told why, and the next run
-retries only what failed.
+retries only what failed. The gate asks whether anything succeeded rather than
+whether anything failed, which is how an all-`unavailable` invite lands on the
+same answer without being special-cased: a connector nobody configured granted
+exactly as much access as one that broke.
 
 The block **leads with Cloudflare's App Launcher** — the one page listing every
 Access-gated app a person can reach — and then gives per-service detail. That
@@ -261,9 +301,10 @@ surface and stays internal-only.
 The link is conditional: the launcher lists *Access* apps, so it appears only for
 invites that actually granted Access. An Argosy-only invitee would otherwise be
 sent to an empty page, and a *failed* Access grant doesn't count either — a link
-that rejects them reads as a broken invite. Direct-path apps deliver their
-secrets inline in the same block, which is precisely what the launcher cannot
-carry through.
+that rejects them reads as a broken invite. Neither does an `unavailable` one:
+the recipient can't act on why a door is shut, only that it is. Direct-path apps
+deliver their secrets inline in the same block, which is precisely what the
+launcher cannot carry through.
 
 ## Security notes
 
