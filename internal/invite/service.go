@@ -120,13 +120,18 @@ type ServiceOutcome struct {
 }
 
 // Result is the outcome of an invite.
+//
+// CredentialBlock and OperatorNote have different audiences and are kept apart
+// for that reason: the block is the invitee's message and is the only thing that
+// may ever be emailed, while the note is for whoever ran the invite (PRSR-19).
 type Result struct {
 	Person          model.Person
 	InviteID        uuid.UUID
 	Delivery        model.DeliveryMethod
 	Bundle          string // the bundle that supplied the service list, if any
 	Outcomes        []ServiceOutcome
-	CredentialBlock string // the copy-pasteable block
+	CredentialBlock string // the copy-pasteable block, for the recipient
+	OperatorNote    string // failure list for the operator; "" when nothing failed
 	Delivered       bool   // true when an email was actually sent
 }
 
@@ -222,9 +227,15 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 
 	res.CredentialBlock = RenderCredentialBlock(person, res.Outcomes, s.launcher)
+	res.OperatorNote = RenderOperatorNote(res.Outcomes)
 
-	if req.Delivery == model.DeliverEmail {
+	// An invite where nothing at all succeeded has nothing to say to the
+	// recipient, so it is not sent — see deliverable. The failures are still
+	// recorded, still reported to the operator, and still retried by the next
+	// run; Delivered stays false so the caller can see the send didn't happen.
+	if req.Delivery == model.DeliverEmail && deliverable(res.Outcomes) {
 		subject := fmt.Sprintf("Your access to %s", strings.Join(displayNames(res.Outcomes), ", "))
+		// CredentialBlock only — OperatorNote must not reach the invitee.
 		if err := s.emailer.Send(ctx, email, subject, res.CredentialBlock); err != nil {
 			return nil, fmt.Errorf("invite: deliver email: %w", err)
 		}
@@ -337,6 +348,27 @@ func hashSecret(secret string) string {
 	}
 	sum := sha256.Sum256([]byte(secret))
 	return hex.EncodeToString(sum[:])
+}
+
+// deliverable reports whether this invite produced anything worth sending the
+// recipient — at least one service provisioned or already in place.
+//
+// When every service fails there is no message to send: the credential block is
+// a greeting and nothing else, so mailing it tells the invitee they've been
+// granted access while granting them none. That block used to carry the operator's
+// failure list, which at least made it non-empty; splitting the two audiences
+// (PRSR-19) is what left the all-failed case with an empty envelope, so the guard
+// belongs here rather than in the renderer.
+//
+// A *partial* failure still sends. The recipient gets what they actually got,
+// which is the whole reason per-service failures don't abort the invite.
+func deliverable(outcomes []ServiceOutcome) bool {
+	for _, o := range outcomes {
+		if o.Status == model.TaskSucceeded || o.Status == model.TaskSkipped {
+			return true
+		}
+	}
+	return false
 }
 
 func displayNames(outcomes []ServiceOutcome) []string {

@@ -111,7 +111,8 @@ Re-running the same invite is safe and **retries only failed services**: a
 service with an active `account` row (upstream id present) is *skipped* — no
 duplicate upstream user, no fresh secret — while a previously-failed service is
 retried. Per-service connector failures never abort the whole invite; they are
-recorded and surfaced in the credential block's operator note.
+recorded and surfaced in the operator note — a field of its own, separate from
+the credential block, because only the block is ever emailed (PRSR-19).
 
 ## Onboarding bundles
 
@@ -219,6 +220,11 @@ The credential block is plain text (pastes cleanly into any chat platform).
 `--deliver copypaste` (default) returns it for the operator to paste;
 `--deliver email` sends it over SMTP to the person. One-time secrets appear once
 and are never retrievable afterward.
+
+An invite where *every* service failed sends no email at all: there is nothing to
+tell the recipient, and a greeting on its own announces access that wasn't
+granted. The invite stays undelivered, the operator is told why, and the next run
+retries only what failed.
 
 The block **leads with Cloudflare's App Launcher** — the one page listing every
 Access-gated app a person can reach — and then gives per-service detail. That

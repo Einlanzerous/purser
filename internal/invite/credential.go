@@ -24,6 +24,10 @@ const AccessServiceKey = "cloudflare"
 // the one page listing every app they can reach — and then gives the per-service
 // login URL, any one-time secret, and how to sign in.
 //
+// Everything here is addressed to the recipient and to nobody else. What went
+// wrong is the operator's business and lives in RenderOperatorNote, which is
+// never emailed — see the comment there for why the two are separate strings.
+//
 // launcher is Cloudflare's App Launcher URL, and is shown only when this invite
 // actually granted Access (see hasAccessGrant). Pointing someone at it without
 // that grant renders them an empty page, which is worse than not linking it.
@@ -67,19 +71,28 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome, launc
 	showLauncher := launcher != "" && len(failed) == 0 && hasAccessGrant(succeeded, skipped)
 
 	if showLauncher {
+		// With the launcher leading, a standalone Cloudflare entry would repeat
+		// the same email-OTP instruction under a second heading. It carries no
+		// URL and no secret of its own, so the header fully replaces it.
+		//
+		// Suppressed before the heading is written, not after, because the
+		// heading's own relevance depends on what survives.
+		succeeded = withoutAccessEntry(succeeded)
+		skipped = withoutAccessEntry(skipped)
+
 		// person.Email is necessarily non-empty here: the Cloudflare connector
 		// refuses to provision without one, so an Access grant implies an email.
 		fmt.Fprintf(&b, "Hi %s — you've been granted access to the Construct.\n\n", greeting)
 		fmt.Fprintf(&b, "🚀 Start here: %s\n", launcher)
 		fmt.Fprintf(&b, "    Sign in with the email one-time-PIN sent to %s — no password.\n", person.Email)
 		b.WriteString("    The Construct apps behind single sign-on are listed there.\n")
-		b.WriteString("\nPer-app details, including anything the launcher can't sign you into:\n")
 
-		// With the launcher leading, a standalone Cloudflare entry would repeat
-		// the same email-OTP instruction under a second heading. It carries no
-		// URL and no secret of its own, so the header fully replaces it.
-		succeeded = withoutAccessEntry(succeeded)
-		skipped = withoutAccessEntry(skipped)
+		// A launcher-only invite — Cloudflare and nothing else — has no per-app
+		// details left once its own entry is dropped, and the heading would
+		// announce a section that never arrives.
+		if len(succeeded)+len(skipped) > 0 {
+			b.WriteString("\nPer-app details, including anything the launcher can't sign you into:\n")
+		}
 	} else {
 		fmt.Fprintf(&b, "Hi %s — you've been granted access to the following:\n", greeting)
 	}
@@ -119,20 +132,54 @@ func RenderCredentialBlock(person model.Person, outcomes []ServiceOutcome, launc
 		}
 	}
 
-	b.WriteString("\nKeep any secrets above private — they are shown once and cannot be retrieved later.\n")
-
-	if len(failed) > 0 {
-		b.WriteString("\n(Operator note — not for the recipient)\n")
-		for _, o := range failed {
-			status := "failed"
-			if o.Pending {
-				status = "pending"
-			}
-			fmt.Fprintf(&b, "  ✗ %s: %s (%s)\n", o.DisplayName, o.Error, status)
-		}
+	// Warn about secrets only when the block actually carries one. An SSO-only
+	// invite shows no secret anywhere, and warning about "the secrets above"
+	// sends the reader hunting for something that was never there.
+	if hasSecret(succeeded) {
+		b.WriteString("\nKeep any secrets above private — they are shown once and cannot be retrieved later.\n")
 	}
 
 	return b.String()
+}
+
+// hasSecret reports whether any rendered entry carried one-time material. It
+// takes the post-suppression list, so a dropped entry can't justify the warning.
+func hasSecret(succeeded []ServiceOutcome) bool {
+	for _, o := range succeeded {
+		if o.Secret != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// RenderOperatorNote lists the services this invite could not provision, for
+// whoever ran it. It returns "" when nothing failed.
+//
+// This is a separate string from the credential block rather than a trailing
+// section of it, and that separation is the whole point. The two were one string
+// once, headed "(Operator note — not for the recipient)" — and `--deliver email`
+// mails that string verbatim, so a single failed connector sent an external
+// invitee a failure list that announced it wasn't for them, carrying raw
+// `err.Error()` text: status codes, upstream bodies, whatever a connector chose
+// to put there (PRSR-19). Splitting at the source leaves the emailer nothing to
+// filter and no way to get the audience wrong.
+func RenderOperatorNote(outcomes []ServiceOutcome) string {
+	var b strings.Builder
+	for _, o := range outcomes {
+		if o.Status != model.TaskFailed {
+			continue
+		}
+		status := "failed"
+		if o.Pending {
+			status = "pending"
+		}
+		fmt.Fprintf(&b, "  ✗ %s: %s (%s)\n", o.DisplayName, o.Error, status)
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return "Operator note — not for the recipient:\n" + b.String()
 }
 
 // hasAccessGrant reports whether this invite left the person inside the

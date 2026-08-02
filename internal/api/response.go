@@ -13,6 +13,11 @@ import (
 // contains one-time secrets) is included only for copy-paste delivery — for
 // email delivery the secrets were sent to the recipient and are not echoed
 // back over HTTP.
+//
+// The operator note is returned on both delivery paths: it holds no secrets, and
+// it is the caller — not the invitee — reading this response. It is deliberately
+// not part of credential_block, so that echoing the block to a recipient cannot
+// carry connector error text along with it (PRSR-19).
 type inviteResponse struct {
 	InviteID        uuid.UUID    `json:"invite_id"`
 	Person          personDTO    `json:"person"`
@@ -20,6 +25,7 @@ type inviteResponse struct {
 	Delivered       bool         `json:"delivered"`
 	Outcomes        []outcomeDTO `json:"outcomes"`
 	CredentialBlock string       `json:"credential_block,omitempty"`
+	OperatorNote    string       `json:"operator_note,omitempty"`
 }
 
 type personDTO struct {
@@ -43,10 +49,11 @@ type outcomeDTO struct {
 
 func newInviteResponse(res *invite.Result) inviteResponse {
 	out := inviteResponse{
-		InviteID:  res.InviteID,
-		Person:    personDTO{ID: res.Person.ID, Name: res.Person.Name, Email: res.Person.Email},
-		Delivery:  string(res.Delivery),
-		Delivered: res.Delivered,
+		InviteID:     res.InviteID,
+		Person:       personDTO{ID: res.Person.ID, Name: res.Person.Name, Email: res.Person.Email},
+		Delivery:     string(res.Delivery),
+		Delivered:    res.Delivered,
+		OperatorNote: res.OperatorNote,
 	}
 	if res.Delivery == model.DeliverCopyPaste {
 		out.CredentialBlock = res.CredentialBlock
