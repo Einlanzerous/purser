@@ -325,6 +325,20 @@ purser: pass --rename to change the recorded name
 one inferred from a prior read. Omitting `--type` leaves an existing person's
 type alone; passing one that disagrees is refused the same way.
 
+`invite` follows the same rule, but warns instead of refusing — provisioning
+shouldn't fail over a name mismatch:
+
+```
+$ purser invite --name "Ada Lovelacce" --email ada@example.com --to switchyard
+
+invite 6f1c… for Ada Lovelace (delivery=copypaste)
+  ! ada@example.com is recorded as "Ada Lovelace", not "Ada Lovelacce" — kept the recorded name
+    to change it: purser person add --email ada@example.com --name "Ada Lovelacce" --rename
+  ✓ Switchyard              succeeded
+```
+
+`person add --rename` is the only way to change a recorded name.
+
 `--email` is required even with `--type agent`: it's the conflict target that
 makes the add idempotent and the key the audit looks people up by, so a row
 without one could be added twice and reconciled never. It is validated as an

@@ -66,7 +66,11 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 - **An occupied email is a conflict, not an edit.** `UpsertPerson` is
   `ON CONFLICT … DO UPDATE SET name`, so any command taking `--name` renames
   whoever holds that address unless it refuses first — `person add` uses
-  `InsertPersonIfAbsent` and requires `--rename`. `invite` still has this trap.
+  `InsertPersonIfAbsent` and requires `--rename`. `invite` no longer calls
+  `UpsertPerson` for an addressed person either (PRSR-20): `resolvePerson` keeps
+  the stored name and reports the disagreement as `Result.NameConflict`. **Only
+  `person add --rename` may change a name.** Don't add a rename path to `invite`
+  — one command owning renames is what makes the guarantee checkable.
 - **`person.email` is unique case-insensitively** (migration 0003), and every
   conflict target must infer on `lower(email)`. The index and the store's
   lookups disagreed once; the gap inserted duplicate identities for the same

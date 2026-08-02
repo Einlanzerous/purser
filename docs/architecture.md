@@ -196,6 +196,15 @@ name it replaced, so the command cannot announce a rename the database didn't
 perform. The same rule covers `--type`: omitted, it leaves an existing person
 alone; supplied and disagreeing, it is refused rather than silently dropped.
 
+`invite` is held to the same rule but resolves it differently (PRSR-20). It used
+to call `UpsertPerson` directly, so a mistyped `--name` on a re-invite — an
+ordinary thing to do, since invites are idempotent per (person × service) —
+renamed whoever held that address. It now keeps the stored name and reports the
+disagreement as `Result.NameConflict`: a warning on stderr, `name_conflict` over
+HTTP. It warns rather than refusing because an invite's job is provisioning, and
+failing one over a name mismatch punishes the wrong action. Renaming stays
+exclusively with `person add --rename`, so exactly one command can change a name.
+
 Email is required even for `--type agent`, though the schema allows it to be
 null: it is the conflict target that makes the add idempotent and the key the
 audit looks people up by, so a row without one could be added twice and

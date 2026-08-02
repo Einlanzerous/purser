@@ -336,6 +336,128 @@ func TestRun_EmailDelivery_SendsWhenSomethingSucceeded(t *testing.T) {
 	}
 }
 
+// PRSR-20: `invite` called UpsertPerson, whose ON CONFLICT sets the name. Since
+// invites are idempotent per (person × service), re-inviting someone to add a
+// service is routine — and a mistyped --name on that re-run renamed them,
+// silently, with the previous name unrecoverable.
+func TestRun_DoesNotRenameAnExistingPerson(t *testing.T) {
+	st := newFakeStore()
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", result: connector.Result{
+		ExternalID: "u-1", Username: "Ada", Secret: "sw_TOKEN",
+	}}
+	reg := connector.NewRegistry(sw)
+	svc := New(seededStore(t, st, reg), reg, nil)
+	ctx := context.Background()
+
+	if _, err := svc.AddPerson(ctx, AddPersonRequest{Name: "Ada Lovelace", Email: "ada@example.com"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	res, err := svc.Run(ctx, Request{
+		Name: "Ada Lovelacce", Email: "ada@example.com", // typo
+		Services: []string{"switchyard"}, Delivery: model.DeliverCopyPaste,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if res.Person.Name != "Ada Lovelace" {
+		t.Errorf("stored name was overwritten: %q", res.Person.Name)
+	}
+	stored, err := st.PersonByEmail(ctx, "ada@example.com")
+	if err != nil {
+		t.Fatalf("PersonByEmail: %v", err)
+	}
+	if stored.Name != "Ada Lovelace" {
+		t.Errorf("row was renamed in the store: %q", stored.Name)
+	}
+
+	// Silence is the actual bug — keeping the name but saying nothing would
+	// leave the operator believing the typo took.
+	c := res.NameConflict
+	if c == nil {
+		t.Fatal("a disagreeing name must be reported, not just ignored")
+	}
+	if c.Stored != "Ada Lovelace" || c.Requested != "Ada Lovelacce" || c.Email != "ada@example.com" {
+		t.Errorf("conflict misreported: %+v", c)
+	}
+
+	// And the invite still did its job — refusing would punish provisioning for
+	// a name mismatch.
+	if got := outcome(res, "switchyard").Status; got != model.TaskSucceeded {
+		t.Errorf("provisioning should proceed regardless, got %s", got)
+	}
+}
+
+// The overwhelmingly common re-invite: same person, same name, adding a service.
+// It must stay completely quiet.
+func TestRun_MatchingNameReportsNoConflict(t *testing.T) {
+	st := newFakeStore()
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", result: connector.Result{ExternalID: "u-1"}}
+	reg := connector.NewRegistry(sw)
+	svc := New(seededStore(t, st, reg), reg, nil)
+	ctx := context.Background()
+
+	if _, err := svc.AddPerson(ctx, AddPersonRequest{Name: "Ada Lovelace", Email: "ada@example.com"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	res, err := svc.Run(ctx, Request{
+		Name: "Ada Lovelace", Email: "ada@example.com",
+		Services: []string{"switchyard"}, Delivery: model.DeliverCopyPaste,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.NameConflict != nil {
+		t.Errorf("no disagreement, so no warning: %+v", res.NameConflict)
+	}
+}
+
+// An unknown address is not a conflict — the invite names a new person and that
+// name is what gets recorded.
+func TestRun_NewEmailRecordsTheGivenName(t *testing.T) {
+	st := newFakeStore()
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", result: connector.Result{ExternalID: "u-1"}}
+	reg := connector.NewRegistry(sw)
+	svc := New(seededStore(t, st, reg), reg, nil)
+
+	res, err := svc.Run(context.Background(), Request{
+		Name: "Grace Hopper", Email: "Grace@Example.com",
+		Services: []string{"switchyard"}, Delivery: model.DeliverCopyPaste,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.NameConflict != nil {
+		t.Errorf("new person, no conflict: %+v", res.NameConflict)
+	}
+	if res.Person.Name != "Grace Hopper" || res.Person.Email != "grace@example.com" {
+		t.Errorf("person recorded wrong: %+v", res.Person)
+	}
+}
+
+// An emailless invite has no conflict target — the unique index is partial on
+// email IS NOT NULL — so it keeps the old unguarded path and must still work.
+func TestRun_WithoutEmailStillProvisions(t *testing.T) {
+	st := newFakeStore()
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", result: connector.Result{ExternalID: "u-1"}}
+	reg := connector.NewRegistry(sw)
+	svc := New(seededStore(t, st, reg), reg, nil)
+
+	res, err := svc.Run(context.Background(), Request{
+		Name: "Anon", Services: []string{"switchyard"}, Delivery: model.DeliverCopyPaste,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.NameConflict != nil {
+		t.Errorf("no email means nothing to conflict with: %+v", res.NameConflict)
+	}
+	if got := outcome(res, "switchyard").Status; got != model.TaskSucceeded {
+		t.Errorf("want succeeded, got %s", got)
+	}
+}
+
 func TestValidate_Errors(t *testing.T) {
 	reg := connector.NewRegistry(&fakeConn{key: "switchyard", display: "Switchyard"})
 	svc := New(newFakeStore(), reg, nil)

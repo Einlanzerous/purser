@@ -119,6 +119,18 @@ type ServiceOutcome struct {
 	Extra        map[string]string
 }
 
+// NameConflict reports that the invite's --name disagreed with the name already
+// recorded for that email, and that the stored name was kept.
+//
+// It is not an error: the invite proceeds against the existing person. It exists
+// so the disagreement is *said out loud* rather than silently resolved, which is
+// the entire difference from the UpsertPerson behaviour it replaced (PRSR-20).
+type NameConflict struct {
+	Email     string
+	Stored    string // the name on the record — kept
+	Requested string // the name this invite passed — ignored
+}
+
 // Result is the outcome of an invite.
 //
 // CredentialBlock and OperatorNote have different audiences and are kept apart
@@ -133,6 +145,10 @@ type Result struct {
 	CredentialBlock string // the copy-pasteable block, for the recipient
 	OperatorNote    string // failure list for the operator; "" when nothing failed
 	Delivered       bool   // true when an email was actually sent
+
+	// NameConflict is set when --name disagreed with the stored record. The
+	// stored name was kept and the invite ran anyway; operator-facing.
+	NameConflict *NameConflict
 }
 
 // resolve returns a copy of req with Services expanded from its bundle and any
@@ -206,7 +222,7 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 
-	person, err := s.store.UpsertPerson(ctx, strings.TrimSpace(req.Name), email, model.PersonHuman)
+	person, conflict, err := s.resolvePerson(ctx, strings.TrimSpace(req.Name), email)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +231,7 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 		return nil, err
 	}
 
-	res := &Result{Person: person, InviteID: inv.ID, Delivery: req.Delivery, Bundle: appliedBundle}
+	res := &Result{Person: person, InviteID: inv.ID, Delivery: req.Delivery, Bundle: appliedBundle, NameConflict: conflict}
 
 	for _, key := range req.Services {
 		conn, _ := s.registry.Get(key) // validated
@@ -246,6 +262,52 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 	}
 
 	return res, nil
+}
+
+// resolvePerson finds or creates the person this invite is for, without ever
+// renaming an existing one (PRSR-20).
+//
+// `invite` used to call UpsertPerson, whose ON CONFLICT sets name = EXCLUDED.name.
+// A re-invite is an ordinary thing to do — invites are idempotent per
+// (person × service), so adding a service to someone means re-running it — and a
+// mistyped --name on that re-run silently overwrote the stored name with no
+// output and no way to recover the old one.
+//
+// It reports the disagreement instead of acting on it. Refusing outright was the
+// alternative, and it's the wrong trade here: an invite's job is provisioning,
+// and failing one over a name mismatch punishes the wrong action. Renaming stays
+// where it already lives, behind `person add --rename`, so exactly one command
+// can change a name and it's the one whose whole subject is the roster.
+func (s *Service) resolvePerson(ctx context.Context, name, email string) (model.Person, *NameConflict, error) {
+	// No email means no conflict target — the unique index is partial on
+	// email IS NOT NULL, so there is nothing to match against and nothing to
+	// overwrite. This is the pre-existing path for emailless invites.
+	if email == "" {
+		p, err := s.store.UpsertPerson(ctx, name, email, model.PersonHuman)
+		return p, nil, err
+	}
+
+	p, created, err := s.store.InsertPersonIfAbsent(ctx, name, email, model.PersonHuman)
+	if err != nil {
+		return model.Person{}, nil, err
+	}
+	if created {
+		return p, nil, nil
+	}
+
+	// Taken. Use the record as it stands; the stored name wins.
+	existing, err := s.store.PersonByEmail(ctx, email)
+	if err != nil {
+		return model.Person{}, nil, err
+	}
+	if existing.Name == name {
+		return existing, nil, nil
+	}
+	return existing, &NameConflict{
+		Email:     existing.Email,
+		Stored:    existing.Name,
+		Requested: name,
+	}, nil
 }
 
 // provisionOne handles a single service: skip if already provisioned, otherwise

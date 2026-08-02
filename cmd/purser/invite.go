@@ -115,6 +115,13 @@ func printResult(res *invite.Result) {
 		bundleNote = fmt.Sprintf(" bundle=%s", res.Bundle)
 	}
 	fmt.Fprintf(os.Stderr, "\ninvite %s for %s (delivery=%s%s)\n", res.InviteID, res.Person.Name, res.Delivery, bundleNote)
+
+	// Loud, and above the per-service lines: the operator asked for one person
+	// by name and got a different one, so this changes what the whole run means.
+	if c := res.NameConflict; c != nil {
+		fmt.Fprintf(os.Stderr, "  ! %s is recorded as %q, not %q — kept the recorded name\n", c.Email, c.Stored, c.Requested)
+		fmt.Fprintf(os.Stderr, "    to change it: purser person add --email %s --name %q --rename\n", c.Email, c.Requested)
+	}
 	for _, o := range res.Outcomes {
 		mark := statusMark(o)
 		fmt.Fprintf(os.Stderr, "  %s %-24s %s", mark, o.DisplayName, o.Status)

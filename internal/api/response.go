@@ -26,6 +26,18 @@ type inviteResponse struct {
 	Outcomes        []outcomeDTO `json:"outcomes"`
 	CredentialBlock string       `json:"credential_block,omitempty"`
 	OperatorNote    string       `json:"operator_note,omitempty"`
+
+	// NameConflict is present when the request's name disagreed with the stored
+	// person and the stored name was kept (PRSR-20). Absent means no
+	// disagreement — a caller that ignores it gets the old silent behaviour, so
+	// it is reported rather than merely available.
+	NameConflict *nameConflictDTO `json:"name_conflict,omitempty"`
+}
+
+type nameConflictDTO struct {
+	Email     string `json:"email"`
+	Stored    string `json:"stored"`
+	Requested string `json:"requested"`
 }
 
 type personDTO struct {
@@ -57,6 +69,9 @@ func newInviteResponse(res *invite.Result) inviteResponse {
 	}
 	if res.Delivery == model.DeliverCopyPaste {
 		out.CredentialBlock = res.CredentialBlock
+	}
+	if c := res.NameConflict; c != nil {
+		out.NameConflict = &nameConflictDTO{Email: c.Email, Stored: c.Stored, Requested: c.Requested}
 	}
 	for _, o := range res.Outcomes {
 		out.Outcomes = append(out.Outcomes, outcomeDTO{
