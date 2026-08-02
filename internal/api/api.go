@@ -85,9 +85,24 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.svc.Run(r.Context(), inviteReq)
 	if err != nil {
+		// A refused email delivery is the caller's to fix, not an outage, and the
+		// message names what disagreed — returning "provisioning failed" with a
+		// 500 would hide the one thing they need in order to correct it.
+		// Validate can't catch this: it takes a database read to know.
+		if errors.Is(err, invite.ErrNameConflictOnEmail) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		log.Printf("api: invite run failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "provisioning failed")
 		return
+	}
+	// Logged as well as returned. name_conflict is an optional field, and a
+	// caller that doesn't read it would otherwise get exactly the silent rename
+	// behaviour PRSR-20 removed — server-side there would be no record at all.
+	if c := res.NameConflict; c != nil {
+		log.Printf("api: invite %s: %s is recorded as %q, not %q — kept the recorded name",
+			res.InviteID, c.Email, c.Stored, c.Requested)
 	}
 	writeJSON(w, http.StatusOK, newInviteResponse(res))
 }

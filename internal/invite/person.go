@@ -77,25 +77,21 @@ func (s *Service) AddPerson(ctx context.Context, req AddPersonRequest) (*AddPers
 	if newType == "" {
 		newType = model.PersonHuman
 	}
-	p, created, err := s.store.InsertPersonIfAbsent(ctx, name, email, newType)
+	existing, created, err := s.findOrCreate(ctx, name, email, newType)
 	if err != nil {
 		return nil, err
 	}
 	if created {
-		return &AddPersonResult{Person: p, Created: true}, nil
+		return &AddPersonResult{Person: existing, Created: true}, nil
 	}
 
 	// The address is taken. Everything below is a decision about a person who
 	// already exists, and the default for all of them is to refuse and say so.
-	existing, err := s.store.PersonByEmail(ctx, email)
-	if err != nil {
-		return nil, err
-	}
 	if req.Type != "" && req.Type != existing.Type {
 		return nil, fmt.Errorf("%w: %s is recorded as %s, not %s",
 			ErrTypeConflict, email, existing.Type, req.Type)
 	}
-	if existing.Name == name {
+	if sameName(existing.Name, name) {
 		return &AddPersonResult{Person: existing}, nil // nothing to write
 	}
 	if !req.Rename {

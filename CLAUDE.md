@@ -71,6 +71,13 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   the stored name and reports the disagreement as `Result.NameConflict`. **Only
   `person add --rename` may change a name.** Don't add a rename path to `invite`
   — one command owning renames is what makes the guarantee checkable.
+- **A name mismatch blocks `--deliver email`, not copy-paste.** It's the only
+  evidence that a mistyped `--email` landed on a *different existing person*, and
+  email mails them working credentials before any warning can be read — so Run
+  returns `ErrNameConflictOnEmail` before writing an invite row or provisioning
+  (409 over HTTP). Copy-paste warns and proceeds; the operator is the gate there.
+  Don't "simplify" these into one behaviour: the asymmetry is the point, because
+  only one of the two paths can be taken back.
 - **`person.email` is unique case-insensitively** (migration 0003), and every
   conflict target must infer on `lower(email)`. The index and the store's
   lookups disagreed once; the gap inserted duplicate identities for the same
@@ -114,8 +121,9 @@ the three token-gated ones registers Unavailable when its token is unset.
 Also shipped: onboarding bundles + the launcher-led credential block (PRSR-12),
 `audit` / `reconcile` (PRSR-15), which retired 15 (person × service) pairs of
 real drift with zero upstream mutation, `person add` (PRSR-16), the roster entry
-point that provisions nothing, and the recipient/operator split in the invite
-result (PRSR-19).
+point that provisions nothing, the recipient/operator split in the invite result
+(PRSR-19), and the end of `invite`'s silent rename (PRSR-20), which also made a
+name mismatch fatal on the email path.
 
 Open, in rough priority order: `Deprovision` is unimplemented on every connector
 but Cloudflare (PRSR-17) — so `stale` can re-arm provisioning but cannot revoke;

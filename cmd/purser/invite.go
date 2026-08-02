@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -70,6 +71,11 @@ func runInvite(args []string) {
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
+		// Nothing was provisioned and nothing was sent, so this is a re-runnable
+		// mistake rather than a failure — exit 2 like the other usage errors.
+		if errors.Is(err, invite.ErrNameConflictOnEmail) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 

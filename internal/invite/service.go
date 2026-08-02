@@ -119,12 +119,23 @@ type ServiceOutcome struct {
 	Extra        map[string]string
 }
 
+// ErrNameConflictOnEmail reports that an invite asked for email delivery while
+// its --name disagreed with the stored record, and was refused.
+//
+// Distinct from ErrNameConflict, which `person add` returns when it declines to
+// edit a name: this one is not about the write at all — the invite would have
+// kept the stored name quite happily. It is about the *send*. See the refusal in
+// Run for why the two paths resolve the same signal differently.
+var ErrNameConflictOnEmail = errors.New("invite: refusing email delivery for a name that disagrees with the record")
+
 // NameConflict reports that the invite's --name disagreed with the name already
 // recorded for that email, and that the stored name was kept.
 //
-// It is not an error: the invite proceeds against the existing person. It exists
-// so the disagreement is *said out loud* rather than silently resolved, which is
-// the entire difference from the UpsertPerson behaviour it replaced (PRSR-20).
+// On copy-paste delivery it is not an error: the invite proceeds against the
+// existing person, and the disagreement is *said out loud* rather than silently
+// resolved — the entire difference from the UpsertPerson behaviour it replaced
+// (PRSR-20). On email delivery the same signal is fatal; see
+// ErrNameConflictOnEmail.
 type NameConflict struct {
 	Email     string
 	Stored    string // the name on the record — kept
@@ -187,6 +198,15 @@ func (s *Service) Validate(req Request) error {
 	if req.Delivery == model.DeliverEmail && strings.TrimSpace(req.Email) == "" {
 		return errors.New("invite: email delivery requires an email address")
 	}
+	// Any address supplied, delivery or not, becomes this person's identity key
+	// — the SSO join key upstream and what the audit looks them up by. Validate
+	// it through the same function `person add` uses, so `invite` cannot record
+	// a key the other command would have rejected.
+	if strings.TrimSpace(req.Email) != "" {
+		if _, err := NormalizeEmail(req.Email); err != nil {
+			return err
+		}
+	}
 	if req.Delivery == model.DeliverEmail && s.emailer == nil {
 		return errors.New("invite: email delivery requested but SMTP is not configured")
 	}
@@ -220,12 +240,37 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 	if req.Delivery == "" {
 		req.Delivery = model.DeliverCopyPaste
 	}
-	email := strings.ToLower(strings.TrimSpace(req.Email))
+	// Normalized through the same function `person add` uses, so the two commands
+	// cannot disagree about what an identity key is. Validate already rejected a
+	// malformed address; this is the value that becomes the conflict target.
+	email := ""
+	if strings.TrimSpace(req.Email) != "" {
+		if email, err = NormalizeEmail(req.Email); err != nil {
+			return nil, err
+		}
+	}
 
 	person, conflict, err := s.resolvePerson(ctx, strings.TrimSpace(req.Name), email)
 	if err != nil {
 		return nil, err
 	}
+
+	// On the one path that can't be taken back, a name mismatch is a refusal
+	// rather than a warning.
+	//
+	// The mismatch is the only evidence that a mistyped --email landed on a
+	// *different existing person*, and email delivery mails that person live
+	// credentials before the operator can read a warning about it. Copy-paste
+	// keeps the warning: nothing has left the building, and the operator is the
+	// gate. Refusing here costs a re-run; not refusing costs a credential sent
+	// to the wrong human.
+	//
+	// Nothing has been written at this point — no invite row, no provisioning.
+	if conflict != nil && req.Delivery == model.DeliverEmail {
+		return nil, fmt.Errorf("%w: %s is recorded as %q, not %q — refusing to email credentials to an address whose name disagrees; re-run with the recorded name, or rename first with `purser person add --email %s --name %q --rename`",
+			ErrNameConflictOnEmail, conflict.Email, conflict.Stored, conflict.Requested, conflict.Email, conflict.Requested)
+	}
+
 	inv, err := s.store.CreateInvite(ctx, person.ID, req.Delivery, req.Role)
 	if err != nil {
 		return nil, err
@@ -279,35 +324,68 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 // where it already lives, behind `person add --rename`, so exactly one command
 // can change a name and it's the one whose whole subject is the roster.
 func (s *Service) resolvePerson(ctx context.Context, name, email string) (model.Person, *NameConflict, error) {
-	// No email means no conflict target — the unique index is partial on
-	// email IS NOT NULL, so there is nothing to match against and nothing to
-	// overwrite. This is the pre-existing path for emailless invites.
+	// No email means no conflict target: the unique index is partial on
+	// email IS NOT NULL, so there is nothing to match against. Note this branch
+	// does not merely skip the *rename* check — UpsertPerson with an empty email
+	// is an unconditional INSERT, so every emailless invite mints a fresh person
+	// and re-provisions from scratch. Pre-existing and tracked separately; the
+	// rename guard above is what PRSR-20 was about.
 	if email == "" {
 		p, err := s.store.UpsertPerson(ctx, name, email, model.PersonHuman)
 		return p, nil, err
 	}
 
-	p, created, err := s.store.InsertPersonIfAbsent(ctx, name, email, model.PersonHuman)
+	person, created, err := s.findOrCreate(ctx, name, email, model.PersonHuman)
 	if err != nil {
 		return model.Person{}, nil, err
 	}
-	if created {
-		return p, nil, nil
+	// Type is deliberately not compared. Unlike `person add`, an invite doesn't
+	// assert what kind of identity this is — it passes human only as the default
+	// for a row that may not exist yet, and an existing row keeps its own type
+	// untouched either way.
+	if created || sameName(person.Name, name) {
+		return person, nil, nil
 	}
-
-	// Taken. Use the record as it stands; the stored name wins.
-	existing, err := s.store.PersonByEmail(ctx, email)
-	if err != nil {
-		return model.Person{}, nil, err
-	}
-	if existing.Name == name {
-		return existing, nil, nil
-	}
-	return existing, &NameConflict{
-		Email:     existing.Email,
-		Stored:    existing.Name,
+	return person, &NameConflict{
+		Email:     person.Email,
+		Stored:    person.Name,
 		Requested: name,
 	}, nil
+}
+
+// findOrCreate inserts the person if the address is free and otherwise reads
+// back whoever holds it. Either way the returned row is the one in the table —
+// InsertPersonIfAbsent deliberately returns nothing when the address is taken,
+// so the read-back is not optional.
+//
+// Shared with AddPerson so the two entry points cannot drift on what "this
+// person already exists" means; they differ only in what they do about it.
+func (s *Service) findOrCreate(ctx context.Context, name, email string, typ model.PersonType) (model.Person, bool, error) {
+	p, created, err := s.store.InsertPersonIfAbsent(ctx, name, email, typ)
+	if err != nil {
+		return model.Person{}, false, err
+	}
+	if created {
+		return p, true, nil
+	}
+	existing, err := s.store.PersonByEmail(ctx, email)
+	if err != nil {
+		return model.Person{}, false, err
+	}
+	return existing, false, nil
+}
+
+// sameName compares two names for conflict purposes, ignoring differences that
+// nobody can see: surrounding space, and runs of internal whitespace.
+//
+// Case is deliberately *not* folded. "ada lovelace" against "Ada Lovelace" is a
+// visible difference an operator can read in the warning and choose to fix with
+// --rename, so reporting it is useful. A doubled space is invisible in every
+// terminal, and a byte-exact comparison would warn about it on every re-invite
+// forever — noise on the routine path, which erodes attention for the email
+// refusal that depends on this same comparison.
+func sameName(a, b string) bool {
+	return strings.Join(strings.Fields(a), " ") == strings.Join(strings.Fields(b), " ")
 }
 
 // provisionOne handles a single service: skip if already provisioned, otherwise
