@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.10.0](https://github.com/Einlanzerous/purser/compare/v0.9.1...v0.10.0) (2026-08-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **invite:** give a not-yet-ready connector its own status (PRSR-21) ([#21](https://github.com/Einlanzerous/purser/issues/21))
+
+### Features
+
+* **invite:** give a not-yet-ready connector its own status (PRSR-21) ([#21](https://github.com/Einlanzerous/purser/issues/21)) ([636adc5](https://github.com/Einlanzerous/purser/commit/636adc5428840bd900801e68081741a416ff7599))
+
+
+### Maintenance
+
+* keep breaking changes on a minor bump until 1.0 ([#23](https://github.com/Einlanzerous/purser/issues/23)) ([3121ea3](https://github.com/Einlanzerous/purser/commit/3121ea35aff21a927e757772aab07d7324985f3e))
+
 ## [0.9.1](https://github.com/Einlanzerous/purser/compare/v0.9.0...v0.9.1) (2026-08-02)
 
 
