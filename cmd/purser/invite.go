@@ -49,17 +49,23 @@ func runInvite(args []string) {
 	// --to and --bundle are both optional: an invite with neither falls back to
 	// the default bundle, which is the common "welcome to the family" path.
 	//
-	// --email is not optional, on any delivery method (PRSR-23). Without one
-	// there is nothing for the person row to collide with, so each run recorded a
-	// new person — and with it a new idempotency key, which turned every re-run
-	// into a fresh round of provisioning. Checked here, and in Validate, so the
-	// mistake costs an exit 2 rather than a database connect.
-	if strings.TrimSpace(*name) == "" || strings.TrimSpace(*email) == "" {
+	if strings.TrimSpace(*name) == "" {
 		fs.Usage()
 		os.Exit(2)
 	}
+	// --email is not optional, on any delivery method (PRSR-23). Without one
+	// there is nothing for the person row to collide with, so each run recorded a
+	// new person — and with it a new idempotency key, which turned every re-run
+	// into a fresh round of provisioning.
+	//
+	// NormalizeEmail owns both halves of the rule, absent and malformed, and says
+	// which — so there is no second copy of "is this an identity key?" here, and
+	// the operator gets the reason rather than another dump of the flag list.
+	// Checked before setup(), so the mistake costs an exit 2 rather than a
+	// database connect; Validate checks it again for every other caller.
 	if _, err := invite.NormalizeEmail(*email); err != nil {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
+		fmt.Fprintln(os.Stderr, "usage: purser invite --name NAME --email EMAIL [--to svc1,svc2] [--bundle NAME]")
 		os.Exit(2)
 	}
 

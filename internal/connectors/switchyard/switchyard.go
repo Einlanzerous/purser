@@ -375,6 +375,19 @@ func (c *Connector) listProjectKeys(ctx context.Context) ([]string, error) {
 // stops after the lookup — no user created, no token minted — which is what
 // makes a Switchyard backfill safe to run against real people.
 func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connector.ReconcileResult, error) {
+	// A person with no address can only be guessed at here, never verified:
+	// findUser falls back to matching on display name, and two people
+	// legitimately share one. Both answers are then wrong in a way that writes —
+	// "yes" records this person against a stranger's account, "no" marks a real
+	// one stale and re-arms provisioning for a second token. So answer neither.
+	// The audit files an unanswerable question as an error and writes nothing,
+	// which is the same contract Cloudflare, Lyceum and Argosy already hold to.
+	//
+	// Only a person row predating PRSR-23 can reach this: `invite` requires an
+	// address now, so every Provision and every new person carries one.
+	if strings.TrimSpace(in.Email) == "" {
+		return connector.ReconcileResult{}, errors.New("switchyard: an email is required to reconcile")
+	}
 	u, found, err := c.findUser(ctx, in.PersonName, in.Email)
 	if err != nil {
 		return connector.ReconcileResult{}, err

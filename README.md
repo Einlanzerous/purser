@@ -386,6 +386,15 @@ a fresh secret each time, and left the audit one more person to walk per run.
 There is no second identity key to fall back to, which is why the address is
 required rather than defaulted.
 
+Migration `0005` states the same rule in the schema — `CHECK (email IS NOT NULL)`,
+declared `NOT VALID` so it binds every new row without having to decide at boot
+what to do with any the old path left behind. Those are stranded either way: no
+command can address a person who has no address, so repairing one means hand SQL
+(which the constraint deliberately still allows). Relatedly, all four connectors
+now refuse an emailless `Reconcile` rather than guessing — Switchyard used to
+fall back to matching on display name, which as an *audit* answer would record
+someone against a same-named stranger.
+
 ### HTTP API
 
 Bearer-authenticated with `PURSER_API_TOKEN` (also relies on

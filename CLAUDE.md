@@ -82,7 +82,18 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   therefore re-provisioned everything, fresh secret and all, once per run
   (PRSR-23). Don't make it optional again or default it, and don't key identity
   on `--name`: two people legitimately share a name, and merging them is worse
-  than duplicating one.
+  than duplicating one. Migration 0005 says the same thing in the schema —
+  `CHECK (email IS NOT NULL) NOT VALID`, so it binds new rows without having to
+  decide the fate of pre-0005 emailless ones at boot. Those are stranded (no
+  command can address a person with no address) and hand SQL is the only repair;
+  the constraint permits it deliberately.
+- **No connector may answer a reconcile it can't verify.** All four refuse an
+  emailless `Reconcile`. Switchyard's `findUser` still falls back to matching on
+  display name — fine on the Provision path, where Switchyard itself reported the
+  conflict, but as an *audit* answer it would record a person against a
+  same-named stranger, or mark a real account stale and re-arm provisioning for a
+  second token. Requiring the address on `invite` is what left that fallback
+  reachable only from the audit, so `Reconcile` guards it there (PRSR-23).
 - **A name mismatch blocks `--deliver email`, not copy-paste.** It's the only
   evidence that a mistyped `--email` landed on a *different existing person*, and
   email mails them working credentials before any warning can be read — so Run

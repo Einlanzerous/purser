@@ -655,22 +655,57 @@ func TestRun_WithoutEmail_IsRefusedBeforeAnythingHappens(t *testing.T) {
 	}
 }
 
+// `invite.delivery` is CHECK-constrained to copypaste|email, and Run writes the
+// person row before the invite row — so a typo'd --deliver used to be caught by
+// Postgres, one write too late, and surfaced as a raw constraint error (a 500
+// over HTTP) with a person already recorded for it. Whatever the schema will
+// refuse, validation refuses first.
+func TestRun_UnknownDeliveryMethod_IsRefusedBeforeAnythingHappens(t *testing.T) {
+	st := newFakeStore()
+	sw := &fakeConn{key: "switchyard", display: "Switchyard", result: connector.Result{ExternalID: "u-1"}}
+	reg := connector.NewRegistry(sw)
+	svc := New(seededStore(t, st, reg), reg, nil)
+
+	_, err := svc.Run(context.Background(), Request{
+		Name: "Ada", Email: "ada@example.com",
+		Services: []string{"switchyard"}, Delivery: "copy-paste", // not "copypaste"
+	})
+	if err == nil {
+		t.Fatal("an unknown delivery method should be refused")
+	}
+	if sw.callCount() != 0 {
+		t.Errorf("provisioned %d times for a refused invite, want 0", sw.callCount())
+	}
+	if n := st.personCount(); n != 0 {
+		t.Errorf("recorded %d people for a refused invite, want 0", n)
+	}
+}
+
 func TestValidate_Errors(t *testing.T) {
 	reg := connector.NewRegistry(&fakeConn{key: "switchyard", display: "Switchyard"})
 	svc := New(newFakeStore(), reg, nil)
 
+	// Every case must fail for the reason it names, so each one supplies
+	// everything the others test: a case missing two required fields passes for
+	// the wrong reason, and the check it was written for goes untested.
 	cases := []struct {
 		name string
 		req  Request
 	}{
-		{"no name", Request{Services: []string{"switchyard"}}},
+		{"no name", Request{Email: "ada@example.com", Services: []string{"switchyard"}}},
 		{"no services", Request{Name: "Ada", Email: "ada@example.com"}},
 		{"unknown service", Request{Name: "Ada", Email: "ada@example.com", Services: []string{"nope"}}},
-		// The address is required on every delivery method, so both of these are
-		// the same check now (PRSR-23) — kept apart because the copy-paste case is
-		// the one that used to be allowed.
+		// Required on every delivery method as of PRSR-23, so this is the
+		// copy-paste case — the one that used to be allowed.
 		{"no email", Request{Name: "Ada", Services: []string{"switchyard"}, Delivery: model.DeliverCopyPaste}},
-		{"email delivery without email", Request{Name: "Ada", Services: []string{"switchyard"}, Delivery: model.DeliverEmail}},
+		// svc below is built with a nil emailer, so this is the SMTP branch.
+		{"email delivery with no SMTP", Request{Name: "Ada", Email: "ada@example.com",
+			Services: []string{"switchyard"}, Delivery: model.DeliverEmail}},
+		// `invite.delivery` is CHECK-constrained, so a typo that reached the store
+		// would fail as a raw Postgres error — after a person row had been written
+		// for it.
+		{"unknown delivery method", Request{Name: "Ada", Email: "ada@example.com",
+			Services: []string{"switchyard"}, Delivery: "copy-paste"}},
 	}
 	for _, tc := range cases {
 		if err := svc.Validate(tc.req); err == nil {

@@ -288,17 +288,33 @@ identity key (a `--handle` with its own unique index); nothing needed one, and
 keying on `--name` instead is worse than the bug — two people legitimately share
 a name, and collapsing them is less recoverable than duplicating one.
 
-The column stays nullable and no migration rewrites what the old path left
-behind. Any such rows stay in the roster and the audit still walks them, but it
-can say very little about them: Cloudflare, Lyceum and Argosy all reject an
-emailless `Reconcile` outright, which the audit records as an *error* rather than
-as absence, and only Switchyard has a fallback (it matches on display name). So
-nothing marks them stale by accident under `reconcile --all` — and nothing
-confirms them either. That is the same "a person without an address cannot be
-found again" this ticket is about, seen from the audit's side. Making the column
-`NOT NULL` would mean deciding their fate inside a migration that fails the whole
-service on boot if it guesses wrong; the constraint belongs where the identity is
-decided instead.
+The rule is in the schema too, as migration 0005: `CHECK (email IS NOT NULL)`,
+declared `NOT VALID`. A guard in Go only guards callers that come through Go,
+which is the lesson of 0003 — a check in `AddPerson` would have left `invite`
+minting the duplicates instead. `NOT VALID` is doing work here rather than
+deferring it: the constraint binds every insert and update from now on, while
+rows the old path already wrote stay exactly as they are. `SET NOT NULL` is what
+could not be deployed, since it would have to rewrite or reject those rows at
+boot and there is nothing to backfill them *with*.
+
+Those rows are stranded, which is worth saying plainly. No command can address a
+person who has no address: `person add` and `invite` both key on the email, so
+either creates a *second* row rather than finding them, and `RenamePerson`
+matches `lower(email)` and so never matches NULL. That was equally true before
+this change — `UpsertPerson` given an address didn't match a NULL-email row
+either — so nothing here regresses, but nothing here repairs it. Repair means
+hand SQL, which 0005 deliberately still permits (`UPDATE person SET email = …`
+satisfies the constraint). Once none remain,
+`ALTER TABLE person VALIDATE CONSTRAINT person_email_required` adopts the rest.
+
+The audit is safe to run with them in the roster, but that took a fix of its own.
+All four connectors now refuse an emailless `Reconcile`, so the audit files the
+question as an error and writes nothing. Switchyard did not: `findUser` falls
+back to matching on display name when there is no email, so `reconcile --all`
+would have recorded such a person against whoever upstream happens to share their
+name — or, on a miss, marked a real account stale and re-armed provisioning for a
+second token. Requiring the address everywhere else is precisely what left that
+fallback reachable only from the audit, where guessing is least acceptable.
 
 **Emails are unique case-insensitively** (migration 0003). They weren't
 originally: `person_email_key` indexed the bare column while every store lookup

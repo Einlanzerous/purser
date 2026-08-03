@@ -179,42 +179,75 @@ func (s *Service) resolve(req Request) (Request, string, error) {
 	return req, applied, nil
 }
 
-// Validate checks a request against the registry before any writes. It resolves
+// checked is a request that has passed validation: bundle expanded, delivery
+// defaulted, email normalized. Run works from one of these rather than deriving
+// the same values a second time, so a request becomes usable in exactly one
+// place and Run has no error branch that Validate didn't already take.
+type checked struct {
+	req    Request // Services expanded, Projects merged, Delivery defaulted
+	bundle string  // the bundle that supplied the service list; "" if named explicitly
+	email  string  // the normalized identity key
+}
+
+// Validate checks a request against the registry before any writes, and is the
+// caller-facing half of validate below — the API uses it to answer 400 vs 500.
+func (s *Service) Validate(req Request) error {
+	_, err := s.validate(req)
+	return err
+}
+
+// validate checks a request and returns it in the form Run needs. It resolves
 // any bundle first, so an unknown bundle or a bundle naming an unregistered
 // service is caught here — i.e. reported as the caller's error rather than
 // failing midway through provisioning.
-func (s *Service) Validate(req Request) error {
+//
+// Everything the database will reject is rejected here, because Run writes a
+// person row before it writes anything else: a value that only the schema
+// refuses (an unknown delivery method against `invite`'s CHECK constraint)
+// would otherwise surface as a raw Postgres error, and a 500, after the roster
+// had already grown a row for it.
+func (s *Service) validate(req Request) (checked, error) {
 	if strings.TrimSpace(req.Name) == "" {
-		return errors.New("invite: name is required")
+		return checked{}, errors.New("invite: name is required")
 	}
 	// The address is required for every invite, not only an emailed one
 	// (PRSR-23) — it is this person's identity key: the SSO join key upstream,
 	// what the audit looks them up by, and the conflict target that makes a
-	// re-invite idempotent. Checked through the same function `person add` uses,
-	// so `invite` cannot record a key the other command would have rejected.
-	if _, err := NormalizeEmail(req.Email); err != nil {
-		return err
-	}
-	resolved, _, err := s.resolve(req)
+	// re-invite idempotent. Normalized through the same function `person add`
+	// uses, so `invite` cannot record a key the other command would have
+	// rejected, and this is the value that becomes the conflict target.
+	email, err := NormalizeEmail(req.Email)
 	if err != nil {
-		return err
+		return checked{}, err
+	}
+	switch req.Delivery {
+	case "", model.DeliverCopyPaste:
+		req.Delivery = model.DeliverCopyPaste
+	case model.DeliverEmail:
+		if s.emailer == nil {
+			return checked{}, errors.New("invite: email delivery requested but SMTP is not configured")
+		}
+	default:
+		return checked{}, fmt.Errorf("invite: unknown delivery method %q (want %s or %s)",
+			req.Delivery, model.DeliverCopyPaste, model.DeliverEmail)
+	}
+	resolved, applied, err := s.resolve(req)
+	if err != nil {
+		return checked{}, err
 	}
 	if len(resolved.Services) == 0 {
-		return errors.New("invite: at least one service is required")
-	}
-	if req.Delivery == model.DeliverEmail && s.emailer == nil {
-		return errors.New("invite: email delivery requested but SMTP is not configured")
+		return checked{}, errors.New("invite: at least one service is required")
 	}
 	for _, key := range resolved.Services {
 		if _, ok := s.registry.Get(key); !ok {
 			if req.Bundle != "" {
-				return fmt.Errorf("invite: bundle %q names unknown service %q (known services: %s)",
+				return checked{}, fmt.Errorf("invite: bundle %q names unknown service %q (known services: %s)",
 					req.Bundle, key, strings.Join(s.registry.Keys(), ", "))
 			}
-			return fmt.Errorf("invite: unknown service %q (known: %s)", key, strings.Join(s.registry.Keys(), ", "))
+			return checked{}, fmt.Errorf("invite: unknown service %q (known: %s)", key, strings.Join(s.registry.Keys(), ", "))
 		}
 	}
-	return nil
+	return checked{req: resolved, bundle: applied, email: email}, nil
 }
 
 // Run executes the invite. It is safe to call repeatedly with the same request:
@@ -222,27 +255,15 @@ func (s *Service) Validate(req Request) error {
 // retried. A per-service connector failure does not abort the whole invite; it
 // is recorded and the remaining services still run.
 func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
-	if err := s.Validate(req); err != nil {
-		return nil, err
-	}
-	// Validate already proved this resolves; re-run it for the expanded request.
-	// appliedBundle is reported back so the operator can see which set was used
-	// — in particular that an unqualified invite got the default bundle.
-	req, appliedBundle, err := s.resolve(req)
+	// One pass decides whether this request is usable and what it means: the
+	// expanded service list, the applied bundle — reported back so the operator
+	// can see which set was used, in particular that an unqualified invite got
+	// the default one — and the normalized identity key.
+	c, err := s.validate(req)
 	if err != nil {
 		return nil, err
 	}
-	if req.Delivery == "" {
-		req.Delivery = model.DeliverCopyPaste
-	}
-	// Normalized through the same function `person add` uses, so the two commands
-	// cannot disagree about what an identity key is. Validate already required it
-	// and rejected a malformed one; this is the value that becomes the conflict
-	// target.
-	email, err := NormalizeEmail(req.Email)
-	if err != nil {
-		return nil, err
-	}
+	req, appliedBundle, email := c.req, c.bundle, c.email
 
 	person, conflict, err := s.resolvePerson(ctx, strings.TrimSpace(req.Name), email)
 	if err != nil {

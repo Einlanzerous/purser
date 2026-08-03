@@ -83,6 +83,64 @@ func TestPersonEmail_UniqueCaseInsensitively(t *testing.T) {
 	}
 }
 
+// Migration 0005 puts the identity-key rule in the schema, where hand-written
+// SQL is subject to it too — the same reasoning as 0003, whose bug a guard in Go
+// could not have reached.
+//
+// NOT VALID is what makes it deployable: rows the pre-PRSR-23 emailless path
+// wrote must survive, because there is nothing to backfill them with and a
+// migration that decides their fate wrongly takes the service down on boot. So
+// the constraint is checked on writes and not on what is already there — and the
+// hand SQL that would repair such a row still satisfies it.
+func TestPersonEmailRequired_BindsNewRowsAndSparesOldOnes(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Reproduce a row the old path left behind: drop the constraint, write what
+	// the emailless branch used to write, then re-apply the migration exactly as
+	// it ships — loaded from the embedded FS rather than retyped, so the test
+	// cannot drift from what runs on boot.
+	if _, err := st.pool.Exec(ctx, `ALTER TABLE person DROP CONSTRAINT person_email_required`); err != nil {
+		t.Fatalf("0005 should have added the constraint: %v", err)
+	}
+	var legacyID string
+	if err := st.pool.QueryRow(ctx,
+		`INSERT INTO person (name, type) VALUES ('Anon', 'human') RETURNING id`).Scan(&legacyID); err != nil {
+		t.Fatal(err)
+	}
+
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.version == "0005" {
+			sql = m.sql
+		}
+	}
+	if sql == "" {
+		t.Fatal("migration 0005 not found in the embedded FS")
+	}
+	// The whole point of NOT VALID: this must apply over the row above rather
+	// than failing the migration — and with it the service's boot.
+	if _, err := st.pool.Exec(ctx, sql); err != nil {
+		t.Fatalf("0005 must apply with an emailless row already present: %v", err)
+	}
+
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO person (name, type) VALUES ('Someone New', 'human')`); err == nil {
+		t.Error("a new emailless row should be refused by person_email_required")
+	}
+
+	// The repair path stays open: giving the stranded row an address satisfies
+	// the constraint rather than tripping it.
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE person SET email = 'anon@example.com' WHERE id = $1`, legacyID); err != nil {
+		t.Errorf("hand-repairing a legacy row must remain possible: %v", err)
+	}
+}
+
 // An occupied address is never modified — that is what lets `person add` refuse
 // and `invite` report the disagreement instead of writing it.
 func TestInsertPersonIfAbsent(t *testing.T) {
