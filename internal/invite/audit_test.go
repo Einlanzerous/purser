@@ -18,7 +18,7 @@ func auditFixture(t *testing.T, conns ...connector.Connector) (*Service, *fakeSt
 	st := newFakeStore()
 	reg := connector.NewRegistry(conns...)
 	svc := New(seededStore(t, st, reg), reg, nil)
-	p, err := st.UpsertPerson(context.Background(), "Ada", "ada@example.com", model.PersonHuman)
+	p, _, err := st.InsertPersonIfAbsent(context.Background(), "Ada", "ada@example.com", model.PersonHuman)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestAudit_ScopeByEmail(t *testing.T) {
 	sw := &fakeConn{key: "switchyard", display: "Switchyard",
 		recResult: connector.ReconcileResult{Exists: false}}
 	svc, st, _ := auditFixture(t, sw)
-	if _, err := st.UpsertPerson(context.Background(), "Bob", "bob@example.com", model.PersonHuman); err != nil {
+	if _, _, err := st.InsertPersonIfAbsent(context.Background(), "Bob", "bob@example.com", model.PersonHuman); err != nil {
 		t.Fatal(err)
 	}
 

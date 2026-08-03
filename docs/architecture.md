@@ -224,10 +224,10 @@ SQL (a typo'd email mints a duplicate identity that reconcile then dutifully
 populates) can do. `--audit` follows the add with the same read-only preview
 `purser audit --email …` prints.
 
-An email that already exists is a **conflict, not an edit**. `UpsertPerson` does
-`ON CONFLICT … DO UPDATE SET name`, so any command taking `--name` would
-otherwise rename whoever holds that address without ever saying so. `add` uses
-`InsertPersonIfAbsent`, which never touches an occupied row, and `--rename` is
+An email that already exists is a **conflict, not an edit**. The store used to
+carry an `UpsertPerson` doing `ON CONFLICT … DO UPDATE SET name`, so any command
+taking `--name` renamed whoever held that address without ever saying so. `add`
+uses `InsertPersonIfAbsent`, which never touches an occupied row, and `--rename` is
 the explicit opt-in — served by a single `UPDATE … RETURNING` that reports the
 name it replaced, so the command cannot announce a rename the database didn't
 perform. The same rule covers `--type`: omitted, it leaves an existing person
@@ -240,6 +240,13 @@ whoever held that address. It now keeps the stored name and reports the
 disagreement as `Result.NameConflict`: a warning on stderr, `name_conflict` over
 HTTP, and a server-side log line so a caller that ignores the field still leaves
 a record. Renaming stays exclusively with `person add --rename`.
+
+`UpsertPerson` itself is **gone** (PRSR-23). PRSR-20 moved the addressed path off
+it; requiring `--email` below removed its last caller, and it is deleted rather
+than left for the next one. A `person` row is now created only by
+`InsertPersonIfAbsent` and renamed only by `RenamePerson`, so the rule that one
+command owns renames is checkable by grepping the store rather than by trusting
+each new call site.
 
 **The two delivery paths resolve that signal differently.** Copy-paste warns:
 the operator is the gate, nothing has left the building, and failing the
@@ -260,15 +267,43 @@ Unlike `person add`, `invite` does **not** compare `--type`. It never asserts
 what kind of identity this is; it passes `human` only as the default for a row
 that may not exist yet, and an existing row keeps its own type untouched.
 
-Email is required even for `--type agent`, though the schema allows it to be
-null: it is the conflict target that makes the add idempotent and the key the
-audit looks people up by, so a row without one could be added twice and
-reconciled never.
+Email is required by **both** commands, though the schema allows the column to be
+null: it is the conflict target that makes them idempotent and the key the audit
+looks people up by, so a row without one could be added twice and reconciled
+never. `person add` has required it since PRSR-16, including for `--type agent`.
+
+`invite` requires it as of PRSR-23, which is a behaviour change to a shipped
+command and worth the reasoning. An emailless invite took a separate branch, and
+because `person_email_key` is partial on `email IS NOT NULL`, the row it wrote
+could not collide with anything — including the row the previous run of the same
+invite wrote. Each run therefore recorded a *new person id*, and that id is what
+every downstream guarantee keys on: `UNIQUE(person_id, service_id)`, which is how
+a re-run skips what is already provisioned, and `InviteRef`
+(`purser-{person.ID}-{connector}`), which is stable per (person × service) so an
+upstream `Idempotency-Key` dedupes across re-runs. So the one command that
+promises "re-running retries only what failed" did the opposite: a fresh upstream
+user and a fresh secret per run, plus one more person for the audit to walk each
+time. The alternative to requiring the address would be inventing a second
+identity key (a `--handle` with its own unique index); nothing needed one, and
+keying on `--name` instead is worse than the bug — two people legitimately share
+a name, and collapsing them is less recoverable than duplicating one.
+
+The column stays nullable and no migration rewrites what the old path left
+behind. Any such rows stay in the roster and the audit still walks them, but it
+can say very little about them: Cloudflare, Lyceum and Argosy all reject an
+emailless `Reconcile` outright, which the audit records as an *error* rather than
+as absence, and only Switchyard has a fallback (it matches on display name). So
+nothing marks them stale by accident under `reconcile --all` — and nothing
+confirms them either. That is the same "a person without an address cannot be
+found again" this ticket is about, seen from the audit's side. Making the column
+`NOT NULL` would mean deciding their fate inside a migration that fails the whole
+service on boot if it guesses wrong; the constraint belongs where the identity is
+decided instead.
 
 **Emails are unique case-insensitively** (migration 0003). They weren't
 originally: `person_email_key` indexed the bare column while every store lookup
 matched `lower(email)`. A row entered by hand as `Ada@Example.com` therefore did
-not collide with the lowercased address the code writes, and the upsert inserted
+not collide with the lowercased address the code writes, and the insert added
 a *second* person for the same human — precisely the duplicate identity this
 command exists to prevent, and one the audit would then walk and populate twice.
 That had to be fixed in the schema: a guard in `AddPerson` would have left
@@ -333,6 +368,9 @@ Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
   real drift with zero upstream mutation (PRSR-14).
 - **`purser person add`** (PRSR-16) — a roster entry point that provisions
   nothing, so people onboarded outside Purser stop being invisible to the audit.
+- **Identity guarantees on `invite`** — it no longer renames silently (PRSR-20),
+  and no longer accepts a person with no email (PRSR-23). Those were the two
+  ways an ordinary re-invite could stop meaning what it says.
 
 **Open:**
 

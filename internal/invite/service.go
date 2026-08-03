@@ -27,7 +27,6 @@ import (
 // Store is the persistence surface the orchestrator needs. *store.Store
 // satisfies it; tests supply an in-memory fake.
 type Store interface {
-	UpsertPerson(ctx context.Context, name, email string, typ model.PersonType) (model.Person, error)
 	InsertPersonIfAbsent(ctx context.Context, name, email string, typ model.PersonType) (model.Person, bool, error)
 	RenamePerson(ctx context.Context, email, name string) (model.Person, string, error)
 	PersonByEmail(ctx context.Context, email string) (model.Person, error)
@@ -188,24 +187,20 @@ func (s *Service) Validate(req Request) error {
 	if strings.TrimSpace(req.Name) == "" {
 		return errors.New("invite: name is required")
 	}
+	// The address is required for every invite, not only an emailed one
+	// (PRSR-23) — it is this person's identity key: the SSO join key upstream,
+	// what the audit looks them up by, and the conflict target that makes a
+	// re-invite idempotent. Checked through the same function `person add` uses,
+	// so `invite` cannot record a key the other command would have rejected.
+	if _, err := NormalizeEmail(req.Email); err != nil {
+		return err
+	}
 	resolved, _, err := s.resolve(req)
 	if err != nil {
 		return err
 	}
 	if len(resolved.Services) == 0 {
 		return errors.New("invite: at least one service is required")
-	}
-	if req.Delivery == model.DeliverEmail && strings.TrimSpace(req.Email) == "" {
-		return errors.New("invite: email delivery requires an email address")
-	}
-	// Any address supplied, delivery or not, becomes this person's identity key
-	// — the SSO join key upstream and what the audit looks them up by. Validate
-	// it through the same function `person add` uses, so `invite` cannot record
-	// a key the other command would have rejected.
-	if strings.TrimSpace(req.Email) != "" {
-		if _, err := NormalizeEmail(req.Email); err != nil {
-			return err
-		}
 	}
 	if req.Delivery == model.DeliverEmail && s.emailer == nil {
 		return errors.New("invite: email delivery requested but SMTP is not configured")
@@ -241,13 +236,12 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 		req.Delivery = model.DeliverCopyPaste
 	}
 	// Normalized through the same function `person add` uses, so the two commands
-	// cannot disagree about what an identity key is. Validate already rejected a
-	// malformed address; this is the value that becomes the conflict target.
-	email := ""
-	if strings.TrimSpace(req.Email) != "" {
-		if email, err = NormalizeEmail(req.Email); err != nil {
-			return nil, err
-		}
+	// cannot disagree about what an identity key is. Validate already required it
+	// and rejected a malformed one; this is the value that becomes the conflict
+	// target.
+	email, err := NormalizeEmail(req.Email)
+	if err != nil {
+		return nil, err
 	}
 
 	person, conflict, err := s.resolvePerson(ctx, strings.TrimSpace(req.Name), email)
@@ -323,18 +317,20 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 // and failing one over a name mismatch punishes the wrong action. Renaming stays
 // where it already lives, behind `person add --rename`, so exactly one command
 // can change a name and it's the one whose whole subject is the roster.
+//
+// email is never empty — Validate requires it (PRSR-23). It used to be optional,
+// and an emailless invite took a separate branch through UpsertPerson, which
+// with no address is not an upsert at all but an unconditional INSERT: the
+// unique index is partial on email IS NOT NULL, so such a row cannot collide
+// with anything, including a previous run of the same invite. Every re-run
+// therefore minted a *new person id*, and the person id is what idempotency is
+// keyed on — UNIQUE(person_id, service_id) for the skip, and InviteRef for the
+// upstream Idempotency-Key. So the one command that promises "re-running only
+// retries what failed" quietly re-provisioned everything, minting a fresh
+// upstream user and a fresh secret each time, and left the audit a new person to
+// walk per run. Requiring the address is what removes the branch; there is no
+// second identity key to fall back to.
 func (s *Service) resolvePerson(ctx context.Context, name, email string) (model.Person, *NameConflict, error) {
-	// No email means no conflict target: the unique index is partial on
-	// email IS NOT NULL, so there is nothing to match against. Note this branch
-	// does not merely skip the *rename* check — UpsertPerson with an empty email
-	// is an unconditional INSERT, so every emailless invite mints a fresh person
-	// and re-provisions from scratch. Pre-existing and tracked separately; the
-	// rename guard above is what PRSR-20 was about.
-	if email == "" {
-		p, err := s.store.UpsertPerson(ctx, name, email, model.PersonHuman)
-		return p, nil, err
-	}
-
 	person, created, err := s.findOrCreate(ctx, name, email, model.PersonHuman)
 	if err != nil {
 		return model.Person{}, nil, err

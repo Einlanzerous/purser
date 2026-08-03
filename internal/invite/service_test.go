@@ -622,25 +622,36 @@ func TestRun_NewEmailRecordsTheGivenName(t *testing.T) {
 	}
 }
 
-// An emailless invite has no conflict target — the unique index is partial on
-// email IS NOT NULL — so it keeps the old unguarded path and must still work.
-func TestRun_WithoutEmailStillProvisions(t *testing.T) {
+// An emailless invite is refused, on copy-paste delivery as much as on email
+// (PRSR-23).
+//
+// It used to be allowed, and it was the one input that turned idempotency off:
+// with no address there is nothing for the person row to collide with — the
+// unique index is partial on email IS NOT NULL — so each run recorded a *new*
+// person id. Every downstream guarantee is keyed on that id, so the command that
+// promises to retry only what failed instead re-provisioned everything, minting
+// a fresh upstream user and a fresh secret per run.
+//
+// The assertion is that nothing happened, not merely that an error came back: a
+// refusal that has already provisioned a service or written a person row is the
+// same bug with a non-zero exit code.
+func TestRun_WithoutEmail_IsRefusedBeforeAnythingHappens(t *testing.T) {
 	st := newFakeStore()
 	sw := &fakeConn{key: "switchyard", display: "Switchyard", result: connector.Result{ExternalID: "u-1"}}
 	reg := connector.NewRegistry(sw)
 	svc := New(seededStore(t, st, reg), reg, nil)
 
-	res, err := svc.Run(context.Background(), Request{
+	_, err := svc.Run(context.Background(), Request{
 		Name: "Anon", Services: []string{"switchyard"}, Delivery: model.DeliverCopyPaste,
 	})
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	if err == nil {
+		t.Fatal("an invite with no email should be refused")
 	}
-	if res.NameConflict != nil {
-		t.Errorf("no email means nothing to conflict with: %+v", res.NameConflict)
+	if sw.callCount() != 0 {
+		t.Errorf("provisioned %d times for a refused invite, want 0", sw.callCount())
 	}
-	if got := outcome(res, "switchyard").Status; got != model.TaskSucceeded {
-		t.Errorf("want succeeded, got %s", got)
+	if n := st.personCount(); n != 0 {
+		t.Errorf("recorded %d people for a refused invite, want 0", n)
 	}
 }
 
@@ -653,8 +664,12 @@ func TestValidate_Errors(t *testing.T) {
 		req  Request
 	}{
 		{"no name", Request{Services: []string{"switchyard"}}},
-		{"no services", Request{Name: "Ada"}},
-		{"unknown service", Request{Name: "Ada", Services: []string{"nope"}}},
+		{"no services", Request{Name: "Ada", Email: "ada@example.com"}},
+		{"unknown service", Request{Name: "Ada", Email: "ada@example.com", Services: []string{"nope"}}},
+		// The address is required on every delivery method, so both of these are
+		// the same check now (PRSR-23) — kept apart because the copy-paste case is
+		// the one that used to be allowed.
+		{"no email", Request{Name: "Ada", Services: []string{"switchyard"}, Delivery: model.DeliverCopyPaste}},
 		{"email delivery without email", Request{Name: "Ada", Services: []string{"switchyard"}, Delivery: model.DeliverEmail}},
 	}
 	for _, tc := range cases {
@@ -693,27 +708,10 @@ func keyOf(a, b uuid.UUID) string { return a.String() + ":" + b.String() }
 // fakeStore is an in-memory invite.Store.
 type fakeStore struct {
 	mu       sync.Mutex
-	people   map[string]model.Person        // by email (or id when no email)
+	people   map[string]model.Person        // by lowercased email — the only key there is
 	services map[string]model.Service       // by key
 	accounts map[string]model.Account       // by person:service
 	tasks    map[string]model.ProvisionTask // by invite:service
-}
-
-func (s *fakeStore) UpsertPerson(_ context.Context, name, email string, typ model.PersonType) (model.Person, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if email != "" {
-		if p, ok := s.people[email]; ok {
-			p.Name = name
-			s.people[email] = p
-			return p, nil
-		}
-	}
-	p := model.Person{ID: uuid.New(), Name: name, Email: email, Type: typ}
-	if email != "" {
-		s.people[email] = p
-	}
-	return p, nil
 }
 
 // InsertPersonIfAbsent mirrors the real store: the email is unique
@@ -731,6 +729,14 @@ func (s *fakeStore) InsertPersonIfAbsent(_ context.Context, name, email string, 
 	p := model.Person{ID: uuid.New(), Name: name, Email: k, Type: typ}
 	s.people[k] = p
 	return p, true, nil
+}
+
+// personCount reports how many people the store holds, so a test can assert
+// that a refused invite recorded nobody.
+func (s *fakeStore) personCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.people)
 }
 
 func (s *fakeStore) RenamePerson(_ context.Context, email, name string) (model.Person, string, error) {
