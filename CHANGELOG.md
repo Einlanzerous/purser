@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.11.0](https://github.com/Einlanzerous/purser/compare/v0.10.0...v0.11.0) (2026-08-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* **invite:** require an email, the key idempotency is built on (PRSR-23) ([#24](https://github.com/Einlanzerous/purser/issues/24))
+
+### Bug Fixes
+
+* **invite:** require an email, the key idempotency is built on (PRSR-23) ([#24](https://github.com/Einlanzerous/purser/issues/24)) ([27b4aa8](https://github.com/Einlanzerous/purser/commit/27b4aa8fa7ad3e117799f491b9781b68b4d93bf5))
+
 ## [0.10.0](https://github.com/Einlanzerous/purser/compare/v0.9.1...v0.10.0) (2026-08-02)
 
 
