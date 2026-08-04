@@ -275,3 +275,30 @@ func TestReconcile_ReportsAbsentUser(t *testing.T) {
 		t.Error("an empty user list should report Exists=false")
 	}
 }
+
+// A person with no address is unanswerable, not absent and not present
+// (PRSR-23). findUser falls back to matching on display name, so answering at
+// all would bind this person to whoever upstream happens to share their name —
+// or, on a miss, mark a real account stale and re-arm provisioning for a second
+// token. The audit turns an error into "unverifiable" and writes nothing, which
+// is the whole reason to fail rather than guess.
+//
+// Only rows predating the required --email can reach this; the guard is what
+// keeps `reconcile --all` safe to run with them in the roster.
+func TestReconcile_RefusesWithoutAnEmailRatherThanMatchingOnName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no address to look up, so the upstream must not be called at all: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"items":[{"id":"u-7","name":"Ada","email":"someone.else@example.com"}],"page":{"next_cursor":null}}`))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	res, err := c.Reconcile(context.Background(), connector.Input{PersonName: "Ada"})
+	if err == nil {
+		t.Fatal("want an error for an emailless reconcile, got none")
+	}
+	if res.Exists {
+		t.Error("a refusal must not also claim the account exists")
+	}
+}

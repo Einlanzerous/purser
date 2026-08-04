@@ -313,9 +313,9 @@ through `Reconcile`, which never mutates. The `reconcile` hint appears only when
 the preview actually found something to record.
 
 An email that already exists is a **conflict, not an edit** — for both the name
-and the type. Purser's older `UpsertPerson` renames on conflict, so a command
-taking `--name` would otherwise rename whoever holds that address silently; `add`
-uses an insert-if-absent instead and refuses:
+and the type. Purser used to have an `UpsertPerson` whose `ON CONFLICT` set the
+name, so a command taking `--name` renamed whoever held that address silently;
+`add` uses an insert-if-absent instead and refuses:
 
 ```
 $ purser person add --name "A. Lovelace" --email ada@example.com
@@ -351,18 +351,22 @@ purser: invite: refusing email delivery for a name that disagrees with the recor
 is recorded as "Ada Lovelace", not "Bob Smith" — … re-run with the recorded name, or rename first
 ```
 
-`person add --rename` is the only way to change a recorded name.
+`person add --rename` is the only way to change a recorded name. `UpsertPerson`
+is gone as of PRSR-23, when its last caller went away — so a person row is
+created in exactly one place and renamed in exactly one other, and "what can
+change a name?" is answerable by grep rather than by review.
 
-`--email` is required even with `--type agent`: it's the conflict target that
-makes the add idempotent and the key the audit looks people up by, so a row
-without one could be added twice and reconciled never. It is validated as an
+`--email` is required on **both** commands — on `person add` even with
+`--type agent`, and on `invite` whichever `--deliver` is used. It's the conflict
+target that makes them idempotent and the key the audit looks people up by, so a
+row without one could be added twice and reconciled never. It is validated as an
 address, which rejects a fragment or a `Name <addr>` form — it cannot, of
 course, catch a plausible typo like `ada@exmaple.com`.
 
 Emails are unique **case-insensitively** (migration `0003`). They were not
 before: the index was case-sensitive while every lookup matched `lower(email)`,
 so a row entered by hand as `Ada@Example.com` didn't collide with the lowercased
-address the code writes, and an upsert would insert a second person for the same
+address the code writes, and the insert added a second person for the same
 human. That is the duplicate-identity failure this command exists to prevent, so
 it had to be fixed in the schema, not worked around above it.
 
@@ -371,6 +375,26 @@ it had to be fixed in the schema, not worked around above it.
 block. Re-running the same invite is idempotent — already-provisioned services
 are skipped and only previously-failed ones retried.
 
+That guarantee is why `invite` requires `--email` (PRSR-23). It used to accept an
+invite without one, and the unique index is partial on `email IS NOT NULL`, so
+the row it wrote could never collide with the row the *previous* run wrote: each
+run recorded a new person, and the person id is what every downstream guarantee
+is keyed on — `UNIQUE(person_id, service_id)` for the skip above, and the
+`InviteRef` an upstream `Idempotency-Key` dedupes on. So the emailless invite
+quietly re-provisioned everything on every run, minting a fresh upstream user and
+a fresh secret each time, and left the audit one more person to walk per run.
+There is no second identity key to fall back to, which is why the address is
+required rather than defaulted.
+
+Migration `0005` states the same rule in the schema — `CHECK (email IS NOT NULL)`,
+declared `NOT VALID` so it binds every new row without having to decide at boot
+what to do with any the old path left behind. Those are stranded either way: no
+command can address a person who has no address, so repairing one means hand SQL
+(which the constraint deliberately still allows). Relatedly, all four connectors
+now refuse an emailless `Reconcile` rather than guessing — Switchyard used to
+fall back to matching on display name, which as an *audit* answer would record
+someone against a same-named stranger.
+
 ### HTTP API
 
 Bearer-authenticated with `PURSER_API_TOKEN` (also relies on
@@ -378,7 +402,8 @@ construct_net/Tailscale isolation).
 
 - `GET  /healthz`
 - `POST /v1/invites` — `{ "name", "email", "services": [...], "bundle", "role", "deliver" }`
-  (omit both `services` and `bundle` to grant the default bundle)
+  (omit both `services` and `bundle` to grant the default bundle; `name` and
+  `email` are required and a request without either is a `400`)
 - `GET  /v1/invites/{id}` — status
 
 The credential block (with secrets) is returned only for `copypaste` delivery;

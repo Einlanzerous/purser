@@ -22,7 +22,7 @@ func runInvite(args []string) {
 	fs := flag.NewFlagSet("invite", flag.ExitOnError)
 	var (
 		name     = fs.String("name", "", "person's display name (required)")
-		email    = fs.String("email", "", "person's email (required for SSO + email delivery)")
+		email    = fs.String("email", "", "person's email (required — the identity key)")
 		to       = fs.String("to", "", "comma-separated services, e.g. switchyard,cloudflare")
 		bundle   = fs.String("bundle", "", "named onboarding bundle to grant, e.g. media | all (see PURSER_BUNDLE_*)")
 		role     = fs.String("role", "member", "preset: member | admin (shortcut for --instance-role + --scopes)")
@@ -38,15 +38,34 @@ func runInvite(args []string) {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "With neither --to nor --bundle, the default bundle is granted")
 		fmt.Fprintln(os.Stderr, "(PURSER_DEFAULT_BUNDLE). Passing both takes the union.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "--email is required whichever delivery is used: it is the person's")
+		fmt.Fprintln(os.Stderr, "identity key, and what makes re-running this invite idempotent.")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
 
 	services := splitServices(*to)
-	// --to and --bundle are both optional now: an invite with neither falls back
-	// to the default bundle, which is the common "welcome to the family" path.
-	if *name == "" {
+	// --to and --bundle are both optional: an invite with neither falls back to
+	// the default bundle, which is the common "welcome to the family" path.
+	//
+	if strings.TrimSpace(*name) == "" {
 		fs.Usage()
+		os.Exit(2)
+	}
+	// --email is not optional, on any delivery method (PRSR-23). Without one
+	// there is nothing for the person row to collide with, so each run recorded a
+	// new person — and with it a new idempotency key, which turned every re-run
+	// into a fresh round of provisioning.
+	//
+	// NormalizeEmail owns both halves of the rule, absent and malformed, and says
+	// which — so there is no second copy of "is this an identity key?" here, and
+	// the operator gets the reason rather than another dump of the flag list.
+	// Checked before setup(), so the mistake costs an exit 2 rather than a
+	// database connect; Validate checks it again for every other caller.
+	if _, err := invite.NormalizeEmail(*email); err != nil {
+		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
+		fmt.Fprintln(os.Stderr, "usage: purser invite --name NAME --email EMAIL [--to svc1,svc2] [--bundle NAME]")
 		os.Exit(2)
 	}
 

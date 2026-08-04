@@ -258,7 +258,7 @@ func TestRun_BundleNamingUnregisteredService_IsRejected(t *testing.T) {
 	reg := connector.NewRegistry(ar) // no cloudflare/lyceum registered
 
 	svc := New(seededStore(t, st, reg), reg, nil, WithBundles(testBundles()))
-	err := svc.Validate(Request{Name: "Ada", Bundle: "media"})
+	err := svc.Validate(Request{Name: "Ada", Email: "ada@example.com", Bundle: "media"})
 	if err == nil {
 		t.Fatal("a bundle naming an unregistered service should fail validation")
 	}

@@ -123,10 +123,14 @@ func (s *Service) AddPerson(ctx context.Context, req AddPersonRequest) (*AddPers
 //
 // Exported so the CLI can reject a malformed address before opening a database
 // connection, without keeping a second copy of the rule.
+//
+// Both entry points call it — `person add` and, since PRSR-23, `invite` — so the
+// "required" half is worded for either. They agree on what an identity key is
+// because there is one function that decides.
 func NormalizeEmail(raw string) (string, error) {
 	email := strings.ToLower(strings.TrimSpace(raw))
 	if email == "" {
-		return "", errors.New("invite: email is required to add a person")
+		return "", errors.New("invite: email is required — it is the person's identity key")
 	}
 	addr, err := mail.ParseAddress(email)
 	if err != nil || addr.Address != email {

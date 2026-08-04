@@ -63,14 +63,37 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   audit can see people onboarded outside Purser, and it stops being useful the
   moment it starts doing invite's job. (`--audit` then runs the ordinary
   read-only audit, which does call `Reconcile`; that's the preview, not the add.)
-- **An occupied email is a conflict, not an edit.** `UpsertPerson` is
-  `ON CONFLICT … DO UPDATE SET name`, so any command taking `--name` renames
-  whoever holds that address unless it refuses first — `person add` uses
-  `InsertPersonIfAbsent` and requires `--rename`. `invite` no longer calls
-  `UpsertPerson` for an addressed person either (PRSR-20): `resolvePerson` keeps
-  the stored name and reports the disagreement as `Result.NameConflict`. **Only
-  `person add --rename` may change a name.** Don't add a rename path to `invite`
-  — one command owning renames is what makes the guarantee checkable.
+- **An occupied email is a conflict, not an edit.** The store used to carry an
+  `UpsertPerson` doing `ON CONFLICT … DO UPDATE SET name`, so any command taking
+  `--name` renamed whoever holds that address unless it refused first — `person
+  add` uses `InsertPersonIfAbsent` and requires `--rename`, and `invite`'s
+  `resolvePerson` keeps the stored name and reports the disagreement as
+  `Result.NameConflict` (PRSR-20). `UpsertPerson` is now deleted (PRSR-23): a
+  `person` row is created only by `InsertPersonIfAbsent` and renamed only by
+  `RenamePerson`. **Only `person add --rename` may change a name.** Don't add a
+  rename path to `invite`, and don't reintroduce a name-setting upsert — one
+  command owning renames is what makes the guarantee checkable by grep.
+- **`invite` requires an email, on every delivery method.** The address is the
+  identity key and there is no second one. Without it the person row has no
+  conflict target — `person_email_key` is partial on `email IS NOT NULL` — so
+  each run recorded a *new* person id, and the person id is what idempotency is
+  keyed on: `UNIQUE(person_id, service_id)` for the skip, and `InviteRef` for the
+  upstream `Idempotency-Key`. The command that promises to retry only what failed
+  therefore re-provisioned everything, fresh secret and all, once per run
+  (PRSR-23). Don't make it optional again or default it, and don't key identity
+  on `--name`: two people legitimately share a name, and merging them is worse
+  than duplicating one. Migration 0005 says the same thing in the schema —
+  `CHECK (email IS NOT NULL) NOT VALID`, so it binds new rows without having to
+  decide the fate of pre-0005 emailless ones at boot. Those are stranded (no
+  command can address a person with no address) and hand SQL is the only repair;
+  the constraint permits it deliberately.
+- **No connector may answer a reconcile it can't verify.** All four refuse an
+  emailless `Reconcile`. Switchyard's `findUser` still falls back to matching on
+  display name — fine on the Provision path, where Switchyard itself reported the
+  conflict, but as an *audit* answer it would record a person against a
+  same-named stranger, or mark a real account stale and re-arm provisioning for a
+  second token. Requiring the address on `invite` is what left that fallback
+  reachable only from the audit, so `Reconcile` guards it there (PRSR-23).
 - **A name mismatch blocks `--deliver email`, not copy-paste.** It's the only
   evidence that a mistyped `--email` landed on a *different existing person*, and
   email mails them working credentials before any warning can be read — so Run
@@ -135,8 +158,10 @@ Also shipped: onboarding bundles + the launcher-led credential block (PRSR-12),
 real drift with zero upstream mutation, `person add` (PRSR-16), the roster entry
 point that provisions nothing, the recipient/operator split in the invite result
 (PRSR-19), the end of `invite`'s silent rename (PRSR-20), which also made a
-name mismatch fatal on the email path, and `TaskUnavailable` (PRSR-21), which
-stopped a not-yet-configured connector counting as a breakage.
+name mismatch fatal on the email path, `TaskUnavailable` (PRSR-21), which
+stopped a not-yet-configured connector counting as a breakage, and a required
+`--email` on `invite` (PRSR-23), which closed the emailless path that minted a
+new person — and so a new idempotency key — on every run.
 
 Open, in rough priority order: `Deprovision` is unimplemented on every connector
 but Cloudflare (PRSR-17) — so `stale` can re-arm provisioning but cannot revoke;

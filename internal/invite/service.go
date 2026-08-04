@@ -27,7 +27,6 @@ import (
 // Store is the persistence surface the orchestrator needs. *store.Store
 // satisfies it; tests supply an in-memory fake.
 type Store interface {
-	UpsertPerson(ctx context.Context, name, email string, typ model.PersonType) (model.Person, error)
 	InsertPersonIfAbsent(ctx context.Context, name, email string, typ model.PersonType) (model.Person, bool, error)
 	RenamePerson(ctx context.Context, email, name string) (model.Person, string, error)
 	PersonByEmail(ctx context.Context, email string) (model.Person, error)
@@ -180,46 +179,75 @@ func (s *Service) resolve(req Request) (Request, string, error) {
 	return req, applied, nil
 }
 
-// Validate checks a request against the registry before any writes. It resolves
+// checked is a request that has passed validation: bundle expanded, delivery
+// defaulted, email normalized. Run works from one of these rather than deriving
+// the same values a second time, so a request becomes usable in exactly one
+// place and Run has no error branch that Validate didn't already take.
+type checked struct {
+	req    Request // Services expanded, Projects merged, Delivery defaulted
+	bundle string  // the bundle that supplied the service list; "" if named explicitly
+	email  string  // the normalized identity key
+}
+
+// Validate checks a request against the registry before any writes, and is the
+// caller-facing half of validate below — the API uses it to answer 400 vs 500.
+func (s *Service) Validate(req Request) error {
+	_, err := s.validate(req)
+	return err
+}
+
+// validate checks a request and returns it in the form Run needs. It resolves
 // any bundle first, so an unknown bundle or a bundle naming an unregistered
 // service is caught here — i.e. reported as the caller's error rather than
 // failing midway through provisioning.
-func (s *Service) Validate(req Request) error {
+//
+// Everything the database will reject is rejected here, because Run writes a
+// person row before it writes anything else: a value that only the schema
+// refuses (an unknown delivery method against `invite`'s CHECK constraint)
+// would otherwise surface as a raw Postgres error, and a 500, after the roster
+// had already grown a row for it.
+func (s *Service) validate(req Request) (checked, error) {
 	if strings.TrimSpace(req.Name) == "" {
-		return errors.New("invite: name is required")
+		return checked{}, errors.New("invite: name is required")
 	}
-	resolved, _, err := s.resolve(req)
+	// The address is required for every invite, not only an emailed one
+	// (PRSR-23) — it is this person's identity key: the SSO join key upstream,
+	// what the audit looks them up by, and the conflict target that makes a
+	// re-invite idempotent. Normalized through the same function `person add`
+	// uses, so `invite` cannot record a key the other command would have
+	// rejected, and this is the value that becomes the conflict target.
+	email, err := NormalizeEmail(req.Email)
 	if err != nil {
-		return err
+		return checked{}, err
+	}
+	switch req.Delivery {
+	case "", model.DeliverCopyPaste:
+		req.Delivery = model.DeliverCopyPaste
+	case model.DeliverEmail:
+		if s.emailer == nil {
+			return checked{}, errors.New("invite: email delivery requested but SMTP is not configured")
+		}
+	default:
+		return checked{}, fmt.Errorf("invite: unknown delivery method %q (want %s or %s)",
+			req.Delivery, model.DeliverCopyPaste, model.DeliverEmail)
+	}
+	resolved, applied, err := s.resolve(req)
+	if err != nil {
+		return checked{}, err
 	}
 	if len(resolved.Services) == 0 {
-		return errors.New("invite: at least one service is required")
-	}
-	if req.Delivery == model.DeliverEmail && strings.TrimSpace(req.Email) == "" {
-		return errors.New("invite: email delivery requires an email address")
-	}
-	// Any address supplied, delivery or not, becomes this person's identity key
-	// — the SSO join key upstream and what the audit looks them up by. Validate
-	// it through the same function `person add` uses, so `invite` cannot record
-	// a key the other command would have rejected.
-	if strings.TrimSpace(req.Email) != "" {
-		if _, err := NormalizeEmail(req.Email); err != nil {
-			return err
-		}
-	}
-	if req.Delivery == model.DeliverEmail && s.emailer == nil {
-		return errors.New("invite: email delivery requested but SMTP is not configured")
+		return checked{}, errors.New("invite: at least one service is required")
 	}
 	for _, key := range resolved.Services {
 		if _, ok := s.registry.Get(key); !ok {
 			if req.Bundle != "" {
-				return fmt.Errorf("invite: bundle %q names unknown service %q (known services: %s)",
+				return checked{}, fmt.Errorf("invite: bundle %q names unknown service %q (known services: %s)",
 					req.Bundle, key, strings.Join(s.registry.Keys(), ", "))
 			}
-			return fmt.Errorf("invite: unknown service %q (known: %s)", key, strings.Join(s.registry.Keys(), ", "))
+			return checked{}, fmt.Errorf("invite: unknown service %q (known: %s)", key, strings.Join(s.registry.Keys(), ", "))
 		}
 	}
-	return nil
+	return checked{req: resolved, bundle: applied, email: email}, nil
 }
 
 // Run executes the invite. It is safe to call repeatedly with the same request:
@@ -227,28 +255,15 @@ func (s *Service) Validate(req Request) error {
 // retried. A per-service connector failure does not abort the whole invite; it
 // is recorded and the remaining services still run.
 func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
-	if err := s.Validate(req); err != nil {
-		return nil, err
-	}
-	// Validate already proved this resolves; re-run it for the expanded request.
-	// appliedBundle is reported back so the operator can see which set was used
-	// — in particular that an unqualified invite got the default bundle.
-	req, appliedBundle, err := s.resolve(req)
+	// One pass decides whether this request is usable and what it means: the
+	// expanded service list, the applied bundle — reported back so the operator
+	// can see which set was used, in particular that an unqualified invite got
+	// the default one — and the normalized identity key.
+	c, err := s.validate(req)
 	if err != nil {
 		return nil, err
 	}
-	if req.Delivery == "" {
-		req.Delivery = model.DeliverCopyPaste
-	}
-	// Normalized through the same function `person add` uses, so the two commands
-	// cannot disagree about what an identity key is. Validate already rejected a
-	// malformed address; this is the value that becomes the conflict target.
-	email := ""
-	if strings.TrimSpace(req.Email) != "" {
-		if email, err = NormalizeEmail(req.Email); err != nil {
-			return nil, err
-		}
-	}
+	req, appliedBundle, email := c.req, c.bundle, c.email
 
 	person, conflict, err := s.resolvePerson(ctx, strings.TrimSpace(req.Name), email)
 	if err != nil {
@@ -323,18 +338,20 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 // and failing one over a name mismatch punishes the wrong action. Renaming stays
 // where it already lives, behind `person add --rename`, so exactly one command
 // can change a name and it's the one whose whole subject is the roster.
+//
+// email is never empty — Validate requires it (PRSR-23). It used to be optional,
+// and an emailless invite took a separate branch through UpsertPerson, which
+// with no address is not an upsert at all but an unconditional INSERT: the
+// unique index is partial on email IS NOT NULL, so such a row cannot collide
+// with anything, including a previous run of the same invite. Every re-run
+// therefore minted a *new person id*, and the person id is what idempotency is
+// keyed on — UNIQUE(person_id, service_id) for the skip, and InviteRef for the
+// upstream Idempotency-Key. So the one command that promises "re-running only
+// retries what failed" quietly re-provisioned everything, minting a fresh
+// upstream user and a fresh secret each time, and left the audit a new person to
+// walk per run. Requiring the address is what removes the branch; there is no
+// second identity key to fall back to.
 func (s *Service) resolvePerson(ctx context.Context, name, email string) (model.Person, *NameConflict, error) {
-	// No email means no conflict target: the unique index is partial on
-	// email IS NOT NULL, so there is nothing to match against. Note this branch
-	// does not merely skip the *rename* check — UpsertPerson with an empty email
-	// is an unconditional INSERT, so every emailless invite mints a fresh person
-	// and re-provisions from scratch. Pre-existing and tracked separately; the
-	// rename guard above is what PRSR-20 was about.
-	if email == "" {
-		p, err := s.store.UpsertPerson(ctx, name, email, model.PersonHuman)
-		return p, nil, err
-	}
-
 	person, created, err := s.findOrCreate(ctx, name, email, model.PersonHuman)
 	if err != nil {
 		return model.Person{}, nil, err

@@ -38,30 +38,10 @@ func testStore(t *testing.T) *Store {
 	return New(pool)
 }
 
-func TestUpsertPerson_IdempotentByEmail(t *testing.T) {
-	st := testStore(t)
-	ctx := context.Background()
-
-	p1, err := st.UpsertPerson(ctx, "Ada", "ada@example.com", model.PersonHuman)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p2, err := st.UpsertPerson(ctx, "Ada Lovelace", "ada@example.com", model.PersonHuman)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p1.ID != p2.ID {
-		t.Errorf("same email should return same person: %s vs %s", p1.ID, p2.ID)
-	}
-	if p2.Name != "Ada Lovelace" {
-		t.Errorf("name should update on upsert, got %q", p2.Name)
-	}
-}
-
 // The bug PRSR-16's migration 0003 closes: person_email_key was case-sensitive
 // while every lookup matched lower(email), so a row that arrived by hand as
 // 'Ada@Example.com' did not collide with the lowercased address the code
-// writes. The upsert then inserted a *second* person for the same human — the
+// writes. The insert then added a *second* person for the same human — the
 // duplicate identity `person add` exists to prevent.
 //
 // This can only be caught against a real index; an in-memory fake keyed by a
@@ -75,9 +55,12 @@ func TestPersonEmail_UniqueCaseInsensitively(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p, err := st.UpsertPerson(ctx, "Ada Lovelace", "ada@example.com", model.PersonHuman)
+	_, created, err := st.InsertPersonIfAbsent(ctx, "Ada Lovelace", "ada@example.com", model.PersonHuman)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if created {
+		t.Error("the differently-cased address is taken; creating is a duplicate identity")
 	}
 	people, err := st.ListPeople(ctx)
 	if err != nil {
@@ -86,16 +69,80 @@ func TestPersonEmail_UniqueCaseInsensitively(t *testing.T) {
 	if len(people) != 1 {
 		t.Fatalf("got %d person rows for one human, want 1 (duplicate identity)", len(people))
 	}
-	if people[0].ID != p.ID {
-		t.Error("upsert returned a row that is not the one in the table")
+	// The conflict is reported, not applied: the hand-entered row keeps its name
+	// and its case.
+	if people[0].Name != "Ada" || people[0].Email != "Ada@Example.com" {
+		t.Errorf("existing row was modified: %+v", people[0])
 	}
-	if people[0].Name != "Ada Lovelace" {
-		t.Errorf("name = %q, want the upsert to have matched the mixed-case row", people[0].Name)
+	got, err := st.PersonByEmail(ctx, "ada@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != people[0].ID {
+		t.Error("the lookup and the index disagree about which row holds this address")
 	}
 }
 
-// InsertPersonIfAbsent must never modify an occupied address — that is the
-// whole difference from UpsertPerson, and what lets `person add` refuse.
+// Migration 0005 puts the identity-key rule in the schema, where hand-written
+// SQL is subject to it too — the same reasoning as 0003, whose bug a guard in Go
+// could not have reached.
+//
+// NOT VALID is what makes it deployable: rows the pre-PRSR-23 emailless path
+// wrote must survive, because there is nothing to backfill them with and a
+// migration that decides their fate wrongly takes the service down on boot. So
+// the constraint is checked on writes and not on what is already there — and the
+// hand SQL that would repair such a row still satisfies it.
+func TestPersonEmailRequired_BindsNewRowsAndSparesOldOnes(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Reproduce a row the old path left behind: drop the constraint, write what
+	// the emailless branch used to write, then re-apply the migration exactly as
+	// it ships — loaded from the embedded FS rather than retyped, so the test
+	// cannot drift from what runs on boot.
+	if _, err := st.pool.Exec(ctx, `ALTER TABLE person DROP CONSTRAINT person_email_required`); err != nil {
+		t.Fatalf("0005 should have added the constraint: %v", err)
+	}
+	var legacyID string
+	if err := st.pool.QueryRow(ctx,
+		`INSERT INTO person (name, type) VALUES ('Anon', 'human') RETURNING id`).Scan(&legacyID); err != nil {
+		t.Fatal(err)
+	}
+
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, m := range migs {
+		if m.version == "0005" {
+			sql = m.sql
+		}
+	}
+	if sql == "" {
+		t.Fatal("migration 0005 not found in the embedded FS")
+	}
+	// The whole point of NOT VALID: this must apply over the row above rather
+	// than failing the migration — and with it the service's boot.
+	if _, err := st.pool.Exec(ctx, sql); err != nil {
+		t.Fatalf("0005 must apply with an emailless row already present: %v", err)
+	}
+
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO person (name, type) VALUES ('Someone New', 'human')`); err == nil {
+		t.Error("a new emailless row should be refused by person_email_required")
+	}
+
+	// The repair path stays open: giving the stranded row an address satisfies
+	// the constraint rather than tripping it.
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE person SET email = 'anon@example.com' WHERE id = $1`, legacyID); err != nil {
+		t.Errorf("hand-repairing a legacy row must remain possible: %v", err)
+	}
+}
+
+// An occupied address is never modified — that is what lets `person add` refuse
+// and `invite` report the disagreement instead of writing it.
 func TestInsertPersonIfAbsent(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -168,7 +215,7 @@ func TestAccountAndTask_Idempotency(t *testing.T) {
 		t.Errorf("EnsureService not idempotent")
 	}
 
-	p, _ := st.UpsertPerson(ctx, "Ada", "ada@example.com", model.PersonHuman)
+	p, _, _ := st.InsertPersonIfAbsent(ctx, "Ada", "ada@example.com", model.PersonHuman)
 	inv, err := st.CreateInvite(ctx, p.ID, model.DeliverCopyPaste, "member")
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +284,7 @@ func TestUpdateTask_PersistsUnavailableStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, _ := st.UpsertPerson(ctx, "Ada", "ada@example.com", model.PersonHuman)
+	p, _, _ := st.InsertPersonIfAbsent(ctx, "Ada", "ada@example.com", model.PersonHuman)
 	inv, err := st.CreateInvite(ctx, p.ID, model.DeliverCopyPaste, "member")
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +330,7 @@ func TestMigration0004_ReclassifiesOnlyErrPendingFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := st.UpsertPerson(ctx, "Ada", "ada@example.com", model.PersonHuman)
+	p, _, err := st.InsertPersonIfAbsent(ctx, "Ada", "ada@example.com", model.PersonHuman)
 	if err != nil {
 		t.Fatal(err)
 	}
