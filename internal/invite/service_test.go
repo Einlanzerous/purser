@@ -978,6 +978,15 @@ func (s *fakeStore) UpdateTask(_ context.Context, t model.ProvisionTask) error {
 	return nil
 }
 
+// accountStatus reads back an account's persisted status, so an offboard test
+// can assert on the durable record rather than only on the returned finding —
+// "we said revoked" and "the row says revoked" are exactly what must not drift.
+func (s *fakeStore) accountStatus(personID, serviceID uuid.UUID) model.AccountStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accounts[keyOf(personID, serviceID)].Status
+}
+
 // taskStatus reads back what was persisted for one service of an invite, so a
 // test can assert on the durable record rather than only on the returned
 // outcome. They are set from the same value and could drift apart in exactly one

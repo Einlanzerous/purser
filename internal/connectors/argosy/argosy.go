@@ -191,8 +191,21 @@ func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connecto
 
 // Deprovision is not yet implemented (Phase 1 is invite-only). Argosy has no
 // admin delete-account endpoint to call.
+// Deprovision reports that Argosy cannot revoke access yet (PRSR-17).
+//
+// The admin surface has create (`POST /api/v1/admin/accounts`) and lookup
+// (`GET /api/v1/admin/accounts?email=`, ARGY-163) but no delete, no disable, and
+// no way to invalidate a device bearer token. So there is nothing to call.
+//
+// ErrPending rather than a plain error, deliberately: it records
+// model.TaskUnavailable, which is the difference between "this broke" and
+// "nobody has built this yet". An offboard that revokes Switchyard, Cloudflare
+// and Lyceum then reports Argosy as unavailable is telling the truth — three
+// services closed, one still open and needing a hand — where returning nil would
+// claim access was removed that demonstrably wasn't, on the one path where that
+// claim is dangerous.
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
-	return errors.New("argosy: deprovision not implemented")
+	return fmt.Errorf("%w: argosy has no account delete or disable endpoint — remove the account by hand until one ships", connector.ErrPending)
 }
 
 func (c *Connector) do(ctx context.Context, method, path string, body any) (int, []byte, error) {

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -167,9 +168,45 @@ func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connecto
 	}
 }
 
-// Deprovision is not yet implemented (Phase 1 is invite-only).
+// Deprovision removes the person's Lyceum account (PRSR-17).
+//
+// **This connector deletes.** Everywhere else `Deprovision` means revoke — take
+// away the way in and leave the account standing — but Lyceum's admin surface
+// offers exactly one destructive operation, `DELETE /admin/users/{id}`, and no
+// way to disable a user or invalidate their sessions short of it. So here the two
+// collapse, and the honest thing is to say so rather than to let the interface's
+// gentler wording imply a reversibility this has none of.
+//
+// Idempotent: a person with no Lyceum user is a success. The id comes from the
+// account row where possible and from a lookup otherwise, both of which key on
+// the email — Lyceum has no name-matching fallback, so there is no stranger to
+// hit here the way there is on Switchyard.
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
-	return errors.New("lyceum: deprovision not implemented")
+	id := strings.TrimSpace(in.ExternalID)
+	if id == "" {
+		rec, err := c.Reconcile(ctx, in)
+		if err != nil {
+			return err
+		}
+		if !rec.Exists {
+			return nil // nothing upstream to remove
+		}
+		id = rec.ExternalID
+	}
+
+	status, raw, err := c.do(ctx, http.MethodDelete, "/admin/users/"+url.PathEscape(id), nil)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
+		// 404 is success: the account is gone, which is the requested state.
+		return nil
+	case http.StatusForbidden:
+		return fmt.Errorf("lyceum: 403 deleting user %s — is LYCEUM_AUTH=true and is PURSER_LYCEUM_OWNER_TOKEN an owner session token? (%s)", id, bodyMsg(raw))
+	default:
+		return apiError("delete user", status, raw)
+	}
 }
 
 func (c *Connector) do(ctx context.Context, method, path string, body any) (int, []byte, error) {

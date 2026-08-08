@@ -66,6 +66,20 @@ type Input struct {
 	// InviteRef is a stable per-(person×service) string suitable for an
 	// idempotency key on upstream APIs that support one.
 	InviteRef string
+
+	// ExternalID is the upstream account id Purser already recorded for this
+	// person and service, when it has one. Empty on the Provision path — there is
+	// nothing to know yet — and set on Deprovision from the `account` row.
+	//
+	// It exists so a revoke targets the account Purser actually provisioned
+	// rather than whatever a fresh lookup turns up. That distinction matters most
+	// on Switchyard, whose findUser falls back to matching on display name: a
+	// lookup is a guess that can land on a same-named stranger, and on the
+	// offboard path the cost of guessing wrong is revoking the wrong person's
+	// access. Connectors should prefer it and fall back to a lookup only when it
+	// is empty (a record written before this field existed, or by an audit that
+	// found no id upstream).
+	ExternalID string
 }
 
 // ProjectGrant assigns a person a role on a project. Key "*" is a wildcard
@@ -113,8 +127,21 @@ type Connector interface {
 	// Connectors whose upstream has no lookup endpoint must return
 	// ErrReconcileUnsupported rather than inferring absence.
 	Reconcile(ctx context.Context, in Input) (ReconcileResult, error)
-	// Deprovision removes the person's access. Stubbed for now (Phase 1 is
-	// invite-only); connectors may return a not-implemented error.
+	// Deprovision revokes the person's access to the service (PRSR-17).
+	//
+	// It means *revoke*, not delete. Where the upstream distinguishes them, take
+	// away the ability to get in and leave the account and anything it authored
+	// alone: revoking is reversible and preserves the record, and "they can't get
+	// in" is the actual requirement. A connector whose upstream offers only a
+	// delete says so in its own doc comment rather than quietly destroying more
+	// than the contract implies.
+	//
+	// Like Provision it must be idempotent: a person with nothing left to revoke
+	// is a success, not an error, so a failed-only retry is safe. And like
+	// Reconcile it must never claim more than it did — a connector that cannot
+	// revoke returns ErrPending (recorded as TaskUnavailable) rather than nil,
+	// because "we removed it" and "we couldn't" must not collapse into the same
+	// answer on the one path that is hard to undo.
 	Deprovision(ctx context.Context, in Input) error
 }
 

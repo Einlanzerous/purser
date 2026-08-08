@@ -225,8 +225,21 @@ func groupHasEmail(g group, email string) bool {
 
 // Deprovision removes the email from the Access group.
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
+	// ErrPending, not a bare error, and for the same reason Provision uses it: an
+	// unconfigured connector did not break, it was never in a position to try.
+	// On the offboard path that difference is what the operator acts on — "go fix
+	// a breakage" against "go remove them by hand, then set the token" — and the
+	// manual step is the one that actually closes the access. It used to report
+	// as a plain failure here, so the one connector whose manual fallback is a
+	// single dashboard click was also the one that looked broken (PRSR-17).
 	if !c.configured() {
-		return fmt.Errorf("cloudflare: not configured")
+		group := c.cfg.GroupName
+		if group == "" {
+			group = "the Allow-by-email Access policy"
+		}
+		return fmt.Errorf(
+			"%w: remove %s from %s in the Cloudflare Zero Trust dashboard (Access → Policies)",
+			connector.ErrPending, strings.ToLower(strings.TrimSpace(in.Email)), group)
 	}
 	email := strings.ToLower(strings.TrimSpace(in.Email))
 	c.groupMu.Lock()

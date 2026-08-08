@@ -6,9 +6,11 @@
 //
 // It talks to Switchyard's /v1 REST API (contract: switchyard/openapi.yaml):
 //
-//	POST /v1/users              -> create user
-//	GET  /v1/users              -> list (used to reconcile a name/email conflict)
-//	POST /v1/users/{id}/tokens  -> mint an API token (sw_… returned once)
+//	POST   /v1/users                      -> create user
+//	GET    /v1/users                      -> list (used to reconcile a name/email conflict)
+//	POST   /v1/users/{id}/tokens          -> mint an API token (sw_… returned once)
+//	GET    /v1/users/{id}/tokens          -> list tokens (offboarding)
+//	DELETE /v1/users/{id}/tokens/{tokenId} -> revoke one (offboarding)
 package switchyard
 
 import (
@@ -398,9 +400,110 @@ func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connecto
 	return connector.ReconcileResult{Exists: true, ExternalID: u.ID, Username: u.Name}, nil
 }
 
-// Deprovision is not yet implemented (Phase 1 is invite-only).
+// Deprovision revokes every live API token the person holds, and leaves the
+// user row alone (PRSR-17).
+//
+// Revoke rather than delete is the deliberate reading here. A Switchyard user
+// owns authored content — tickets, comments, external refs — and deleting them
+// would orphan or cascade work Purser has no business destroying to accomplish
+// "this person should not have access". Their tokens are what grants API access,
+// so revoking those is the whole of what offboarding needs from this connector.
+//
+// The *other* way in is SSO, and this connector cannot close it: Switchyard's
+// Cloudflare Access SSO matches the CF-verified email to users.email, so the gate
+// is Cloudflare's Access group, not anything here. Offboarding both is what
+// actually cuts access — which is why `purser offboard` runs across services
+// rather than per-connector, and why an offboard that skips cloudflare leaves a
+// working login behind. Said plainly because the half-done case looks finished.
+//
+// Idempotent by construction: it revokes only tokens whose revoked_at is null, so
+// a re-run finds nothing to do and succeeds. A person with no Switchyard user at
+// all is also a success — there is no access to take away.
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
-	return errors.New("switchyard: deprovision not implemented")
+	userID, err := c.resolveUserID(ctx, in)
+	if err != nil {
+		return err
+	}
+	if userID == "" {
+		return nil // no such user upstream; nothing to revoke
+	}
+
+	tokens, err := c.liveTokens(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, t := range tokens {
+		status, raw, err := c.do(ctx, http.MethodDelete, "/v1/users/"+userID+"/tokens/"+t.ID, "", nil)
+		if err != nil {
+			return err
+		}
+		// 404 means someone else revoked it between the list and here, which is
+		// the outcome we wanted anyway.
+		if status != http.StatusNoContent && status != http.StatusOK && status != http.StatusNotFound {
+			return apiError("revoke token "+t.ID, status, raw)
+		}
+	}
+	return nil
+}
+
+// resolveUserID picks the upstream user this offboard is about, preferring the
+// id Purser recorded when it provisioned them.
+//
+// Falling back to a lookup is safe *only* because an email is required: findUser
+// matches on email first and drops to display name only when the address is
+// empty, and a display-name match on this path would revoke a same-named
+// stranger's tokens. So the empty address is refused rather than guessed at,
+// exactly as Reconcile refuses it.
+func (c *Connector) resolveUserID(ctx context.Context, in connector.Input) (string, error) {
+	if id := strings.TrimSpace(in.ExternalID); id != "" {
+		return id, nil
+	}
+	if strings.TrimSpace(in.Email) == "" {
+		return "", errors.New("switchyard: an email is required to deprovision")
+	}
+	u, found, err := c.findUser(ctx, in.PersonName, in.Email)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", nil
+	}
+	return u.ID, nil
+}
+
+// token is one API token as the list endpoint reports it. RevokedAt is the field
+// that makes a re-run cheap and correct.
+type token struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	RevokedAt *string `json:"revoked_at"`
+}
+
+// liveTokens lists the user's tokens that have not already been revoked.
+func (c *Connector) liveTokens(ctx context.Context, userID string) ([]token, error) {
+	status, raw, err := c.do(ctx, http.MethodGet, "/v1/users/"+userID+"/tokens", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNotFound {
+		return nil, nil // user vanished under us; nothing to revoke
+	}
+	if status != http.StatusOK {
+		return nil, apiError("list tokens", status, raw)
+	}
+	var list struct {
+		Items []token `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, fmt.Errorf("switchyard: decode token list: %w", err)
+	}
+	live := make([]token, 0, len(list.Items))
+	for _, t := range list.Items {
+		if t.RevokedAt == nil {
+			live = append(live, t)
+		}
+	}
+	return live, nil
 }
 
 // do performs a JSON request against the Switchyard API and returns the status

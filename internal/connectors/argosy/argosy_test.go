@@ -3,6 +3,7 @@ package argosy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -251,5 +252,25 @@ func TestProvision_ConflictFallsBackToEmailWhenNoAccountInBody(t *testing.T) {
 	}
 	if res.ExternalID != "mara@example.com" {
 		t.Errorf("should fall back to the email, got %q", res.ExternalID)
+	}
+}
+
+// Argosy cannot revoke, and must say so as ErrPending rather than as a plain
+// error or — far worse — as success. The orchestrator records it as
+// TaskUnavailable, which is what lets a three-of-four offboard report honestly
+// instead of claiming access was removed that wasn't (PRSR-17).
+func TestDeprovision_ReportsUnavailableNotSuccess(t *testing.T) {
+	c, err := New(Config{BaseURL: "http://argosy:4004", ProvisionToken: "tok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Deprovision(context.Background(), connector.Input{
+		Email: "ada@example.com", ExternalID: "a-1",
+	})
+	if err == nil {
+		t.Fatal("Deprovision must not report success — the account is still there")
+	}
+	if !errors.Is(err, connector.ErrPending) {
+		t.Errorf("err = %v, want it to wrap connector.ErrPending", err)
 	}
 }

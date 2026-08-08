@@ -12,9 +12,9 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 
 ## Layout
 
-- `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `person
-  add|list|show`, `audit`, `reconcile`, `migrate`, `version`). Composition root:
-  `setup()` wires store + connectors + orchestrator.
+- `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `offboard`,
+  `person add|list|show`, `audit`, `reconcile`, `migrate`, `version`).
+  Composition root: `setup()` wires store + connectors + orchestrator.
 - `internal/model/` — domain types (person, service, account, invite,
   provision_task), 1:1 with the schema.
 - `internal/connector/` — the `Connector` interface + `Registry` +
@@ -105,6 +105,37 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   conflict target must infer on `lower(email)`. The index and the store's
   lookups disagreed once; the gap inserted duplicate identities for the same
   human, which the audit then populated twice.
+- **`offboard` previews; `invite` acts.** The one genuinely destructive command
+  inverts every default the provisioning path takes (PRSR-17). A dry run makes
+  **no connector call at all** — not a read-only one — and `--apply` is what acts;
+  a duplicate grant is wasteful, but revoking the wrong person is not fixed by
+  re-running. There is no bulk mode: `--email` is required and always one person,
+  which is a stronger guard than the flag `reconcile --all` needs. Dry run and
+  apply share one code path, so the preview is exactly what the apply does.
+- **A revoke that didn't happen must never be recorded as one.** Only a
+  successful `Deprovision` marks the account `deprovisioned`; `failed` and
+  `unavailable` leave it **active** so the next run retries it. The lie outlives
+  the error message — the audit, `person show`, and the next invite's idempotency
+  skip all read that column and would report access as removed while it is live.
+  For the same reason `offboard` exits non-zero on `unavailable`, the opposite of
+  `invite`, where nothing was granted and waiting harms nobody.
+- **`Deprovision` means revoke, not delete — except Lyceum.** Switchyard revokes
+  tokens and keeps the user, because deleting would take their authored tickets
+  with it; Cloudflare drops the email from the Access group. Lyceum's admin
+  surface offers only `DELETE /admin/users/{id}`, so there the two collapse — say
+  so rather than letting the interface's wording imply a reversibility it hasn't
+  got. Argosy has no endpoint at all and returns `ErrPending`, so a three-of-four
+  offboard reports honestly instead of claiming what it didn't do.
+- **Revoking Switchyard does not close its door.** Its tokens gate the API; the
+  SSO login is gated by the *Cloudflare Access group*, so an offboard that skips
+  `cloudflare` leaves a working sign-in behind while looking finished. The CLI
+  says this outright when it happens. Don't remove that warning without removing
+  the asymmetry that makes it true.
+- **The `account` row is marked, never deleted.** Deprovisioning keeps the record
+  of what someone held and when it was taken away — deleting it would destroy the
+  history the audit exists to read *and* silently re-arm provisioning, since the
+  idempotency skip keys on an active account and a missing row means the opposite
+  of a deprovisioned one.
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
   plaintext lives only in the returned/emailed credential block.
 - **The roster reads records, and cannot read a secret.** `person list` /
@@ -178,15 +209,16 @@ stopped a not-yet-configured connector counting as a breakage, a required
 `--email` on `invite` (PRSR-23), which closed the emailless path that minted a
 new person — and so a new idempotency key — on every run, and the read-only
 roster commands `person list` / `person show` (PRSR-24), which answer "who has
-what" from local records so nobody has to reach for psql.
+what" from local records so nobody has to reach for psql, and `purser offboard`
+(PRSR-17), which gave Purser the revoke half it had never had — three of four
+connectors revoking, Argosy reporting `unavailable` until it has an endpoint, and
+`deprovisioned` finally a status something writes.
 
-Open, in rough priority order: **nothing calls `Deprovision`** (PRSR-17) — there
-is no CLI verb and no orchestrator path, so Cloudflare's working implementation
-is unreachable and the other three connectors return not-implemented; `stale` can
-therefore re-arm provisioning but never revoke, and `model.AccountDeprovisioned`
-is written by nothing at all. Nothing runs the audit on a schedule (PRSR-18).
-Purser still authenticates to Switchyard as the instance bootstrap token rather
-than a dedicated one (PRSR-25 — PRSR-3 shipped the bootstrap fallback and is
-closed; the hardening is what's left). Service spin-up is a separate axis, not
-started: epic PRSR-22, gated on its prereq PRSR-11 (a tunnel config-management
-decision plus CF token scopes — neither is code).
+Open, in rough priority order: nothing runs the audit on a schedule (PRSR-18).
+Argosy has no delete or disable endpoint, so it is the one service `offboard`
+cannot close (ARGY ticket pending). Purser still authenticates to Switchyard as
+the instance bootstrap token rather than a dedicated one (PRSR-25 — PRSR-3
+shipped the bootstrap fallback and is closed; the hardening is what's left).
+Service spin-up is a separate axis, not started: epic PRSR-22, gated on its
+prereq PRSR-11 (a tunnel config-management decision plus CF token scopes —
+neither is code).

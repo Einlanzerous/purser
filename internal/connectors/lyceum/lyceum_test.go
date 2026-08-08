@@ -153,3 +153,77 @@ func TestReconcile_ForbiddenIsLoud(t *testing.T) {
 		t.Fatalf("403 should surface the LYCEUM_AUTH hint, got %v", err)
 	}
 }
+
+// Lyceum is the one connector where Deprovision deletes: DELETE /admin/users/{id}
+// is the only destructive operation the admin surface offers, and there is no
+// disable. Documented rather than disguised (PRSR-17).
+func TestDeprovision_DeletesTheUser(t *testing.T) {
+	var deleted []string
+	var listCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/admin/users/"):
+			deleted = append(deleted, strings.TrimPrefix(r.URL.Path, "/admin/users/"))
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/users":
+			listCalls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"id":7,"email":"ada@example.com","display_name":"Ada"}]`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// With the recorded id, no lookup is needed.
+	if err := c.Deprovision(context.Background(), connector.Input{
+		Email: "ada@example.com", ExternalID: "7",
+	}); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != "7" {
+		t.Errorf("deleted = %v, want [7]", deleted)
+	}
+	if listCalls != 0 {
+		t.Errorf("a recorded id should skip the lookup, got %d list calls", listCalls)
+	}
+
+	// Without one it falls back to the email lookup.
+	if err := c.Deprovision(context.Background(), connector.Input{Email: "ada@example.com"}); err != nil {
+		t.Fatalf("Deprovision via lookup: %v", err)
+	}
+	if listCalls != 1 || len(deleted) != 2 {
+		t.Errorf("want one lookup and a second delete, got listCalls=%d deleted=%v", listCalls, deleted)
+	}
+}
+
+// Idempotent both ways: a person Lyceum has never heard of, and a 404 from the
+// delete itself, are both the state the caller asked for.
+func TestDeprovision_MissingUserIsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/users":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	if err := c.Deprovision(context.Background(), connector.Input{Email: "ghost@example.com"}); err != nil {
+		t.Errorf("an unknown person should be success, got %v", err)
+	}
+	if err := c.Deprovision(context.Background(), connector.Input{
+		Email: "ghost@example.com", ExternalID: "99",
+	}); err != nil {
+		t.Errorf("a 404 from delete should be success, got %v", err)
+	}
+}
