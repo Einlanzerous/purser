@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/Einlanzerous/purser/compare/v0.12.0...v0.13.0) (2026-08-08)
+
+
+### Features
+
+* **offboard:** give Purser the revoke half it never had (PRSR-17) ([#29](https://github.com/Einlanzerous/purser/issues/29)) ([b1d5b22](https://github.com/Einlanzerous/purser/commit/b1d5b22e90397e3ba09336e3728ffabe03129da6))
+
 ## [0.12.0](https://github.com/Einlanzerous/purser/compare/v0.11.0...v0.12.0) (2026-08-08)
 
 
