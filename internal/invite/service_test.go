@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -747,6 +748,7 @@ type fakeStore struct {
 	services map[string]model.Service       // by key
 	accounts map[string]model.Account       // by person:service
 	tasks    map[string]model.ProvisionTask // by invite:service
+	invites  []model.Invite                 // in creation order; the roster reads them back
 }
 
 // InsertPersonIfAbsent mirrors the real store: the email is unique
@@ -799,10 +801,31 @@ func (s *fakeStore) ServiceByKey(_ context.Context, key string) (model.Service, 
 }
 
 func (s *fakeStore) CreateInvite(_ context.Context, personID uuid.UUID, d model.DeliveryMethod, role string) (model.Invite, error) {
-	return model.Invite{ID: uuid.New(), PersonID: personID, Delivery: d, Role: role}, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Timestamps step by a second per invite rather than reading the clock, so
+	// "newest first" is decided by creation order instead of by whether two
+	// invites in the same test landed in the same nanosecond.
+	inv := model.Invite{
+		ID: uuid.New(), PersonID: personID, Delivery: d, Role: role,
+		CreatedAt: time.Unix(0, 0).Add(time.Duration(len(s.invites)) * time.Second),
+	}
+	s.invites = append(s.invites, inv)
+	return inv, nil
 }
 
-func (s *fakeStore) MarkInviteDelivered(context.Context, uuid.UUID) error { return nil }
+func (s *fakeStore) MarkInviteDelivered(_ context.Context, inviteID uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, inv := range s.invites {
+		if inv.ID == inviteID {
+			at := inv.CreatedAt
+			s.invites[i].DeliveredAt = &at
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
 
 func (s *fakeStore) AccountFor(_ context.Context, personID, serviceID uuid.UUID) (model.Account, error) {
 	s.mu.Lock()
@@ -873,6 +896,79 @@ func (s *fakeStore) UpdateAccountStatus(_ context.Context, accountID uuid.UUID, 
 		}
 	}
 	return store.ErrNotFound
+}
+
+// --- RosterStore (PRSR-24) ---
+
+func (s *fakeStore) ListServices(context.Context) ([]model.Service, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Service, 0, len(s.services))
+	for _, svc := range s.services {
+		out = append(out, svc)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+// AccountRecords mirrors the real store's join: an account plus the key and
+// display name of its service, and — the point of the type — no secret columns.
+func (s *fakeStore) AccountRecords(context.Context) ([]store.AccountRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accountRecordsLocked(uuid.Nil), nil
+}
+
+func (s *fakeStore) AccountRecordsFor(_ context.Context, personID uuid.UUID) ([]store.AccountRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accountRecordsLocked(personID), nil
+}
+
+func (s *fakeStore) accountRecordsLocked(personID uuid.UUID) []store.AccountRecord {
+	byID := map[uuid.UUID]model.Service{}
+	for _, svc := range s.services {
+		byID[svc.ID] = svc
+	}
+	var out []store.AccountRecord
+	for _, a := range s.accounts {
+		if personID != uuid.Nil && a.PersonID != personID {
+			continue
+		}
+		svc := byID[a.ServiceID]
+		out = append(out, store.AccountRecord{
+			PersonID:    a.PersonID,
+			ServiceKey:  svc.Key,
+			DisplayName: svc.DisplayName,
+			ExternalID:  a.ExternalID,
+			Username:    a.Username,
+			Status:      a.Status,
+			CreatedAt:   a.CreatedAt,
+			UpdatedAt:   a.UpdatedAt,
+		})
+	}
+	// The real query orders by person then service key; roster output is
+	// asserted on, so map iteration must not decide it.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].PersonID != out[j].PersonID {
+			return out[i].PersonID.String() < out[j].PersonID.String()
+		}
+		return out[i].ServiceKey < out[j].ServiceKey
+	})
+	return out
+}
+
+func (s *fakeStore) InvitesFor(_ context.Context, personID uuid.UUID) ([]model.Invite, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []model.Invite
+	for _, inv := range s.invites {
+		if inv.PersonID == personID {
+			out = append(out, inv)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
 }
 
 func (s *fakeStore) UpdateTask(_ context.Context, t model.ProvisionTask) error {

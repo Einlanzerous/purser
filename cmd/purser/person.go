@@ -13,10 +13,22 @@ import (
 	"github.com/Einlanzerous/purser/internal/model"
 )
 
-const personUsage = "usage: purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]"
+// Per-subcommand usage lines, so each flag set prints its own rather than the
+// whole noun's.
+const (
+	personAddUsage  = "usage: purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]"
+	personListUsage = "usage: purser person list [--to svc1,svc2] [--type human|agent] [--all] [--json]"
+	personShowUsage = "usage: purser person show --email EMAIL [--json]"
+)
 
-// runPerson dispatches `purser person <subcommand>`. Only `add` exists today;
-// the noun is there so a future `list`/`show` has an obvious home.
+const personUsage = `usage: purser person <add|list|show>
+  add   --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]
+  list  [--to svc1,svc2] [--type human|agent] [--all] [--json]
+  show  --email EMAIL [--json]`
+
+// runPerson dispatches `purser person <subcommand>`: the roster noun. `add`
+// records someone and provisions nothing; `list` and `show` read the records
+// back and write nothing at all (PRSR-24).
 func runPerson(args []string) {
 	sub := ""
 	if len(args) > 0 && !isFlag(args[0]) {
@@ -25,6 +37,10 @@ func runPerson(args []string) {
 	switch sub {
 	case "add":
 		runPersonAdd(args)
+	case "list":
+		runPersonList(args)
+	case "show":
+		runPersonShow(args)
 	default:
 		if sub != "" {
 			fmt.Fprintf(os.Stderr, "purser: unknown person subcommand %q\n", sub)
@@ -53,7 +69,7 @@ func runPersonAdd(args []string) {
 		audit  = fs.Bool("audit", false, "after adding, run a read-only audit of what they already hold")
 	)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, personUsage)
+		fmt.Fprintln(os.Stderr, personAddUsage)
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Records that someone exists so the audit can see them. Writes no account")
 		fmt.Fprintln(os.Stderr, "rows, calls no connectors, mints no credentials — that is `purser invite`.")
@@ -68,8 +84,8 @@ func runPersonAdd(args []string) {
 		fs.Usage()
 		os.Exit(2)
 	}
-	if t := model.PersonType(*typ); t != "" && t != model.PersonHuman && t != model.PersonAgent {
-		fmt.Fprintf(os.Stderr, "purser: --type: want %s or %s, got %q\n", model.PersonHuman, model.PersonAgent, *typ)
+	if _, err := invite.ParsePersonType(*typ); err != nil {
+		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
 		os.Exit(2)
 	}
 	if _, err := invite.NormalizeEmail(*email); err != nil {
@@ -169,6 +185,19 @@ func printNextSteps(p model.Person, preview *invite.AuditResult) {
 			p.Email, n, plural(n))
 	}
 	fmt.Fprintf(w, "  purser invite --name %q --email %s\t# provision what they lack\n", p.Name, p.Email)
+}
+
+// printAddPersonHint names the command that fixes an address nobody holds.
+//
+// Shared by `person show` and `audit`, which reach the same dead end from
+// opposite directions: one was asked about someone off the roster, the other
+// was asked to audit them. Both answers are the same row, and `person add` is
+// the only command that writes it without provisioning anything.
+func printAddPersonHint(err error, email string) {
+	if !errors.Is(err, invite.ErrPersonNotFound) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "purser: to record them: purser person add --name NAME --email %s\n", email)
 }
 
 func plural(n int) string {

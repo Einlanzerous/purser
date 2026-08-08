@@ -131,7 +131,10 @@ func (s *Service) auditScope(ctx context.Context, astore AuditStore, req AuditRe
 	if email := strings.TrimSpace(req.Email); email != "" {
 		p, err := s.store.PersonByEmail(ctx, email)
 		if errors.Is(err, store.ErrNotFound) {
-			return nil, fmt.Errorf("invite: no person with email %q", email)
+			// Same sentinel `person show` returns, and the same text it always
+			// had: one meaning of "that address is not on the roster", so a
+			// caller can offer `person add` without matching on a message.
+			return nil, fmt.Errorf("%w %q", ErrPersonNotFound, email)
 		}
 		if err != nil {
 			return nil, err
@@ -157,7 +160,7 @@ func (s *Service) auditConnectors(req AuditRequest) ([]connector.Connector, erro
 	for _, k := range req.Services {
 		c, ok := s.registry.Get(k)
 		if !ok {
-			return nil, fmt.Errorf("invite: unknown service %q (known: %s)", k, strings.Join(s.registry.Keys(), ", "))
+			return nil, unknownServiceError(k, s.registry.Keys())
 		}
 		conns = append(conns, c)
 	}
