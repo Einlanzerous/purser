@@ -180,8 +180,13 @@ new person — and so a new idempotency key — on every run, and the read-only
 roster commands `person list` / `person show` (PRSR-24), which answer "who has
 what" from local records so nobody has to reach for psql.
 
-Open, in rough priority order: `Deprovision` is unimplemented on every connector
-but Cloudflare (PRSR-17) — so `stale` can re-arm provisioning but cannot revoke;
-nothing runs the audit on a schedule (PRSR-18); Purser still authenticates to
-Switchyard as the instance bootstrap token rather than a dedicated one (PRSR-3);
-and service spin-up is a separate axis, not started (PRSR-11).
+Open, in rough priority order: **nothing calls `Deprovision`** (PRSR-17) — there
+is no CLI verb and no orchestrator path, so Cloudflare's working implementation
+is unreachable and the other three connectors return not-implemented; `stale` can
+therefore re-arm provisioning but never revoke, and `model.AccountDeprovisioned`
+is written by nothing at all. Nothing runs the audit on a schedule (PRSR-18).
+Purser still authenticates to Switchyard as the instance bootstrap token rather
+than a dedicated one (PRSR-25 — PRSR-3 shipped the bootstrap fallback and is
+closed; the hardening is what's left). Service spin-up is a separate axis, not
+started: epic PRSR-22, gated on its prereq PRSR-11 (a tunnel config-management
+decision plus CF token scopes — neither is code).
