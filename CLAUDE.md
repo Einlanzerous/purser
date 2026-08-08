@@ -12,9 +12,9 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 
 ## Layout
 
-- `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `person add`,
-  `audit`, `reconcile`, `migrate`, `version`). Composition root: `setup()` wires
-  store + connectors + orchestrator.
+- `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `person
+  add|list|show`, `audit`, `reconcile`, `migrate`, `version`). Composition root:
+  `setup()` wires store + connectors + orchestrator.
 - `internal/model/` — domain types (person, service, account, invite,
   provision_task), 1:1 with the schema.
 - `internal/connector/` — the `Connector` interface + `Registry` +
@@ -107,6 +107,20 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   human, which the audit then populated twice.
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
   plaintext lives only in the returned/emailed credential block.
+- **The roster reads records, and cannot read a secret.** `person list` /
+  `person show` (PRSR-24) touch `person`, `account` and `service` only — neither
+  `Roster` nor `PersonDetail` references `s.registry`, because "who is on the
+  roster" must not depend on every upstream being reachable, and that is the
+  whole difference from `audit`. Don't give them a connector call. They read
+  `store.AccountRecord`, which has no `secret_hash`/`secret_ref` field and comes
+  from a query selecting neither column: credentials are shown once, at invite
+  time, and `--json` serializes whatever the struct holds, so the guarantee is
+  that the field doesn't exist rather than that no renderer prints it. Don't add
+  one "just for the hash". `list` hides non-active accounts by default but
+  reports `Hidden` so the omission is never silent — `--to lyceum` finding
+  nobody has to mean "nobody has Lyceum", not "nobody has it any more" — and its
+  service filter selects on the same accounts it displays. `show` filters
+  nothing; a stale row is the point of the single-person view.
 - **The credential block is the recipient's; the operator note is the
   operator's.** `Result.CredentialBlock` is the only thing `--deliver email` may
   ever send, and `RenderCredentialBlock` must stay free of operator-facing
@@ -159,9 +173,11 @@ real drift with zero upstream mutation, `person add` (PRSR-16), the roster entry
 point that provisions nothing, the recipient/operator split in the invite result
 (PRSR-19), the end of `invite`'s silent rename (PRSR-20), which also made a
 name mismatch fatal on the email path, `TaskUnavailable` (PRSR-21), which
-stopped a not-yet-configured connector counting as a breakage, and a required
+stopped a not-yet-configured connector counting as a breakage, a required
 `--email` on `invite` (PRSR-23), which closed the emailless path that minted a
-new person — and so a new idempotency key — on every run.
+new person — and so a new idempotency key — on every run, and the read-only
+roster commands `person list` / `person show` (PRSR-24), which answer "who has
+what" from local records so nobody has to reach for psql.
 
 Open, in rough priority order: `Deprovision` is unimplemented on every connector
 but Cloudflare (PRSR-17) — so `stale` can re-arm provisioning but cannot revoke;

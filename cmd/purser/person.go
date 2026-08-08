@@ -13,10 +13,22 @@ import (
 	"github.com/Einlanzerous/purser/internal/model"
 )
 
-const personUsage = "usage: purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]"
+// Per-subcommand usage lines, so each flag set prints its own rather than the
+// whole noun's.
+const (
+	personAddUsage  = "usage: purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]"
+	personListUsage = "usage: purser person list [--to svc1,svc2] [--type human|agent] [--all] [--json]"
+	personShowUsage = "usage: purser person show --email EMAIL [--json]"
+)
 
-// runPerson dispatches `purser person <subcommand>`. Only `add` exists today;
-// the noun is there so a future `list`/`show` has an obvious home.
+const personUsage = `usage: purser person <add|list|show>
+  add   --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]
+  list  [--to svc1,svc2] [--type human|agent] [--all] [--json]
+  show  --email EMAIL [--json]`
+
+// runPerson dispatches `purser person <subcommand>`: the roster noun. `add`
+// records someone and provisions nothing; `list` and `show` read the records
+// back and write nothing at all (PRSR-24).
 func runPerson(args []string) {
 	sub := ""
 	if len(args) > 0 && !isFlag(args[0]) {
@@ -25,6 +37,10 @@ func runPerson(args []string) {
 	switch sub {
 	case "add":
 		runPersonAdd(args)
+	case "list":
+		runPersonList(args)
+	case "show":
+		runPersonShow(args)
 	default:
 		if sub != "" {
 			fmt.Fprintf(os.Stderr, "purser: unknown person subcommand %q\n", sub)
@@ -53,7 +69,7 @@ func runPersonAdd(args []string) {
 		audit  = fs.Bool("audit", false, "after adding, run a read-only audit of what they already hold")
 	)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, personUsage)
+		fmt.Fprintln(os.Stderr, personAddUsage)
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Records that someone exists so the audit can see them. Writes no account")
 		fmt.Fprintln(os.Stderr, "rows, calls no connectors, mints no credentials — that is `purser invite`.")

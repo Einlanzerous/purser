@@ -9,6 +9,8 @@
 //	purser serve                # ditto
 //	purser invite --name … --email … --to switchyard,cloudflare
 //	purser person add --name … --email …  # record someone; provisions nothing
+//	purser person list          # the roster: who has what, from local records
+//	purser person show --email … # one person in full, from local records
 //	purser audit                # report record-vs-upstream drift (read-only)
 //	purser reconcile --email …  # repair the records; never mints a credential
 //	purser migrate              # apply DB migrations and exit

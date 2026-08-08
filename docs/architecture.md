@@ -329,6 +329,53 @@ Deploying 0003 requires that no such pair already exists, since the index cannot
 be built over one. It fails loudly and transactionally if so — the migration
 carries the query that finds them.
 
+### Reading the roster back (PRSR-24)
+
+`person add` writes people in; `person list` and `person show` read them out.
+Until they existed the only way to ask what Purser held was psql — which needs
+schema knowledge, bypasses every invariant the CLI enforces, and sits one typo
+away from an `UPDATE` against live provisioning records. Provisioning one person
+by matching what two others already had took four hand-written joins across
+`person`, `account`, `service` and `invite`, for a question Purser is the system
+of record for.
+
+**`audit` is not this.** It answers a different question — records *versus
+upstream* — so it needs a connector call per (person × service) and is only as
+available as the connectors are. Asking who is on the roster shouldn't require
+every upstream service to be reachable, or cost a reconcile sweep. So the roster
+reads `person`, `account` and `service` and stops: neither `Roster` nor
+`PersonDetail` so much as references the connector registry, and a test asserts
+both `Provision` and `Reconcile` stay at zero calls.
+
+**No secret reaches either command, structurally.** They read
+`store.AccountRecord` — an account joined to its service, with no `secret_hash`
+and no `secret_ref` field, from a query that selects neither column. Credentials
+are shown exactly once, at invite time; a roster view that re-surfaced even the
+hash would weaken that, and `--json` serializes whatever the struct holds. Making
+it unrepresentable is what keeps the property answerable by reading one type,
+rather than by auditing every renderer and DTO that will ever wrap it.
+
+**The default filter is never silent.** `list` shows active accounts, because a
+stale row is exactly what someone does *not* have and listing it under "services"
+would misreport access. But an omission that can't be seen produces the same
+class of wrong answer: `--to lyceum` returning nobody must mean "nobody has
+Lyceum", not "nobody has Lyceum any more". So the hidden count comes back with
+the result and the CLI prints it. The service filter also selects on the same
+accounts the output shows — filtering on one set and displaying another would
+return people with an empty services column and no way to tell why.
+
+`show` withholds nothing by contrast: it is the single-person view, where a
+deprovisioned or stale row is the interesting part, and each carries its status
+so none of them reads as access still held.
+
+A person with **no** accounts is still on the roster. That row is what `person
+add` writes, so an account-driven listing would be blind to exactly the people
+that command exists to record.
+
+Switchyard-side detail — instance role, project memberships — also had to come
+from the Switchyard database by hand, and is *not* here. Surfacing it belongs to
+the switchyard connector's `Reconcile`, not to a local roster command.
+
 ## Delivery
 
 The credential block is plain text (pastes cleanly into any chat platform).
@@ -387,6 +434,9 @@ Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
 - **Identity guarantees on `invite`** — it no longer renames silently (PRSR-20),
   and no longer accepts a person with no email (PRSR-23). Those were the two
   ways an ordinary re-invite could stop meaning what it says.
+- **`purser person list` / `person show`** (PRSR-24) — the roster read back out
+  of local records, so asking what someone already holds no longer means psql
+  against live provisioning tables.
 
 **Open:**
 

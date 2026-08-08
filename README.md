@@ -218,11 +218,74 @@ purser                       # run the HTTP server (default)
 purser serve                 # ditto
 purser invite --name NAME --email EMAIL [--to svc1,svc2] [--bundle NAME] [--role member|admin] [--deliver copypaste|email]
 purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]
+purser person list [--to svc1,svc2] [--type human|agent] [--all] [--json]   # the roster
+purser person show --email EMAIL [--json]                  # one person in full
 purser audit [--email EMAIL] [--to svc1,svc2]              # report drift, read-only
 purser reconcile --email EMAIL | --all [--to svc1,svc2]    # repair records
 purser migrate               # apply DB migrations and exit
 purser version
 ```
+
+### Reading the roster
+
+"Who is on the roster, and what does each person have?" is a question Purser is
+the system of record for, so it answers it — no psql, no schema knowledge, and
+no `SELECT` that is one typo away from an `UPDATE` against live provisioning
+records:
+
+```
+$ purser person list
+NAME            EMAIL                TYPE   SERVICES                SINCE
+Ada Lovelace    ada@example.com      human  cloudflare, switchyard  2026-03-11
+Bradley Kim     bradley@example.com  human  switchyard              2026-04-02
+Nightly Runner  bot@example.com      agent  argosy                  2026-05-19
+
+3 people
+1 non-active account hidden (deprovisioned or stale) — pass --all to include it
+```
+
+`--to svc1,svc2` narrows to people holding those services, `--type human|agent`
+to one kind of identity, and `--json` emits the structured form — the shape an
+agent reaches for before an invite, which is the case that drove this.
+
+`person show` is one person in full: every account with its status, and the
+invite history.
+
+```
+$ purser person show --email ada@example.com
+Ada Lovelace <ada@example.com>
+human · id a8ebb070-… · recorded 2026-03-11 · updated 2026-04-02
+
+ACCOUNTS
+SERVICE     STATUS  USERNAME  EXTERNAL ID      RECORDED    UPDATED
+cloudflare  active  —         ada@example.com  2026-03-11  2026-03-11
+lyceum      stale   ada       u-4              2026-03-11  2026-06-02
+switchyard  active  ada       u-17             2026-03-11  2026-03-11
+
+INVITES
+WHEN        DELIVERY   ROLE    DELIVERED
+2026-06-02  copypaste  member  —
+2026-03-11  email      member  2026-03-11
+```
+
+Three things about these commands are deliberate:
+
+**They read local records only** — `person`, `account`, `service` — and call no
+connector. Asking who is on the roster shouldn't require every upstream service
+to be reachable, or cost a full reconcile sweep. `audit` is the command that
+compares records against upstream; this is the one that reads the records.
+
+**No secret, not even a hash.** Credentials are shown once, at invite time. The
+roster's account type has no `secret_hash` or `secret_ref` field and the query
+selects neither column, so there is nothing for a renderer or a `--json` encoder
+to leak — the guarantee is the type, not a rule about what to print.
+
+**`list` shows active accounts by default, and says when it didn't.** A stale
+row is precisely what someone *doesn't* have, so it would misreport the services
+column. But hiding it silently is worse: `--to lyceum` returning nobody has to
+mean "nobody has Lyceum", not "nobody has Lyceum any more", so the hidden count
+is always reported. `show`, being the single-person view, withholds nothing —
+there a stale row is the interesting part, and it carries its status.
 
 ### Auditing and reconciling
 
