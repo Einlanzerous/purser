@@ -41,7 +41,7 @@ Each service hides its own user model behind a `Connector`:
 ```go
 Provision(ctx, Input) (Result, error)             // create/ensure the account, return a one-time secret
 Reconcile(ctx, Input) (ReconcileResult, error)    // READ-ONLY: does this person already have access?
-Deprovision(ctx, Input) error                     // remove access (unimplemented — PRSR-17)
+Deprovision(ctx, Input) error                     // remove access (no caller — PRSR-17)
 ```
 
 **`Reconcile` must never mutate.** No create, no mint, no rotate, no revoke — it
@@ -441,19 +441,22 @@ Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
 
 **Open:**
 
-- **PRSR-17 — Deprovision.** Declared on the interface, unimplemented on every
-  connector except Cloudflare. Purser can onboard across the stack in one command
-  and cannot remove anyone. This is why `stale` currently means "re-arm
-  provisioning" and cannot mean "revoke".
+- **PRSR-17 — Deprovision.** Nothing calls it. Cloudflare's implementation works
+  and is unreachable; the other three connectors return not-implemented; there is
+  no CLI verb and no orchestrator path. Purser can onboard across the stack in one
+  command and cannot remove anyone. This is why `stale` means "re-arm
+  provisioning" and cannot mean "revoke" — and why `model.AccountDeprovisioned`
+  is a state the schema permits, the roster commands render, and nothing writes.
 - **PRSR-18 — run the audit on a schedule.** It exists and nothing triggers it,
   so drift will reaccumulate and be found the same way it was last time: by
   accident.
-- **PRSR-3 — a dedicated Switchyard provisioning token.** Purser currently
-  authenticates as the instance bootstrap token: functional, but not attributable
-  and not independently revocable.
-- **PRSR-11 — service spin-up** (below).
+- **PRSR-25 — a dedicated Switchyard provisioning token.** Purser authenticates
+  as the instance bootstrap token: functional, but not attributable and not
+  independently revocable. PRSR-3 shipped that fallback and is closed; this is the
+  hardening half, and it needs an operator with a `users:manage`-capable token.
+- **PRSR-22 — service spin-up** (below), gated on its prereq **PRSR-11**.
 
-## Future direction: service spin-up (PRSR-11)
+## Future direction: service spin-up (epic PRSR-22)
 
 Everything above provisions **people into existing services** (the person ×
 service axis). A separate, larger direction is standing up the Cloudflare edge
@@ -479,4 +482,6 @@ reusing the existing CF API client, registry, store, and idempotency ethos.
   Argosy sidesteps it entirely — it's on the *direct / non-tunnelled* path, so
   its spin-up is DNS-to-static-IP + Access app only, and is the natural pilot.
 
-See PRSR-11 for the full assessment and the proposed epic breakdown.
+Epic PRSR-22 carries the full assessment and breakdown; PRSR-11 is its only
+currently-actionable part — the tunnel decision above plus the token scopes, both
+decisions and access changes rather than code.
