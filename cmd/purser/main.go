@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -72,6 +73,22 @@ func main() {
 }
 
 func isFlag(s string) bool { return len(s) > 0 && s[0] == '-' }
+
+// requireNoOperands refuses leftover positional arguments.
+//
+// Go's flag package stops parsing at the first operand and leaves the rest in
+// Args(), so `purser person list switchyard --to lyceum` silently discards
+// --to and answers a different question than the one asked — with exit 0, which
+// is the worst way for a roster command to be wrong. Nothing here takes a
+// positional argument, so any leftover is a mistake worth naming.
+func requireNoOperands(fs *flag.FlagSet, usage string) {
+	if fs.NArg() == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "purser: unexpected argument %q — every option is a flag\n", fs.Arg(0))
+	fmt.Fprintln(os.Stderr, usage)
+	os.Exit(2)
+}
 
 // app bundles the wired-up dependencies shared by the subcommands.
 type app struct {

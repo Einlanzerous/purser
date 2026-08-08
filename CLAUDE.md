@@ -108,10 +108,11 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
   plaintext lives only in the returned/emailed credential block.
 - **The roster reads records, and cannot read a secret.** `person list` /
-  `person show` (PRSR-24) touch `person`, `account` and `service` only — neither
-  `Roster` nor `PersonDetail` references `s.registry`, because "who is on the
-  roster" must not depend on every upstream being reachable, and that is the
-  whole difference from `audit`. Don't give them a connector call. They read
+  `person show` (PRSR-24) read local tables only — `person`, `account` and
+  `service`, plus `invite` for `show`'s history — and neither `Roster` nor
+  `PersonDetail` references `s.registry`, because "who is on the roster" must
+  not depend on every upstream being reachable, and that is the whole difference
+  from `audit`. Don't give them a connector call. They read
   `store.AccountRecord`, which has no `secret_hash`/`secret_ref` field and comes
   from a query selecting neither column: credentials are shown once, at invite
   time, and `--json` serializes whatever the struct holds, so the guarantee is

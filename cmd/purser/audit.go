@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -68,6 +69,13 @@ func runAudit(args []string, apply bool) {
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
+		// An address nobody holds is a roster gap with a command that fixes it,
+		// and a mistyped service is a flag to retype — neither is an outage, so
+		// they read the same here as they do from `person show` / `person list`.
+		printAddPersonHint(err, strings.ToLower(strings.TrimSpace(*email)))
+		if errors.Is(err, invite.ErrUnknownService) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 	printAudit(res)

@@ -84,8 +84,8 @@ func runPersonAdd(args []string) {
 		fs.Usage()
 		os.Exit(2)
 	}
-	if t := model.PersonType(*typ); t != "" && t != model.PersonHuman && t != model.PersonAgent {
-		fmt.Fprintf(os.Stderr, "purser: --type: want %s or %s, got %q\n", model.PersonHuman, model.PersonAgent, *typ)
+	if _, err := invite.ParsePersonType(*typ); err != nil {
+		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
 		os.Exit(2)
 	}
 	if _, err := invite.NormalizeEmail(*email); err != nil {
@@ -185,6 +185,19 @@ func printNextSteps(p model.Person, preview *invite.AuditResult) {
 			p.Email, n, plural(n))
 	}
 	fmt.Fprintf(w, "  purser invite --name %q --email %s\t# provision what they lack\n", p.Name, p.Email)
+}
+
+// printAddPersonHint names the command that fixes an address nobody holds.
+//
+// Shared by `person show` and `audit`, which reach the same dead end from
+// opposite directions: one was asked about someone off the roster, the other
+// was asked to audit them. Both answers are the same row, and `person add` is
+// the only command that writes it without provisioning anything.
+func printAddPersonHint(err error, email string) {
+	if !errors.Is(err, invite.ErrPersonNotFound) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "purser: to record them: purser person add --name NAME --email %s\n", email)
 }
 
 func plural(n int) string {

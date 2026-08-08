@@ -68,12 +68,12 @@ func (s *Service) AddPerson(ctx context.Context, req AddPersonRequest) (*AddPers
 	if err != nil {
 		return nil, err
 	}
-	if req.Type != "" && req.Type != model.PersonHuman && req.Type != model.PersonAgent {
-		return nil, fmt.Errorf("invite: unknown person type %q (want %s or %s)",
-			req.Type, model.PersonHuman, model.PersonAgent)
+	reqType, err := ParsePersonType(string(req.Type))
+	if err != nil {
+		return nil, err
 	}
 
-	newType := req.Type
+	newType := reqType
 	if newType == "" {
 		newType = model.PersonHuman
 	}
@@ -87,9 +87,9 @@ func (s *Service) AddPerson(ctx context.Context, req AddPersonRequest) (*AddPers
 
 	// The address is taken. Everything below is a decision about a person who
 	// already exists, and the default for all of them is to refuse and say so.
-	if req.Type != "" && req.Type != existing.Type {
+	if reqType != "" && reqType != existing.Type {
 		return nil, fmt.Errorf("%w: %s is recorded as %s, not %s",
-			ErrTypeConflict, email, existing.Type, req.Type)
+			ErrTypeConflict, email, existing.Type, reqType)
 	}
 	if sameName(existing.Name, name) {
 		return &AddPersonResult{Person: existing}, nil // nothing to write
@@ -111,6 +111,27 @@ func (s *Service) AddPerson(ctx context.Context, req AddPersonRequest) (*AddPers
 		Renamed:      previous != name,
 		PreviousName: previous,
 	}, nil
+}
+
+// ParsePersonType validates an identity kind and returns it trimmed.
+//
+// Empty is allowed and means "unspecified": a new person defaults to human and
+// an existing one keeps whatever it is, rather than being silently converted.
+// Deciding that here rather than at each call site is what stops the two
+// meanings from drifting apart.
+//
+// Exported for the same reason as NormalizeEmail: the CLI rejects a bad --type
+// before opening a database connection, and does it without keeping a second
+// copy of the rule. It had four copies in two message formats before PRSR-24
+// added the fourth.
+func ParsePersonType(raw string) (model.PersonType, error) {
+	t := model.PersonType(strings.TrimSpace(raw))
+	switch t {
+	case "", model.PersonHuman, model.PersonAgent:
+		return t, nil
+	}
+	return "", fmt.Errorf("invite: unknown person type %q (want %s or %s)",
+		strings.TrimSpace(raw), model.PersonHuman, model.PersonAgent)
 }
 
 // NormalizeEmail lowercases, trims, and checks the address is well-formed.

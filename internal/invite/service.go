@@ -118,6 +118,19 @@ type ServiceOutcome struct {
 	Extra        map[string]string
 }
 
+// ErrUnknownService reports a service key nothing knows about. It is a typo in
+// a flag, not an outage, so callers match on it to exit like the other usage
+// errors rather than like a failure.
+var ErrUnknownService = errors.New("invite: unknown service")
+
+// unknownServiceError formats that refusal with the keys that would have
+// worked. known is passed in rather than read here because the right authority
+// differs by caller — the connector registry for anything that will *provision*,
+// the service table for a view of records — and that distinction is deliberate.
+func unknownServiceError(key string, known []string) error {
+	return fmt.Errorf("%w %q (known: %s)", ErrUnknownService, key, strings.Join(known, ", "))
+}
+
 // ErrNameConflictOnEmail reports that an invite asked for email delivery while
 // its --name disagreed with the stored record, and was refused.
 //
@@ -244,7 +257,7 @@ func (s *Service) validate(req Request) (checked, error) {
 				return checked{}, fmt.Errorf("invite: bundle %q names unknown service %q (known services: %s)",
 					req.Bundle, key, strings.Join(s.registry.Keys(), ", "))
 			}
-			return checked{}, fmt.Errorf("invite: unknown service %q (known: %s)", key, strings.Join(s.registry.Keys(), ", "))
+			return checked{}, unknownServiceError(key, s.registry.Keys())
 		}
 	}
 	return checked{req: resolved, bundle: applied, email: email}, nil

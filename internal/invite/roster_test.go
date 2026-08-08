@@ -190,8 +190,18 @@ func TestRoster_UnknownServiceIsRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unknown service should be an error, not an empty roster")
 	}
+	if !errors.Is(err, ErrUnknownService) {
+		t.Errorf("err = %v, want ErrUnknownService — the CLI exits 2 on it", err)
+	}
 	if !strings.Contains(err.Error(), "switchyard") {
 		t.Errorf("the error should name the known services, got: %v", err)
+	}
+
+	// A blank key is refused the same way rather than quietly dropped: skipping
+	// it would turn a filtered request into the whole roster, which is the
+	// wrong-answer case this refusal exists for.
+	if _, err := svc.Roster(context.Background(), RosterRequest{Services: []string{"  "}}); !errors.Is(err, ErrUnknownService) {
+		t.Errorf("a blank service key should be refused, got %v", err)
 	}
 }
 

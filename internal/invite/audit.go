@@ -160,7 +160,7 @@ func (s *Service) auditConnectors(req AuditRequest) ([]connector.Connector, erro
 	for _, k := range req.Services {
 		c, ok := s.registry.Get(k)
 		if !ok {
-			return nil, fmt.Errorf("invite: unknown service %q (known: %s)", k, strings.Join(s.registry.Keys(), ", "))
+			return nil, unknownServiceError(k, s.registry.Keys())
 		}
 		conns = append(conns, c)
 	}

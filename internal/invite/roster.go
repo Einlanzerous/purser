@@ -64,13 +64,16 @@ type RosterEntry struct {
 // RosterResult is the whole roster in scope.
 type RosterResult struct {
 	Entries []RosterEntry
-	// Hidden counts accounts left out for not being active. Reported so the
-	// default filter can never be silent: a person whose only Lyceum account is
-	// stale is absent from `person list --to lyceum` entirely, and without this
-	// the empty result reads as "nobody has Lyceum" rather than "nobody has
-	// Lyceum *any more*".
-	Hidden           int
-	IncludedInactive bool
+	// Hidden counts accounts left out for not being active, and is always zero
+	// when the request asked for them. Reported so the default filter can never
+	// be silent: a person whose only Lyceum account is stale is absent from
+	// `person list --to lyceum` entirely, and without this the empty result
+	// reads as "nobody has Lyceum" rather than "nobody has Lyceum *any more*".
+	//
+	// Every renderer owes the reader this number — the table prints it and so
+	// does --json, since a consumer that only sees an empty list is exactly the
+	// reader this field exists for.
+	Hidden int
 }
 
 // Roster answers "who is on the roster, and what does each person have?" from
@@ -84,9 +87,9 @@ func (s *Service) Roster(ctx context.Context, req RosterRequest) (*RosterResult,
 	if !ok {
 		return nil, errors.New("invite: the configured store does not support the roster")
 	}
-	if req.Type != "" && req.Type != model.PersonHuman && req.Type != model.PersonAgent {
-		return nil, fmt.Errorf("invite: unknown person type %q (want %s or %s)",
-			req.Type, model.PersonHuman, model.PersonAgent)
+	wantType, err := ParsePersonType(string(req.Type))
+	if err != nil {
+		return nil, err
 	}
 	want, err := rosterServices(ctx, rstore, req.Services)
 	if err != nil {
@@ -109,9 +112,9 @@ func (s *Service) Roster(ctx context.Context, req RosterRequest) (*RosterResult,
 		byPerson[a.PersonID] = append(byPerson[a.PersonID], a)
 	}
 
-	res := &RosterResult{IncludedInactive: req.IncludeInactive}
+	res := &RosterResult{}
 	for _, p := range people {
-		if req.Type != "" && p.Type != req.Type {
+		if wantType != "" && p.Type != wantType {
 			continue
 		}
 		// matching is what the request asked about; visible is what survives the
@@ -160,18 +163,17 @@ func rosterServices(ctx context.Context, rstore RosterStore, keys []string) (map
 		known[svc.Key] = true
 		names = append(names, svc.Key)
 	}
+	// A blank key is refused like any other unknown one rather than skipped:
+	// dropping it silently would turn `--to ""` into "no filter at all", which
+	// is the whole roster answering a question about one service — the opposite
+	// of what this function is for.
 	want := make(map[string]bool, len(keys))
 	for _, k := range keys {
-		if k = strings.TrimSpace(k); k == "" {
-			continue
-		}
+		k = strings.TrimSpace(k)
 		if !known[k] {
-			return nil, fmt.Errorf("invite: unknown service %q (known: %s)", k, strings.Join(names, ", "))
+			return nil, unknownServiceError(k, names)
 		}
 		want[k] = true
-	}
-	if len(want) == 0 {
-		return nil, nil
 	}
 	return want, nil
 }

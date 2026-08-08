@@ -23,6 +23,13 @@ import (
 // wants the column narrow enough to scan.
 const dateFormat = "2006-01-02"
 
+// stampFormat is for the invite history, where the date alone is not enough:
+// re-running an invite is the routine case — that is what "retries only what
+// failed" means in practice — and two runs a minute apart while someone fixes a
+// token would otherwise render as identical rows in a list whose whole job is
+// ordering them. Seconds, because minutes lose exactly that case.
+const stampFormat = "2006-01-02 15:04:05"
+
 // dash stands in for a field with no value, so an empty column reads as
 // "nothing here" rather than as a rendering bug.
 const dash = "—"
@@ -50,11 +57,12 @@ func runPersonList(args []string) {
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
+	requireNoOperands(fs, personListUsage)
 
 	// Checked before setup(), so a bad flag costs an exit 2 rather than a
 	// database connect and a migration run.
-	if t := model.PersonType(*typ); t != "" && t != model.PersonHuman && t != model.PersonAgent {
-		fmt.Fprintf(os.Stderr, "purser: --type: want %s or %s, got %q\n", model.PersonHuman, model.PersonAgent, *typ)
+	if _, err := invite.ParsePersonType(*typ); err != nil {
+		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -73,6 +81,12 @@ func runPersonList(args []string) {
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
+		// A mistyped service is a flag to retype, not an outage — the same exit
+		// as a mistyped --type, so a script can't read one as infrastructure
+		// failure and the other as user error.
+		if errors.Is(err, invite.ErrUnknownService) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 
@@ -100,8 +114,13 @@ func runPersonShow(args []string) {
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
+	requireNoOperands(fs, personShowUsage)
 
-	if _, err := invite.NormalizeEmail(*email); err != nil {
+	// Kept, not discarded: the normalized address is what the lookup will key
+	// on, so the hint below quotes the same string rather than a second, weaker
+	// normalization of the raw flag.
+	wanted, err := invite.NormalizeEmail(*email)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
 		fmt.Fprintln(os.Stderr, personShowUsage)
 		os.Exit(2)
@@ -115,15 +134,10 @@ func runPersonShow(args []string) {
 	}
 	defer a.cleanup()
 
-	d, err := a.svc.PersonDetail(ctx, *email)
+	d, err := a.svc.PersonDetail(ctx, wanted)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
-		if errors.Is(err, invite.ErrPersonNotFound) {
-			// Not knowing them is a roster gap, and there is a command for it —
-			// the same one the audit's blind spot calls for.
-			fmt.Fprintf(os.Stderr, "purser: to record them: purser person add --name NAME --email %s\n",
-				strings.ToLower(strings.TrimSpace(*email)))
-		}
+		printAddPersonHint(err, wanted)
 		os.Exit(1)
 	}
 
@@ -136,8 +150,10 @@ func runPersonShow(args []string) {
 
 // --- table rendering ---
 
-// printRoster writes the roster to stdout; everything explanatory goes to
-// stderr, so `purser person list > roster.txt` captures the answer alone.
+// printRoster writes the roster to stdout and nothing else, so `purser person
+// list > roster.txt` captures rows a script can read. An empty roster is a
+// header and no rows; the count that explains it belongs to the summary, on
+// stderr, rather than to a parenthetical row pretending to be data.
 func printRoster(res *invite.RosterResult) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tEMAIL\tTYPE\tSERVICES\tSINCE")
@@ -146,14 +162,12 @@ func printRoster(res *invite.RosterResult) {
 			e.Person.Name, orDash(e.Person.Email), e.Person.Type,
 			servicesCell(e.Accounts), e.Person.CreatedAt.Format(dateFormat))
 	}
-	if len(res.Entries) == 0 {
-		fmt.Fprintln(w, "(nobody on the roster matches)")
-	}
 	_ = w.Flush()
 }
 
 // printRosterSummary reports the count and — the part that matters — says so
-// when the default filter dropped something.
+// when the default filter dropped something. Hidden is zero whenever --all was
+// passed, so the count alone is the whole condition.
 func printRosterSummary(res *invite.RosterResult) {
 	n := len(res.Entries)
 	noun := "people"
@@ -161,7 +175,7 @@ func printRosterSummary(res *invite.RosterResult) {
 		noun = "person"
 	}
 	fmt.Fprintf(os.Stderr, "\n%d %s\n", n, noun)
-	if res.Hidden > 0 && !res.IncludedInactive {
+	if res.Hidden > 0 {
 		fmt.Fprintf(os.Stderr, "%d non-active account%s hidden (deprovisioned or stale) — pass --all to include %s\n",
 			res.Hidden, plural(res.Hidden), them(res.Hidden))
 	}
@@ -211,10 +225,10 @@ func printPersonDetail(d *invite.PersonDetail) {
 	for _, inv := range d.Invites {
 		delivered := dash
 		if inv.DeliveredAt != nil {
-			delivered = inv.DeliveredAt.Format(dateFormat)
+			delivered = inv.DeliveredAt.Format(stampFormat)
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
-			inv.CreatedAt.Format(dateFormat), inv.Delivery, orDash(inv.Role), delivered)
+			inv.CreatedAt.Format(stampFormat), inv.Delivery, orDash(inv.Role), delivered)
 	}
 	if len(d.Invites) == 0 {
 		fmt.Fprintln(w, "(none)")
@@ -257,6 +271,15 @@ func them(n int) string {
 // here (PRSR-24).
 type rosterDTO struct {
 	People []rosterEntryDTO `json:"people"`
+	// HiddenAccounts is the same count the table prints to stderr, and it is
+	// here for the same reason: an empty `people` is the one result a consumer
+	// cannot interpret without it. `--to lyceum` returning nothing has to be
+	// readable as "nobody has Lyceum any more" rather than "nobody ever did",
+	// and stderr is exactly what a `| jq` pipeline throws away.
+	//
+	// Never omitempty: "the field is absent" and "the value is zero" would then
+	// be the same wire form, which is the ambiguity the field exists to remove.
+	HiddenAccounts int `json:"hidden_accounts"`
 }
 
 type rosterEntryDTO struct {
@@ -300,7 +323,10 @@ type inviteDTO struct {
 func newRosterDTO(res *invite.RosterResult) rosterDTO {
 	// Built empty rather than nil so an empty roster encodes as [] — a consumer
 	// iterating the field shouldn't have to special-case null.
-	out := rosterDTO{People: make([]rosterEntryDTO, 0, len(res.Entries))}
+	out := rosterDTO{
+		People:         make([]rosterEntryDTO, 0, len(res.Entries)),
+		HiddenAccounts: res.Hidden,
+	}
 	for _, e := range res.Entries {
 		out.People = append(out.People, rosterEntryDTO{
 			Person:   newPersonDTO(e.Person),

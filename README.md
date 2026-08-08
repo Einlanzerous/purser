@@ -270,10 +270,11 @@ WHEN        DELIVERY   ROLE    DELIVERED
 
 Three things about these commands are deliberate:
 
-**They read local records only** — `person`, `account`, `service` — and call no
-connector. Asking who is on the roster shouldn't require every upstream service
-to be reachable, or cost a full reconcile sweep. `audit` is the command that
-compares records against upstream; this is the one that reads the records.
+**They read local records only** — `person`, `account` and `service`, plus
+`invite` for `show`'s history — and call no connector. Asking who is on the
+roster shouldn't require every upstream service to be reachable, or cost a full
+reconcile sweep. `audit` is the command that compares records against upstream;
+this is the one that reads the records.
 
 **No secret, not even a hash.** Credentials are shown once, at invite time. The
 roster's account type has no `secret_hash` or `secret_ref` field and the query

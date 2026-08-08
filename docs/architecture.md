@@ -343,9 +343,10 @@ of record for.
 upstream* — so it needs a connector call per (person × service) and is only as
 available as the connectors are. Asking who is on the roster shouldn't require
 every upstream service to be reachable, or cost a reconcile sweep. So the roster
-reads `person`, `account` and `service` and stops: neither `Roster` nor
-`PersonDetail` so much as references the connector registry, and a test asserts
-both `Provision` and `Reconcile` stay at zero calls.
+reads local tables and stops — `person`, `account` and `service`, plus `invite`
+for `show`'s history: neither `Roster` nor `PersonDetail` so much as references
+the connector registry, and a test asserts both `Provision` and `Reconcile` stay
+at zero calls.
 
 **No secret reaches either command, structurally.** They read
 `store.AccountRecord` — an account joined to its service, with no `secret_hash`
