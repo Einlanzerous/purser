@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -167,9 +168,113 @@ func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connecto
 	}
 }
 
-// Deprovision is not yet implemented (Phase 1 is invite-only).
+// Deprovision removes the person's Lyceum account (PRSR-17).
+//
+// **This connector deletes.** Everywhere else `Deprovision` means revoke — take
+// away the way in and leave the account standing — but Lyceum's admin surface
+// offers exactly one destructive operation, `DELETE /admin/users/{id}`, and no
+// way to disable a user or invalidate their sessions short of it. So here the two
+// collapse, and the honest thing is to say so rather than to let the interface's
+// gentler wording imply a reversibility this has none of.
+//
+// Idempotent: a person with no Lyceum user is a success. The id comes from the
+// account row where possible and from a lookup otherwise, both of which key on
+// the email — Lyceum has no name-matching fallback, so there is no stranger to
+// hit here the way there is on Switchyard.
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
-	return errors.New("lyceum: deprovision not implemented")
+	id, recorded, err := c.resolveUserID(ctx, in)
+	if err != nil {
+		return err
+	}
+	if id == "" {
+		return nil // nothing upstream to remove
+	}
+
+	status, raw, err := c.deleteUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	// A 404 against the id Purser *recorded* means the record is wrong, not that
+	// the person has no account. Reporting success there would mark the account
+	// deprovisioned while the real Lyceum user stays, and the next run would skip
+	// it. So re-ask the authority — the email — and delete what it points at.
+	if status == http.StatusNotFound && recorded {
+		looked, err := c.lookupUserID(ctx, in)
+		if err != nil {
+			return err
+		}
+		if looked == "" || looked == id {
+			return nil // genuinely gone
+		}
+		if status, raw, err = c.deleteUser(ctx, looked); err != nil {
+			return err
+		}
+		id = looked
+	}
+
+	switch status {
+	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
+		return nil
+	case http.StatusForbidden:
+		// Two different 403s live here and they need different fixes, so don't
+		// blame auth for both: requireOwner rejects a non-owner token, and
+		// DeleteUser rejects the household owner as immutable. The second is not a
+		// misconfiguration at all — it means Purser was asked to offboard the
+		// person who owns the library.
+		return fmt.Errorf("lyceum: 403 deleting user %s — either PURSER_LYCEUM_OWNER_TOKEN is not an owner session token (with LYCEUM_AUTH=true), or this is the household owner, who cannot be removed (%s)", id, bodyMsg(raw))
+	default:
+		return apiError("delete user", status, raw)
+	}
+}
+
+func (c *Connector) deleteUser(ctx context.Context, id string) (int, []byte, error) {
+	return c.do(ctx, http.MethodDelete, "/admin/users/"+url.PathEscape(id), nil)
+}
+
+// resolveUserID picks the Lyceum user id to delete, preferring the recorded one
+// and reporting whether that is where it came from.
+//
+// The recorded value is not always an id. Provision's 409 branch — the person
+// already had a Lyceum account when they were invited — records the *email* in
+// ExternalID, and Lyceum's DELETE handler ParseInts the path segment, so sending
+// that yields 400 on every run, forever, with no fallback: the empty-id branch
+// that knows how to look them up is never reached. Anyone who pre-existed their
+// invite was therefore permanently un-offboardable (PRSR-17 review).
+//
+// Rather than trust the column, require the shape the endpoint requires. A value
+// that is not a positive integer is treated as no id at all and resolved by
+// email, which is what it was standing in for.
+func (c *Connector) resolveUserID(ctx context.Context, in connector.Input) (id string, recorded bool, err error) {
+	if raw := strings.TrimSpace(in.ExternalID); numericID(raw) {
+		return raw, true, nil
+	}
+	id, err = c.lookupUserID(ctx, in)
+	return id, false, err
+}
+
+// lookupUserID resolves the person's Lyceum id from their email, or "" if they
+// have no account. Reconcile already does exactly this and refuses an emailless
+// person, so it is reused rather than restated.
+func (c *Connector) lookupUserID(ctx context.Context, in connector.Input) (string, error) {
+	rec, err := c.Reconcile(ctx, in)
+	if err != nil || !rec.Exists {
+		return "", err
+	}
+	return rec.ExternalID, nil
+}
+
+// numericID reports whether s is the positive integer Lyceum's admin routes
+// expect. Anything else — an email, a UUID, empty — is not an id here.
+func numericID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Connector) do(ctx context.Context, method, path string, body any) (int, []byte, error) {

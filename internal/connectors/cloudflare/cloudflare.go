@@ -85,6 +85,25 @@ func (c *Connector) configured() bool {
 	return c.cfg.APIToken != "" && c.cfg.AccountID != "" && c.cfg.GroupID != ""
 }
 
+// CanDeprovision reports whether the Access group can be edited, answerable from
+// config alone — so the offboard preview says "unavailable" for an unconfigured
+// Cloudflare rather than promising a revoke that --apply then declines.
+//
+// ErrRevokeUnavailable, not a plain error: an unconfigured connector did not
+// break, and this is the one service whose manual fallback is a single dashboard
+// click, so the operator note should send them there rather than hunting a bug.
+func (c *Connector) CanDeprovision() error {
+	if c.configured() {
+		return nil
+	}
+	group := c.cfg.GroupName
+	if group == "" {
+		group = "the Allow-by-email Access policy"
+	}
+	return fmt.Errorf("%w: drop them from %s in the Cloudflare Zero Trust dashboard (Access → Policies)",
+		connector.ErrRevokeUnavailable, group)
+}
+
 // otpNote is the sign-in guidance shown to the invited person.
 func (c *Connector) otpNote(email string) string {
 	apps := c.cfg.AppsNote
@@ -225,8 +244,15 @@ func groupHasEmail(g group, email string) bool {
 
 // Deprovision removes the email from the Access group.
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
-	if !c.configured() {
-		return fmt.Errorf("cloudflare: not configured")
+	// ErrPending, not a bare error, and for the same reason Provision uses it: an
+	// unconfigured connector did not break, it was never in a position to try.
+	// On the offboard path that difference is what the operator acts on — "go fix
+	// a breakage" against "go remove them by hand, then set the token" — and the
+	// manual step is the one that actually closes the access. It used to report
+	// as a plain failure here, so the one connector whose manual fallback is a
+	// single dashboard click was also the one that looked broken (PRSR-17).
+	if err := c.CanDeprovision(); err != nil {
+		return fmt.Errorf("%w — remove %s by hand", err, strings.ToLower(strings.TrimSpace(in.Email)))
 	}
 	email := strings.ToLower(strings.TrimSpace(in.Email))
 	c.groupMu.Lock()

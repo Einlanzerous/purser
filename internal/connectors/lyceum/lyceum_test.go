@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -151,5 +152,169 @@ func TestReconcile_ForbiddenIsLoud(t *testing.T) {
 	if _, err := c.Reconcile(context.Background(), connector.Input{Email: "mara@example.com"}); err == nil ||
 		!strings.Contains(err.Error(), "LYCEUM_AUTH") {
 		t.Fatalf("403 should surface the LYCEUM_AUTH hint, got %v", err)
+	}
+}
+
+// Lyceum is the one connector where Deprovision deletes: DELETE /admin/users/{id}
+// is the only destructive operation the admin surface offers, and there is no
+// disable. Documented rather than disguised (PRSR-17).
+func TestDeprovision_DeletesTheUser(t *testing.T) {
+	var deleted []string
+	var listCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/admin/users/"):
+			deleted = append(deleted, strings.TrimPrefix(r.URL.Path, "/admin/users/"))
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/users":
+			listCalls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"id":7,"email":"ada@example.com","display_name":"Ada"}]`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// With the recorded id, no lookup is needed.
+	if err := c.Deprovision(context.Background(), connector.Input{
+		Email: "ada@example.com", ExternalID: "7",
+	}); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != "7" {
+		t.Errorf("deleted = %v, want [7]", deleted)
+	}
+	if listCalls != 0 {
+		t.Errorf("a recorded id should skip the lookup, got %d list calls", listCalls)
+	}
+
+	// Without one it falls back to the email lookup.
+	if err := c.Deprovision(context.Background(), connector.Input{Email: "ada@example.com"}); err != nil {
+		t.Fatalf("Deprovision via lookup: %v", err)
+	}
+	if listCalls != 1 || len(deleted) != 2 {
+		t.Errorf("want one lookup and a second delete, got listCalls=%d deleted=%v", listCalls, deleted)
+	}
+}
+
+// Idempotent both ways: a person Lyceum has never heard of, and a 404 from the
+// delete itself, are both the state the caller asked for.
+func TestDeprovision_MissingUserIsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/users":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	if err := c.Deprovision(context.Background(), connector.Input{Email: "ghost@example.com"}); err != nil {
+		t.Errorf("an unknown person should be success, got %v", err)
+	}
+	if err := c.Deprovision(context.Background(), connector.Input{
+		Email: "ghost@example.com", ExternalID: "99",
+	}); err != nil {
+		t.Errorf("a 404 from delete should be success, got %v", err)
+	}
+}
+
+// Provision's 409 branch records the *email* in ExternalID, and Lyceum's DELETE
+// handler ParseInts the path segment — so passing it straight through yielded 400
+// on every run, forever, for anyone who already had a Lyceum account when they
+// were invited. The empty-id fallback that knows how to look them up was never
+// reached, because the id was not empty (PRSR-17 review).
+func TestDeprovision_RecoversWhenExternalIDIsAnEmail(t *testing.T) {
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/users":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"id":7,"email":"ada@example.com","display_name":"Ada"}]`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/admin/users/"):
+			id := strings.TrimPrefix(r.URL.Path, "/admin/users/")
+			// Mirror the real handler: a non-numeric id is a 400, not a delete.
+			if _, err := strconv.ParseInt(id, 10, 64); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			deleted = append(deleted, id)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	if err := c.Deprovision(context.Background(), connector.Input{
+		Email: "ada@example.com", ExternalID: "ada@example.com",
+	}); err != nil {
+		t.Fatalf("an email in ExternalID must resolve by lookup, got %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != "7" {
+		t.Errorf("deleted = %v, want the looked-up numeric id [7]", deleted)
+	}
+}
+
+// A 404 against the *recorded* id means the record is wrong, not that the person
+// has no account. Reporting success would mark them deprovisioned while the real
+// Lyceum user stays — and the next run would skip them.
+func TestDeprovision_StaleExternalIDFallsBackToTheLookup(t *testing.T) {
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/users":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"id":7,"email":"ada@example.com","display_name":"Ada"}]`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/admin/users/999":
+			w.WriteHeader(http.StatusNotFound) // the recorded id is stale
+		case r.Method == http.MethodDelete && r.URL.Path == "/admin/users/7":
+			deleted = append(deleted, "7")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	if err := c.Deprovision(context.Background(), connector.Input{
+		Email: "ada@example.com", ExternalID: "999",
+	}); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != "7" {
+		t.Errorf("deleted = %v — a stale id must not be reported as success", deleted)
+	}
+}
+
+// Lyceum's DELETE returns 403 for two unrelated reasons and they need different
+// fixes: a non-owner token, or the household owner being immutable. The message
+// must not blame only the first.
+func TestDeprovision_403MentionsBothCauses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("the owner account cannot be removed"))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, OwnerToken: "lyc_owner"})
+	err := c.Deprovision(context.Background(), connector.Input{Email: "ada@example.com", ExternalID: "1"})
+	if err == nil {
+		t.Fatal("a 403 must be an error")
+	}
+	if !strings.Contains(err.Error(), "owner, who cannot be removed") {
+		t.Errorf("the message should name the immutable-owner case too, got: %v", err)
 	}
 }

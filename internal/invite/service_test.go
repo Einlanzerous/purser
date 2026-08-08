@@ -749,6 +749,9 @@ type fakeStore struct {
 	accounts map[string]model.Account       // by person:service
 	tasks    map[string]model.ProvisionTask // by invite:service
 	invites  []model.Invite                 // in creation order; the roster reads them back
+
+	// failStatusUpdate, when set, makes UpdateAccountStatus fail.
+	failStatusUpdate error
 }
 
 // InsertPersonIfAbsent mirrors the real store: the email is unique
@@ -888,6 +891,12 @@ func (s *fakeStore) PersonByEmail(_ context.Context, email string) (model.Person
 func (s *fakeStore) UpdateAccountStatus(_ context.Context, accountID uuid.UUID, status model.AccountStatus) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Lets a test simulate the database going away mid-offboard, after a revoke
+	// has already landed upstream — the case where aborting would discard the
+	// report the operator needs most.
+	if s.failStatusUpdate != nil {
+		return s.failStatusUpdate
+	}
 	for k, a := range s.accounts {
 		if a.ID == accountID {
 			a.Status = status
@@ -937,6 +946,7 @@ func (s *fakeStore) accountRecordsLocked(personID uuid.UUID) []store.AccountReco
 		}
 		svc := byID[a.ServiceID]
 		out = append(out, store.AccountRecord{
+			ID:          a.ID,
 			PersonID:    a.PersonID,
 			ServiceKey:  svc.Key,
 			DisplayName: svc.DisplayName,
@@ -976,6 +986,15 @@ func (s *fakeStore) UpdateTask(_ context.Context, t model.ProvisionTask) error {
 	defer s.mu.Unlock()
 	s.tasks[keyOf(t.InviteID, t.ServiceID)] = t
 	return nil
+}
+
+// accountStatus reads back an account's persisted status, so an offboard test
+// can assert on the durable record rather than only on the returned finding —
+// "we said revoked" and "the row says revoked" are exactly what must not drift.
+func (s *fakeStore) accountStatus(personID, serviceID uuid.UUID) model.AccountStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accounts[keyOf(personID, serviceID)].Status
 }
 
 // taskStatus reads back what was persisted for one service of an invite, so a

@@ -220,6 +220,7 @@ purser invite --name NAME --email EMAIL [--to svc1,svc2] [--bundle NAME] [--role
 purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--audit]
 purser person list [--to svc1,svc2] [--type human|agent] [--all] [--json]   # the roster
 purser person show --email EMAIL [--json]                  # one person in full
+purser offboard --email EMAIL [--to svc1,svc2] [--apply]   # revoke access; previews by default
 purser audit [--email EMAIL] [--to svc1,svc2]              # report drift, read-only
 purser reconcile --email EMAIL | --all [--to svc1,svc2]    # repair records
 purser migrate               # apply DB migrations and exit
@@ -287,6 +288,74 @@ column. But hiding it silently is worse: `--to lyceum` returning nobody has to
 mean "nobody has Lyceum", not "nobody has Lyceum any more", so the hidden count
 is always reported. `show`, being the single-person view, withholds nothing —
 there a stale row is the interesting part, and it carries its status.
+
+### Offboarding
+
+`invite` grants access across the stack in one command. `offboard` is its
+opposite, and until PRSR-17 it did not exist — removing someone meant four
+manual deletes plus hand-editing Purser's records:
+
+```
+$ purser offboard --email ada@example.com
+SERVICE     USERNAME  ACTION
+argosy      ada       revoke
+cloudflare  —         revoke
+lyceum      ada       nothing-to-do
+switchyard  ada       revoke
+
+Ada Lovelace <ada@example.com>: 3 to revoke, 1 nothing to do, 0 unavailable, 0 failed
+
+Preview — nothing revoked. Re-run with --apply to revoke 3 services.
+```
+
+**It previews by default.** `invite` acts without asking because granting access
+twice is merely wasteful; revoking the wrong person is not undone by running it
+again. `--apply` is what acts, and a dry run makes *no connector call at all*.
+There is no bulk mode either — `--email` is required and always names one person,
+which is a stronger guard than the `--all` flag `reconcile` needs.
+
+**It revokes; it does not delete.** Per service:
+
+| service | what happens |
+|---|---|
+| `switchyard` | every live API token revoked; the user and their tickets stay |
+| `cloudflare` | the email is removed from the Access group |
+| `lyceum` | **deleted** — `DELETE /admin/users/{id}` is the only operation its admin API has |
+| `argosy` | **nothing** — no delete or disable endpoint exists; reported `unavailable` |
+
+The preview knows this in advance — a connector that can't revoke says so without
+being called, so the dry run never promises what `--apply` would decline.
+
+Lyceum is called out because it is the exception, and Argosy because it is the
+gap. An Argosy account is reported as still open rather than quietly skipped:
+
+```
+Still has access — Purser cannot revoke these:
+  - Argosy: connector: provisioning not yet available: argosy has no account delete
+    or disable endpoint — remove the account by hand until one ships
+Remove them by hand.
+```
+
+That distinction is `TaskUnavailable` doing its job. A connector nobody has built
+a delete for did not *fail* — but on this path it is not success either, so
+`offboard` exits non-zero for it, the opposite of `invite`.
+
+**A failed revoke leaves the record active.** Only a connector that actually
+succeeded marks the `account` row `deprovisioned`. Recording a revoke that didn't
+happen is worse than the failure: the error scrolls away, and the audit,
+`person show`, and the next invite's idempotency skip all go on reading a column
+that says access was removed while it is still live.
+
+**The row is marked, never deleted**, so what someone held — and when it was taken
+away — survives the offboarding. That last part needed its own column:
+`updated_at` is bumped by the next re-invite, so `deprovisioned_at` (migration
+0006) records the revocation durably and is never cleared. `person list` hides
+the row and says so; `person show` displays it with a REVOKED date.
+
+> **One thing to know:** revoking Switchyard tokens removes *API* access. The
+> sign-in is gated by the Cloudflare Access group, so an offboard that skips
+> `cloudflare` leaves a working login behind. The CLI warns when that happens,
+> but the half-done case looks finished, which is why it is worth stating twice.
 
 ### Auditing and reconciling
 

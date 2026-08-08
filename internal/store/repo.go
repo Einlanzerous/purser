@@ -195,9 +195,22 @@ func (s *Store) PersonByEmail(ctx context.Context, email string) (model.Person, 
 // UpdateAccountStatus changes only an account's status, deliberately leaving
 // secret_hash and identity columns untouched — marking a row stale must not
 // destroy the record of what was provisioned (PRSR-15).
+//
+// Moving to deprovisioned also stamps deprovisioned_at, which UpsertAccount then
+// never clears, so "when was this taken away" survives a later re-invite
+// (PRSR-17). It is set only on the transition into that status: re-running an
+// offboard against an already-deprovisioned row is a no-op upstream and must not
+// move the date either.
 func (s *Store) UpdateAccountStatus(ctx context.Context, accountID uuid.UUID, status model.AccountStatus) error {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE account SET status = $2, updated_at = now() WHERE id = $1`,
+		UPDATE account SET
+			status = $2,
+			deprovisioned_at = CASE
+				WHEN $2 = 'deprovisioned' AND deprovisioned_at IS NULL THEN now()
+				ELSE deprovisioned_at
+			END,
+			updated_at = now()
+		WHERE id = $1`,
 		accountID, string(status))
 	if err != nil {
 		return fmt.Errorf("store: update account status: %w", err)

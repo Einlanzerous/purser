@@ -185,3 +185,76 @@ func TestListServicesAndInvitesFor(t *testing.T) {
 		t.Errorf("oldest invite should be last, got %s", got)
 	}
 }
+
+// Migration 0006. account.status plus updated_at looked like enough history and
+// isn't: UpsertAccount sets status='active' and bumps updated_at, so the next
+// invite for that person and service erased both — and re-inviting someone is an
+// ordinary thing to do. deprovisioned_at is written on the transition and never
+// cleared, so "when was it taken away" survives (PRSR-17 review).
+func TestDeprovisionedAt_SurvivesAReinvite(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	svc, err := st.EnsureService(ctx, "switchyard", "Switchyard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _, err := st.InsertPersonIfAbsent(ctx, "Ada", "ada@example.com", model.PersonHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acct, err := st.UpsertAccount(ctx, model.Account{
+		PersonID: p.ID, ServiceID: svc.ID, ExternalID: "u-1", Username: "ada",
+		SecretHash: "h", Status: model.AccountActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Not set while active.
+	records, err := st.AccountRecordsFor(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records[0].DeprovisionedAt != nil {
+		t.Errorf("an active account should have no deprovisioned_at, got %v", records[0].DeprovisionedAt)
+	}
+	if records[0].ID != acct.ID {
+		t.Errorf("the record should carry the account id, got %s want %s", records[0].ID, acct.ID)
+	}
+
+	if err := st.UpdateAccountStatus(ctx, acct.ID, model.AccountDeprovisioned); err != nil {
+		t.Fatal(err)
+	}
+	records, _ = st.AccountRecordsFor(ctx, p.ID)
+	stamped := records[0].DeprovisionedAt
+	if stamped == nil {
+		t.Fatal("revoking should stamp deprovisioned_at")
+	}
+
+	// Re-inviting them goes through UpsertAccount, which is what used to erase
+	// the evidence.
+	if _, err := st.UpsertAccount(ctx, model.Account{
+		PersonID: p.ID, ServiceID: svc.ID, ExternalID: "u-1", Username: "ada",
+		SecretHash: "h2", Status: model.AccountActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	records, _ = st.AccountRecordsFor(ctx, p.ID)
+	if records[0].Status != model.AccountActive {
+		t.Errorf("a re-invite should make it active again, got %s", records[0].Status)
+	}
+	if records[0].DeprovisionedAt == nil || !records[0].DeprovisionedAt.Equal(*stamped) {
+		t.Errorf("deprovisioned_at must survive a re-invite: was %v, now %v", stamped, records[0].DeprovisionedAt)
+	}
+
+	// Re-running an offboard against an already-deprovisioned row must not move
+	// the date either — the access was taken away once.
+	if err := st.UpdateAccountStatus(ctx, acct.ID, model.AccountDeprovisioned); err != nil {
+		t.Fatal(err)
+	}
+	records, _ = st.AccountRecordsFor(ctx, p.ID)
+	if !records[0].DeprovisionedAt.Equal(*stamped) {
+		t.Errorf("the date moved on a re-run: was %v, now %v", stamped, records[0].DeprovisionedAt)
+	}
+}

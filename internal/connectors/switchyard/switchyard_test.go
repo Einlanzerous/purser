@@ -302,3 +302,161 @@ func TestReconcile_RefusesWithoutAnEmailRatherThanMatchingOnName(t *testing.T) {
 		t.Error("a refusal must not also claim the account exists")
 	}
 }
+
+// Deprovision revokes every live token and leaves the user standing. Deleting
+// the user would take their authored tickets and comments with it, which is far
+// more than "this person should not have access" asks for (PRSR-17).
+func TestDeprovision_RevokesLiveTokensAndKeepsTheUser(t *testing.T) {
+	var revoked []string
+	var listCalls, userDeletes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/users/u-42/tokens":
+			listCalls++
+			w.WriteHeader(http.StatusOK)
+			// One already revoked: it must not be revoked again.
+			_, _ = w.Write([]byte(`{"items":[
+				{"id":"t-1","name":"purser-provisioned","revoked_at":null},
+				{"id":"t-2","name":"laptop","revoked_at":"2026-01-01T00:00:00Z"},
+				{"id":"t-3","name":"cli","revoked_at":null}]}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/users/u-42/tokens/"):
+			revoked = append(revoked, strings.TrimPrefix(r.URL.Path, "/v1/users/u-42/tokens/"))
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/users/u-42":
+			userDeletes++
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ExternalID present, so no user lookup is needed at all.
+	if err := c.Deprovision(context.Background(), connector.Input{
+		PersonName: "Ada", Email: "ada@example.com", ExternalID: "u-42",
+	}); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+	if len(revoked) != 2 || revoked[0] != "t-1" || revoked[1] != "t-3" {
+		t.Errorf("revoked = %v, want the two live tokens only", revoked)
+	}
+	if userDeletes != 0 {
+		t.Errorf("Deprovision deleted the user %d time(s) — it must only revoke", userDeletes)
+	}
+	if listCalls != 1 {
+		t.Errorf("listCalls = %d, want 1", listCalls)
+	}
+}
+
+// A person with nothing left to revoke is a success, so a failed-only retry and
+// a second offboard are both safe.
+func TestDeprovision_IsIdempotentAndTolerantOfAMissingUser(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/users":
+			// Nobody upstream matches.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"items":[],"page":{"next_cursor":null}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/users/u-9/tokens":
+			// Every token already revoked.
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"items":[{"id":"t-1","revoked_at":"2026-01-01T00:00:00Z"}]}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	// No user upstream at all — nothing to take away.
+	if err := c.Deprovision(context.Background(), connector.Input{
+		PersonName: "Ada", Email: "ada@example.com",
+	}); err != nil {
+		t.Errorf("a missing user should be success, got %v", err)
+	}
+	// A user whose tokens are already revoked — likewise.
+	if err := c.Deprovision(context.Background(), connector.Input{
+		PersonName: "Ada", Email: "ada@example.com", ExternalID: "u-9",
+	}); err != nil {
+		t.Errorf("an already-revoked user should be success, got %v", err)
+	}
+}
+
+// Without an ExternalID the connector must look the person up by email — and
+// findUser falls back to display-name matching when there is no address, which
+// on this path would revoke a same-named stranger's tokens.
+func TestDeprovision_RefusesAnEmaillessPerson(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		t.Errorf("nothing should be called: %s %s", r.Method, r.URL.Path)
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	if err := c.Deprovision(context.Background(), connector.Input{PersonName: "Ada"}); err == nil {
+		t.Error("an emailless deprovision must be refused, not guessed at")
+	}
+}
+
+// A 404 on the token list for the *recorded* user id means the record is wrong,
+// not that the person has no tokens. Treating it as "nothing to revoke" would
+// mark the account deprovisioned while the real user's tokens stay live — and
+// the next run would skip them, silently and permanently (PRSR-17 review).
+func TestDeprovision_StaleExternalIDFallsBackToTheLookup(t *testing.T) {
+	var revoked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/users/u-stale/tokens":
+			w.WriteHeader(http.StatusNotFound) // the recorded id is wrong
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/users":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"items":[{"id":"u-42","name":"Ada","email":"ada@example.com"}],"page":{"next_cursor":null}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/users/u-42/tokens":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"items":[{"id":"t-live","revoked_at":null}]}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/users/u-42/tokens/"):
+			revoked = append(revoked, strings.TrimPrefix(r.URL.Path, "/v1/users/u-42/tokens/"))
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	if err := c.Deprovision(context.Background(), connector.Input{
+		PersonName: "Ada", Email: "ada@example.com", ExternalID: "u-stale",
+	}); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+	if len(revoked) != 1 || revoked[0] != "t-live" {
+		t.Errorf("revoked = %v — a stale id must not be reported as nothing to revoke", revoked)
+	}
+}
+
+// A recorded id that 404s *and* an email that finds nobody is the genuine
+// no-access case, and must stay a success so a re-run is cheap.
+func TestDeprovision_StaleIDWithNoUpstreamUserIsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/tokens"):
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/users":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"items":[],"page":{"next_cursor":null}}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c, _ := New(Config{BaseURL: srv.URL, Token: "sw_admin"})
+	if err := c.Deprovision(context.Background(), connector.Input{
+		PersonName: "Ada", Email: "ada@example.com", ExternalID: "u-gone",
+	}); err != nil {
+		t.Errorf("no user upstream at all should be success, got %v", err)
+	}
+}

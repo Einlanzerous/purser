@@ -23,6 +23,51 @@ import (
 // 0004's one-shot backfill, so changing its text is a schema-adjacent edit.
 var ErrPending = errors.New("connector: provisioning not yet available")
 
+// ErrRevokeUnavailable is Deprovision's counterpart to ErrPending: the connector
+// is registered but cannot revoke — its upstream has no delete, disable, or
+// token-invalidation endpoint, or its credential isn't configured.
+//
+// It exists as a separate sentinel purely so the *message* can be right.
+// ErrPending's text is "provisioning not yet available", which is nonsense on an
+// offboard, and it cannot be reworded: migration 0004's one-shot backfill matches
+// that string as a literal prefix, so its wording is schema-adjacent. Callers
+// that bucket by outcome should accept either — see IsUnavailable — since both
+// mean the same thing to the orchestrator (model.TaskUnavailable) and differ only
+// in which half of the lifecycle they are describing.
+var ErrRevokeUnavailable = errors.New("connector: revoking not yet available")
+
+// IsUnavailable reports whether err is either "not built yet" sentinel. Use it
+// instead of matching one, so a connector that reaches for the wrong half of the
+// pair is still bucketed correctly rather than reported as a breakage.
+func IsUnavailable(err error) bool {
+	return errors.Is(err, ErrPending) || errors.Is(err, ErrRevokeUnavailable)
+}
+
+// RevokeChecker is an optional interface a Connector implements to answer "could
+// you revoke, if asked?" without calling anything upstream.
+//
+// The offboard preview needs this. Argosy's Deprovision is an unconditional
+// ErrRevokeUnavailable and an Unavailable stub's always is too, so a dry run that
+// reported "revoke" for them would promise something --apply then refuses — and
+// "the preview is exactly what the apply does" is the property that makes a
+// preview worth having on the one command you cannot take back.
+//
+// A connector that does not implement it is assumed able; only connectors that
+// know they cannot need to say so.
+type RevokeChecker interface {
+	// CanDeprovision returns nil when Deprovision could act, or an error
+	// (normally wrapping ErrRevokeUnavailable) explaining why it could not.
+	CanDeprovision() error
+}
+
+// CanDeprovision asks c whether it could revoke, without contacting upstream.
+func CanDeprovision(c Connector) error {
+	if rc, ok := c.(RevokeChecker); ok {
+		return rc.CanDeprovision()
+	}
+	return nil
+}
+
 // ErrReconcileUnsupported is returned by Reconcile when the target system has
 // no way to look a person up without creating them — i.e. the only "does this
 // account exist?" signal available is a 409 from the create endpoint, which is
@@ -66,6 +111,20 @@ type Input struct {
 	// InviteRef is a stable per-(person×service) string suitable for an
 	// idempotency key on upstream APIs that support one.
 	InviteRef string
+
+	// ExternalID is the upstream account id Purser already recorded for this
+	// person and service, when it has one. Empty on the Provision path — there is
+	// nothing to know yet — and set on Deprovision from the `account` row.
+	//
+	// It exists so a revoke targets the account Purser actually provisioned
+	// rather than whatever a fresh lookup turns up. That distinction matters most
+	// on Switchyard, whose findUser falls back to matching on display name: a
+	// lookup is a guess that can land on a same-named stranger, and on the
+	// offboard path the cost of guessing wrong is revoking the wrong person's
+	// access. Connectors should prefer it and fall back to a lookup only when it
+	// is empty (a record written before this field existed, or by an audit that
+	// found no id upstream).
+	ExternalID string
 }
 
 // ProjectGrant assigns a person a role on a project. Key "*" is a wildcard
@@ -113,8 +172,21 @@ type Connector interface {
 	// Connectors whose upstream has no lookup endpoint must return
 	// ErrReconcileUnsupported rather than inferring absence.
 	Reconcile(ctx context.Context, in Input) (ReconcileResult, error)
-	// Deprovision removes the person's access. Stubbed for now (Phase 1 is
-	// invite-only); connectors may return a not-implemented error.
+	// Deprovision revokes the person's access to the service (PRSR-17).
+	//
+	// It means *revoke*, not delete. Where the upstream distinguishes them, take
+	// away the ability to get in and leave the account and anything it authored
+	// alone: revoking is reversible and preserves the record, and "they can't get
+	// in" is the actual requirement. A connector whose upstream offers only a
+	// delete says so in its own doc comment rather than quietly destroying more
+	// than the contract implies.
+	//
+	// Like Provision it must be idempotent: a person with nothing left to revoke
+	// is a success, not an error, so a failed-only retry is safe. And like
+	// Reconcile it must never claim more than it did — a connector that cannot
+	// revoke returns ErrPending (recorded as TaskUnavailable) rather than nil,
+	// because "we removed it" and "we couldn't" must not collapse into the same
+	// answer on the one path that is hard to undo.
 	Deprovision(ctx context.Context, in Input) error
 }
 

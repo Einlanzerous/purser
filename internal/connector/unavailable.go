@@ -40,6 +40,17 @@ func (u *Unavailable) Reconcile(ctx context.Context, in Input) (ReconcileResult,
 	return ReconcileResult{}, fmt.Errorf("%w: %s", ErrPending, u.Reason)
 }
 
+// Deprovision can't revoke what it was never able to grant. It reports
+// ErrRevokeUnavailable rather than ErrPending so the operator note says
+// "revoking not yet available" instead of talking about provisioning on an
+// offboard — same bucket, right sentence.
 func (u *Unavailable) Deprovision(ctx context.Context, in Input) error {
-	return fmt.Errorf("%w: %s", ErrPending, u.Reason)
+	return fmt.Errorf("%w: %s", ErrRevokeUnavailable, u.Reason)
+}
+
+// CanDeprovision reports the same refusal without a call, so the offboard
+// preview shows this service as unavailable rather than promising a revoke that
+// --apply would then decline.
+func (u *Unavailable) CanDeprovision() error {
+	return fmt.Errorf("%w: %s", ErrRevokeUnavailable, u.Reason)
 }

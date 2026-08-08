@@ -21,6 +21,10 @@ import (
 // cannot print a secret" a question you answer by reading one type, instead of
 // by auditing every renderer and every DTO that will ever wrap it.
 type AccountRecord struct {
+	// ID is the account row's own id, carried so a caller acting on the record
+	// (offboard marking it deprovisioned) doesn't have to re-read the row it
+	// was just handed.
+	ID          uuid.UUID
 	PersonID    uuid.UUID
 	ServiceKey  string
 	DisplayName string
@@ -29,6 +33,9 @@ type AccountRecord struct {
 	Status      model.AccountStatus
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+	// DeprovisionedAt is when access was last revoked, or nil if it never was.
+	// Never cleared by a re-provision — see migration 0006.
+	DeprovisionedAt *time.Time
 }
 
 // AccountRecords returns every account on the roster, joined to its service,
@@ -51,8 +58,8 @@ func (s *Store) AccountRecordsFor(ctx context.Context, personID uuid.UUID) ([]Ac
 // registry on boot), so this drops nothing.
 func (s *Store) accountRecords(ctx context.Context, personID *uuid.UUID) ([]AccountRecord, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT a.person_id, s.key, s.display_name, a.external_id, a.username,
-		       a.status, a.created_at, a.updated_at
+		SELECT a.id, a.person_id, s.key, s.display_name, a.external_id, a.username,
+		       a.status, a.created_at, a.updated_at, a.deprovisioned_at
 		FROM account a
 		JOIN service s ON s.id = a.service_id
 		WHERE $1::uuid IS NULL OR a.person_id = $1
@@ -65,8 +72,8 @@ func (s *Store) accountRecords(ctx context.Context, personID *uuid.UUID) ([]Acco
 	var out []AccountRecord
 	for rows.Next() {
 		var a AccountRecord
-		if err := rows.Scan(&a.PersonID, &a.ServiceKey, &a.DisplayName, &a.ExternalID,
-			&a.Username, &a.Status, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.PersonID, &a.ServiceKey, &a.DisplayName, &a.ExternalID,
+			&a.Username, &a.Status, &a.CreatedAt, &a.UpdatedAt, &a.DeprovisionedAt); err != nil {
 			return nil, fmt.Errorf("store: scan account record: %w", err)
 		}
 		out = append(out, a)
