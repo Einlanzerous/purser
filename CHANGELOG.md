@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/Einlanzerous/purser/compare/v0.11.0...v0.12.0) (2026-08-08)
+
+
+### Features
+
+* **person:** read the roster back without psql (PRSR-24) ([#26](https://github.com/Einlanzerous/purser/issues/26)) ([2ffb7bb](https://github.com/Einlanzerous/purser/commit/2ffb7bb6bdf2dfacea0df4b8742ea40607ee9c26))
+
 ## [0.11.0](https://github.com/Einlanzerous/purser/compare/v0.10.0...v0.11.0) (2026-08-04)
 
 
