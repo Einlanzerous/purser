@@ -271,3 +271,134 @@ func TestOffboard_IsIdempotent(t *testing.T) {
 		t.Errorf("action = %s, want %s", f.Action, ActionNothingToDo)
 	}
 }
+
+// cantRevokeConn declares up front that it cannot revoke, the way Argosy and
+// every Unavailable stub do.
+type cantRevokeConn struct {
+	deprovConn
+	why error
+}
+
+func (c *cantRevokeConn) CanDeprovision() error { return c.why }
+func (c *cantRevokeConn) Deprovision(_ context.Context, in connector.Input) error {
+	c.deprovCalls++
+	c.deprovIn = in
+	return c.why
+}
+
+// The preview must not promise what --apply refuses. Argosy's Deprovision is an
+// unconditional refusal and so is every Unavailable stub, so a dry run that said
+// "revoke" for them would break the one property that makes previewing this
+// command worth doing.
+func TestOffboard_PreviewMatchesApplyForConnectorsThatCannotRevoke(t *testing.T) {
+	ar := &cantRevokeConn{
+		deprovConn: deprovConn{fakeConn: fakeConn{key: "argosy", display: "Argosy"}},
+		why:        fmt.Errorf("%w: no delete endpoint", connector.ErrRevokeUnavailable),
+	}
+	svc, st, p := offboardFixture(t, ar)
+	addAccount(t, st, p, "argosy", model.AccountActive)
+
+	preview, err := svc.Offboard(context.Background(), OffboardRequest{Email: "ada@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pf, _ := offboardFindingFor(preview, "argosy")
+	if pf.Action != ActionUnavailable {
+		t.Errorf("preview action = %s, want %s — the dry run promised a revoke that apply refuses", pf.Action, ActionUnavailable)
+	}
+	if ar.deprovCalls != 0 {
+		t.Errorf("a preview must reach no connector, got %d calls", ar.deprovCalls)
+	}
+
+	applied, err := svc.Offboard(context.Background(), OffboardRequest{Email: "ada@example.com", Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	af, _ := offboardFindingFor(applied, "argosy")
+	if af.Action != pf.Action {
+		t.Errorf("preview said %s, apply said %s — these must agree", pf.Action, af.Action)
+	}
+}
+
+// A revoke that landed upstream but couldn't be recorded is its own state. It
+// points the opposite way from a failure — access IS gone, and it is Purser's
+// records that are now wrong — so collapsing them would send the operator to
+// check access that they no longer have.
+func TestOffboard_RevokedButUnrecordedIsItsOwnState(t *testing.T) {
+	sw := &deprovConn{fakeConn: fakeConn{key: "switchyard", display: "Switchyard"}}
+	ly := &deprovConn{fakeConn: fakeConn{key: "lyceum", display: "Lyceum"}}
+	svc, st, p := offboardFixture(t, sw, ly)
+	addAccount(t, st, p, "switchyard", model.AccountActive)
+	addAccount(t, st, p, "lyceum", model.AccountActive)
+	st.failStatusUpdate = errors.New("pool closed")
+
+	res, err := svc.Offboard(context.Background(), OffboardRequest{Email: "ada@example.com", Apply: true})
+	if err != nil {
+		t.Fatalf("a write failure must not abort the report: %v", err)
+	}
+	// Both services still reported — the operator has to be told what was
+	// already revoked, which is exactly what aborting would have thrown away.
+	if len(res.Findings) != 2 {
+		t.Fatalf("want both findings, got %+v", res.Findings)
+	}
+	for _, f := range res.Findings {
+		if f.Action != ActionRevokedNotRecorded {
+			t.Errorf("%s: action = %s, want %s", f.ServiceKey, f.Action, ActionRevokedNotRecorded)
+		}
+		if f.Applied {
+			t.Errorf("%s: the record did not land, so this is not applied", f.ServiceKey)
+		}
+	}
+	// Both connectors ran: the first one's write failure must not skip the rest.
+	if sw.deprovCalls != 1 || ly.deprovCalls != 1 {
+		t.Errorf("both should have been revoked: switchyard=%d lyceum=%d", sw.deprovCalls, ly.deprovCalls)
+	}
+	note := RenderOffboardNote(res)
+	if !strings.Contains(note, "NOT recorded") {
+		t.Errorf("the note must distinguish this from a failure:\n%s", note)
+	}
+}
+
+// A scoped run has to say what it left behind. An out-of-scope service produces
+// no finding, so "absent from the table" would otherwise be ambiguous between
+// "they never had it" and "you excluded it" — which need opposite advice.
+func TestOffboard_ReportsActiveServicesScopedOut(t *testing.T) {
+	sw := &deprovConn{fakeConn: fakeConn{key: "switchyard", display: "Switchyard"}}
+	cf := &deprovConn{fakeConn: fakeConn{key: "cloudflare", display: "Cloudflare Access (SSO)"}}
+	svc, st, p := offboardFixture(t, sw, cf)
+	addAccount(t, st, p, "switchyard", model.AccountActive)
+	addAccount(t, st, p, "cloudflare", model.AccountActive)
+
+	res, err := svc.Offboard(context.Background(), OffboardRequest{
+		Email: "ada@example.com", Services: []string{"switchyard"}, Apply: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.SkippedActive) != 1 || res.SkippedActive[0] != "cloudflare" {
+		t.Errorf("SkippedActive = %v, want [cloudflare]", res.SkippedActive)
+	}
+	if cf.deprovCalls != 0 {
+		t.Error("an out-of-scope service must not be touched")
+	}
+}
+
+// A service the person holds no *active* account in is not "left behind" — the
+// scoped-out list must not name it, or the advice it drives becomes a no-op.
+func TestOffboard_SkippedActiveIgnoresInactiveAccounts(t *testing.T) {
+	sw := &deprovConn{fakeConn: fakeConn{key: "switchyard", display: "Switchyard"}}
+	cf := &deprovConn{fakeConn: fakeConn{key: "cloudflare", display: "Cloudflare Access (SSO)"}}
+	svc, st, p := offboardFixture(t, sw, cf)
+	addAccount(t, st, p, "switchyard", model.AccountActive)
+	addAccount(t, st, p, "cloudflare", model.AccountStale)
+
+	res, err := svc.Offboard(context.Background(), OffboardRequest{
+		Email: "ada@example.com", Services: []string{"switchyard"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.SkippedActive) != 0 {
+		t.Errorf("a stale account is not access left behind, got %v", res.SkippedActive)
+	}
+}

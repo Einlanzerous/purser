@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/Einlanzerous/purser/internal/invite"
@@ -54,24 +55,33 @@ func runOffboard(args []string) {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
 		os.Exit(1)
 	}
-	defer a.cleanup()
 
-	res, err := a.svc.Offboard(ctx, invite.OffboardRequest{
+	// os.Exit skips deferred calls, and this command has a non-zero success-ish
+	// exit — so the pool is closed explicitly before every exit rather than by a
+	// defer that only the error paths would ever reach.
+	code := offboard(ctx, a, invite.OffboardRequest{
 		Email:    wanted,
 		Services: splitCSV(*to),
 		Apply:    *apply,
 	})
+	a.cleanup()
+	os.Exit(code)
+}
+
+// offboard runs the request and prints it, returning the process exit code.
+// Split out so the caller can close the pool before exiting.
+func offboard(ctx context.Context, a *app, req invite.OffboardRequest) int {
+	res, err := a.svc.Offboard(ctx, req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "purser: %v\n", err)
-		printAddPersonHint(err, wanted)
+		printAddPersonHint(err, req.Email)
 		if errors.Is(err, invite.ErrUnknownService) {
-			os.Exit(2)
+			return 2
 		}
-		os.Exit(1)
+		return 1
 	}
-
 	printOffboard(res)
-	os.Exit(offboardExit(res))
+	return offboardExit(res)
 }
 
 // printOffboard writes the per-service verdicts to stdout and the operator's
@@ -96,6 +106,9 @@ func printOffboard(res *invite.OffboardResult) {
 		res.Person.Name, res.Person.Email,
 		c[invite.ActionRevoke], c[invite.ActionNothingToDo],
 		c[invite.ActionUnavailable], c[invite.ActionFailed])
+	if n := c[invite.ActionRevokedNotRecorded]; n > 0 {
+		fmt.Fprintf(os.Stderr, "%d revoked upstream but not recorded — see below.\n", n)
+	}
 
 	if !res.Applied {
 		if c[invite.ActionRevoke] > 0 {
@@ -108,43 +121,104 @@ func printOffboard(res *invite.OffboardResult) {
 		fmt.Fprintf(os.Stderr, "\nRevoked %d of %d.\n", res.Revoked(), len(res.Findings))
 	}
 
+	if len(res.SkippedActive) > 0 {
+		fmt.Fprintf(os.Stderr, "\nStill active, excluded by --to: %s\n", strings.Join(res.SkippedActive, ", "))
+	}
+
+	// What this command knows is what Purser recorded. An empty table means "no
+	// recorded access", which is not the same claim as "no access" — the roster
+	// can be behind, which is the whole reason `audit` exists. Saying so is
+	// cheap; asserting the stronger thing from local rows alone would be the
+	// treat-unverifiable-as-absent mistake the rest of the codebase refuses.
+	if len(res.Findings) == 0 {
+		fmt.Fprintf(os.Stderr, "\nThis reads Purser's records only. If they were set up outside Purser,\nrun `purser audit --email %s` to check upstream first.\n", res.Person.Email)
+	}
+
 	if note := invite.RenderOffboardNote(res); note != "" {
 		fmt.Fprintf(os.Stderr, "\n%s", note)
 	}
 
 	// The half-done case looks finished, so say it outright: revoking Switchyard
 	// tokens does not close its SSO door — the Cloudflare Access group does.
-	if leavesSSOOpen(res) {
-		fmt.Fprintln(os.Stderr, "\nNote: Switchyard was revoked but Cloudflare Access was not.")
-		fmt.Fprintln(os.Stderr, "Revoking tokens removes API access; the SSO login is gated by the Access")
-		fmt.Fprintln(os.Stderr, "group, so they can still sign in. Include --to cloudflare to close it.")
+	switch leavesSSOOpen(res) {
+	case ssoClosed:
+	case ssoOpenScopedOut:
+		printSSOWarning(res, "Include --to cloudflare to close it.")
+	case ssoOpenCantClose:
+		// --to cloudflare would be a no-op here: it is already in scope and the
+		// connector can't act. Prescribing it anyway teaches the operator to
+		// ignore this warning, which is the one that matters.
+		printSSOWarning(res, "Purser can't close it — remove them from the Access group by hand.")
 	}
 }
 
-// leavesSSOOpen reports the specific partial offboard that reads as complete and
-// isn't: Switchyard revoked while the Cloudflare Access grant survives.
-func leavesSSOOpen(res *invite.OffboardResult) bool {
-	if !res.Applied {
-		return false
+func printSSOWarning(res *invite.OffboardResult, remedy string) {
+	verb := "would be revoked"
+	if res.Applied {
+		verb = "was revoked"
 	}
-	var switchyardRevoked, cloudflareStands bool
+	fmt.Fprintf(os.Stderr, "\nNote: Switchyard %s, but their Cloudflare Access grant stands.\n", verb)
+	fmt.Fprintln(os.Stderr, "Revoking tokens removes API access; the sign-in is gated by the Access")
+	fmt.Fprintf(os.Stderr, "group, so they could still log in. %s\n", remedy)
+}
+
+// ssoState is why (or whether) a Cloudflare Access grant is left standing.
+type ssoState int
+
+const (
+	ssoClosed        ssoState = iota // nothing left open
+	ssoOpenScopedOut                 // --to excluded it; naming it would fix this
+	ssoOpenCantClose                 // in scope, but the connector can't act
+)
+
+// leavesSSOOpen reports the partial offboard that reads as complete and isn't:
+// Switchyard revoked while a live Cloudflare Access grant survives.
+//
+// Two things this must get right, both learned the hard way. It fires on the
+// *preview* as well as the apply — a warning about an irreversible step is worth
+// least after the step. And it fires only when there is an active cloudflare
+// account still standing: if the person has no such row, nothing is open and the
+// remedy it suggests would be a provable no-op, which teaches the operator to
+// ignore the warning that matters.
+func leavesSSOOpen(res *invite.OffboardResult) ssoState {
+	// "Closing" means the access will be gone when this run is done — already
+	// applied on a real run, or slated to be on a preview. Reading Applied alone
+	// would make every preview look like it left everything open.
+	closing := func(f invite.OffboardFinding) bool {
+		if res.Applied {
+			return f.Applied
+		}
+		return f.Action == invite.ActionRevoke
+	}
+
+	var switchyardClosing, cloudflareStuck bool
 	for _, f := range res.Findings {
 		switch f.ServiceKey {
 		case "switchyard":
-			switchyardRevoked = f.Applied
+			switchyardClosing = closing(f)
 		case "cloudflare":
-			cloudflareStands = !f.Applied && f.Action != invite.ActionNothingToDo
+			// NothingToDo means there is no grant to close, so nothing is left
+			// open — warning there would prescribe a provable no-op.
+			cloudflareStuck = !closing(f) && f.Action != invite.ActionNothingToDo
 		}
 	}
-	// An unscoped run reports on cloudflare too, so "not mentioned at all" means
-	// the operator scoped it out — which is exactly the case worth flagging.
-	mentioned := false
-	for _, f := range res.Findings {
-		if f.ServiceKey == "cloudflare" {
-			mentioned = true
+	if !switchyardClosing {
+		return ssoClosed
+	}
+	// A cloudflare grant scoped out by --to produces no finding at all, which is
+	// precisely the case this warning is for. SkippedActive is what tells it
+	// apart from the person simply never having had one — and it is a different
+	// state from "in scope and unfixable", because only one of them has a remedy
+	// the operator can type.
+	for _, key := range res.SkippedActive {
+		if key == "cloudflare" {
+			return ssoOpenScopedOut
 		}
 	}
-	return switchyardRevoked && (cloudflareStands || !mentioned)
+	if cloudflareStuck {
+		return ssoOpenCantClose
+	}
+	return ssoClosed
 }
 
 // offboardExit reports whether access is actually gone.
@@ -157,7 +231,8 @@ func leavesSSOOpen(res *invite.OffboardResult) bool {
 // wasn't.
 func offboardExit(res *invite.OffboardResult) int {
 	c := res.Counts()
-	if c[invite.ActionFailed] > 0 || c[invite.ActionUnavailable] > 0 {
+	if c[invite.ActionFailed] > 0 || c[invite.ActionUnavailable] > 0 ||
+		c[invite.ActionRevokedNotRecorded] > 0 {
 		return 1
 	}
 	return 0

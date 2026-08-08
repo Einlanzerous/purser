@@ -85,6 +85,25 @@ func (c *Connector) configured() bool {
 	return c.cfg.APIToken != "" && c.cfg.AccountID != "" && c.cfg.GroupID != ""
 }
 
+// CanDeprovision reports whether the Access group can be edited, answerable from
+// config alone — so the offboard preview says "unavailable" for an unconfigured
+// Cloudflare rather than promising a revoke that --apply then declines.
+//
+// ErrRevokeUnavailable, not a plain error: an unconfigured connector did not
+// break, and this is the one service whose manual fallback is a single dashboard
+// click, so the operator note should send them there rather than hunting a bug.
+func (c *Connector) CanDeprovision() error {
+	if c.configured() {
+		return nil
+	}
+	group := c.cfg.GroupName
+	if group == "" {
+		group = "the Allow-by-email Access policy"
+	}
+	return fmt.Errorf("%w: drop them from %s in the Cloudflare Zero Trust dashboard (Access → Policies)",
+		connector.ErrRevokeUnavailable, group)
+}
+
 // otpNote is the sign-in guidance shown to the invited person.
 func (c *Connector) otpNote(email string) string {
 	apps := c.cfg.AppsNote
@@ -232,14 +251,8 @@ func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
 	// manual step is the one that actually closes the access. It used to report
 	// as a plain failure here, so the one connector whose manual fallback is a
 	// single dashboard click was also the one that looked broken (PRSR-17).
-	if !c.configured() {
-		group := c.cfg.GroupName
-		if group == "" {
-			group = "the Allow-by-email Access policy"
-		}
-		return fmt.Errorf(
-			"%w: remove %s from %s in the Cloudflare Zero Trust dashboard (Access → Policies)",
-			connector.ErrPending, strings.ToLower(strings.TrimSpace(in.Email)), group)
+	if err := c.CanDeprovision(); err != nil {
+		return fmt.Errorf("%w — remove %s by hand", err, strings.ToLower(strings.TrimSpace(in.Email)))
 	}
 	email := strings.ToLower(strings.TrimSpace(in.Email))
 	c.groupMu.Lock()

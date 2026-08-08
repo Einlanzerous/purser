@@ -51,6 +51,16 @@ const (
 	// active, because recording a revoke that didn't happen is the one outcome
 	// worse than the failure itself.
 	ActionFailed OffboardAction = "failed"
+	// ActionRevokedNotRecorded — the connector revoked and the database write
+	// that records it did not land.
+	//
+	// Its own state, not a flavour of failed, because the two point opposite
+	// ways: failed means access is probably still live, this means it is
+	// definitely gone and Purser's records disagree. Telling an operator to
+	// "check whether they still have access" when the answer is no wastes the
+	// one thing the report is for. Re-running fixes it — the revoke is
+	// idempotent — so the advice differs too.
+	ActionRevokedNotRecorded OffboardAction = "revoked-not-recorded"
 )
 
 // OffboardFinding is one service's verdict.
@@ -84,6 +94,12 @@ type OffboardResult struct {
 	Person   model.Person
 	Findings []OffboardFinding
 	Applied  bool
+	// SkippedActive names services the person still holds an *active* account in
+	// that --to excluded, so a scoped run can say what it left behind. A finding
+	// cannot carry this: an out-of-scope service produces no finding at all, so
+	// "not in the table" is ambiguous between "they never had it" and "you
+	// scoped it out" — and those need opposite advice.
+	SkippedActive []string
 }
 
 // Counts summarizes findings by action, for a one-line summary.
@@ -147,13 +163,17 @@ func (s *Service) Offboard(ctx context.Context, req OffboardRequest) (*OffboardR
 	res := &OffboardResult{Person: person, Applied: req.Apply}
 	for _, a := range accounts {
 		if want != nil && !want[a.ServiceKey] {
+			if a.Status == model.AccountActive {
+				res.SkippedActive = append(res.SkippedActive, a.ServiceKey)
+			}
 			continue
 		}
-		f, err := s.offboardOne(ctx, astore, person, a, req.Apply)
-		if err != nil {
-			return nil, err // infrastructure (DB) error, not a connector one
-		}
-		res.Findings = append(res.Findings, f)
+		// offboardOne never returns an error: once a revoke has landed upstream,
+		// aborting would discard every finding accumulated so far and leave the
+		// operator with one error line and no idea what was already taken away.
+		// Failures are folded into the finding instead, so the report always
+		// survives to be printed.
+		res.Findings = append(res.Findings, s.offboardOne(ctx, astore, person, a, req.Apply))
 	}
 
 	// A service named explicitly but never held still gets a line. Silence would
@@ -167,7 +187,10 @@ func (s *Service) Offboard(ctx context.Context, req OffboardRequest) (*OffboardR
 }
 
 // offboardOne revokes a single service, or reports what it would revoke.
-func (s *Service) offboardOne(ctx context.Context, astore AuditStore, p model.Person, a store.AccountRecord, apply bool) (OffboardFinding, error) {
+//
+// It returns no error by design: every outcome is a finding, including the ones
+// that would traditionally abort. See the call site.
+func (s *Service) offboardOne(ctx context.Context, astore AuditStore, p model.Person, a store.AccountRecord, apply bool) OffboardFinding {
 	f := OffboardFinding{
 		ServiceKey: a.ServiceKey, DisplayName: a.DisplayName,
 		Username: a.Username, ExternalID: a.ExternalID,
@@ -178,7 +201,7 @@ func (s *Service) offboardOne(ctx context.Context, astore AuditStore, p model.Pe
 	// be a connector call that cannot change anything.
 	if a.Status != model.AccountActive {
 		f.Action = ActionNothingToDo
-		return f, nil
+		return f
 	}
 
 	conn, ok := s.registry.Get(a.ServiceKey)
@@ -188,12 +211,22 @@ func (s *Service) offboardOne(ctx context.Context, astore AuditStore, p model.Pe
 		// the access is real and Purser can't reach it.
 		f.Action = ActionUnavailable
 		f.Err = fmt.Sprintf("no connector registered for %q in this build", a.ServiceKey)
-		return f, nil
+		return f
+	}
+
+	// Ask before promising. Argosy's Deprovision is an unconditional refusal and
+	// so is every Unavailable stub, so a preview that said "revoke" here would
+	// promise what --apply then declines — breaking the one property that makes a
+	// preview worth having on a command you cannot take back. CanDeprovision
+	// answers from config and capability alone, contacting nothing.
+	if err := connector.CanDeprovision(conn); err != nil {
+		f.Action, f.Err = ActionUnavailable, err.Error()
+		return f
 	}
 
 	f.Action = ActionRevoke
 	if !apply {
-		return f, nil // dry run: no connector call at all
+		return f // dry run: no connector call at all
 	}
 
 	err := conn.Deprovision(ctx, connector.Input{
@@ -204,31 +237,30 @@ func (s *Service) offboardOne(ctx context.Context, astore AuditStore, p model.Pe
 		ExternalID: a.ExternalID,
 	})
 	switch {
-	case errors.Is(err, connector.ErrPending):
+	case connector.IsUnavailable(err):
 		f.Action, f.Err = ActionUnavailable, err.Error()
-		return f, nil
+		return f
 	case err != nil:
 		// The record stays active. Marking it deprovisioned here would tell every
 		// later reader — the audit, `person show`, the next invite's skip — that
 		// access was removed when it wasn't, and that lie survives long after the
 		// error message scrolls away.
 		f.Action, f.Err = ActionFailed, err.Error()
-		return f, nil
+		return f
 	}
 
-	svc, err := s.store.ServiceByKey(ctx, a.ServiceKey)
-	if err != nil {
-		return f, err
-	}
-	acct, err := s.store.AccountFor(ctx, p.ID, svc.ID)
-	if err != nil {
-		return f, err
-	}
-	if err := astore.UpdateAccountStatus(ctx, acct.ID, model.AccountDeprovisioned); err != nil {
-		return f, err
+	// The account id came back with the record, so there is no re-read here.
+	if err := astore.UpdateAccountStatus(ctx, a.ID, model.AccountDeprovisioned); err != nil {
+		// Upstream access is gone; only the bookkeeping failed. Reported as its
+		// own state rather than as a failure, and emphatically not swallowed: the
+		// row still reads active, so every later reader thinks they have access
+		// they don't. Re-running fixes it, since the revoke is idempotent.
+		f.Action = ActionRevokedNotRecorded
+		f.Err = err.Error()
+		return f
 	}
 	f.Applied = true
-	return f, nil
+	return f
 }
 
 // unheldFindings reports the explicitly-named services the person holds no
@@ -287,6 +319,20 @@ func RenderOffboardNote(res *OffboardResult) string {
 			}
 		}
 		b.WriteString("Re-run to retry; it acts only on what is still active.\n")
+	}
+	if c[ActionRevokedNotRecorded] > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		// Deliberately the opposite advice from the failure block above: the
+		// access is gone, and it is Purser's own records that are now wrong.
+		b.WriteString("Revoked upstream, but NOT recorded — access is gone, Purser's records still say active:\n")
+		for _, f := range res.Findings {
+			if f.Action == ActionRevokedNotRecorded {
+				fmt.Fprintf(&b, "  - %s: %s\n", f.DisplayName, f.Err)
+			}
+		}
+		b.WriteString("Re-run to fix the records; the revoke itself is idempotent.\n")
 	}
 	return b.String()
 }

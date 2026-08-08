@@ -323,6 +323,9 @@ which is a stronger guard than the `--all` flag `reconcile` needs.
 | `lyceum` | **deleted** — `DELETE /admin/users/{id}` is the only operation its admin API has |
 | `argosy` | **nothing** — no delete or disable endpoint exists; reported `unavailable` |
 
+The preview knows this in advance — a connector that can't revoke says so without
+being called, so the dry run never promises what `--apply` would decline.
+
 Lyceum is called out because it is the exception, and Argosy because it is the
 gap. An Argosy account is reported as still open rather than quietly skipped:
 
@@ -344,8 +347,10 @@ happen is worse than the failure: the error scrolls away, and the audit,
 that says access was removed while it is still live.
 
 **The row is marked, never deleted**, so what someone held — and when it was taken
-away — survives the offboarding. `person list` hides it and says so; `person show`
-displays it in full.
+away — survives the offboarding. That last part needed its own column:
+`updated_at` is bumped by the next re-invite, so `deprovisioned_at` (migration
+0006) records the revocation durably and is never cleared. `person list` hides
+the row and says so; `person show` displays it with a REVOKED date.
 
 > **One thing to know:** revoking Switchyard tokens removes *API* access. The
 > sign-in is gated by the Cloudflare Access group, so an offboard that skips

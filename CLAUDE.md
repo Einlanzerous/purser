@@ -118,24 +118,51 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   the error message — the audit, `person show`, and the next invite's idempotency
   skip all read that column and would report access as removed while it is live.
   For the same reason `offboard` exits non-zero on `unavailable`, the opposite of
-  `invite`, where nothing was granted and waiting harms nobody.
+  `invite`, where nothing was granted and waiting harms nobody. The inverse has
+  its own state too: `revoked-not-recorded` means the connector succeeded and the
+  write didn't, so access *is* gone and Purser's records are wrong — the opposite
+  advice from `failed`, which is why they aren't one status.
+- **The preview must not promise what `--apply` refuses.** Argosy's `Deprovision`
+  is an unconditional refusal and so is every `Unavailable` stub, so a dry run
+  that reported `revoke` for them would break the property that makes previewing
+  worthwhile. `connector.CanDeprovision` answers from capability and config
+  alone, contacting nothing; a connector that knows it can't act implements
+  `RevokeChecker` and its `Deprovision` delegates to the same answer so the two
+  cannot drift.
+- **`ErrRevokeUnavailable` is the revoke-path twin of `ErrPending`.** Same
+  bucket — match with `connector.IsUnavailable` — but "provisioning not yet
+  available" is the wrong sentence on an offboard, and `ErrPending`'s text can't
+  be reworded because migration 0004's backfill matches it as a literal prefix.
+- **A 404 against a *recorded* `external_id` is a wrong record, not absent
+  access.** Both Switchyard and Lyceum fall back to the email lookup and revoke
+  what that finds. Treating it as "nothing to revoke" marks the account
+  deprovisioned while the real user's access stays live, and the next run skips
+  it — silent and permanent, unlike a failure. Lyceum has a second trap: its
+  `Provision` 409 branch records the *email* in `external_id`, and its DELETE
+  handler `ParseInt`s the path, so a non-numeric id must resolve by lookup
+  instead.
 - **`Deprovision` means revoke, not delete — except Lyceum.** Switchyard revokes
   tokens and keeps the user, because deleting would take their authored tickets
   with it; Cloudflare drops the email from the Access group. Lyceum's admin
   surface offers only `DELETE /admin/users/{id}`, so there the two collapse — say
   so rather than letting the interface's wording imply a reversibility it hasn't
-  got. Argosy has no endpoint at all and returns `ErrPending`, so a three-of-four
+  got. Argosy has no endpoint at all and returns `ErrRevokeUnavailable`, so a three-of-four
   offboard reports honestly instead of claiming what it didn't do.
 - **Revoking Switchyard does not close its door.** Its tokens gate the API; the
   SSO login is gated by the *Cloudflare Access group*, so an offboard that skips
   `cloudflare` leaves a working sign-in behind while looking finished. The CLI
   says this outright when it happens. Don't remove that warning without removing
   the asymmetry that makes it true.
-- **The `account` row is marked, never deleted.** Deprovisioning keeps the record
-  of what someone held and when it was taken away — deleting it would destroy the
-  history the audit exists to read *and* silently re-arm provisioning, since the
-  idempotency skip keys on an active account and a missing row means the opposite
-  of a deprovisioned one.
+- **The `account` row is marked, never deleted**, and `deprovisioned_at`
+  (migration 0006) is what makes "when was it taken away" durable. `status` +
+  `updated_at` looked like enough and wasn't: `UpsertAccount` sets active and
+  bumps `updated_at`, so the next invite erased both — and re-inviting someone is
+  ordinary. The column is written on the transition into `deprovisioned` and
+  never cleared, so an *active* row may still carry one; read `status` for the
+  current state. Deleting the row instead would destroy the history the audit
+  exists to read *and* silently re-arm provisioning, since the idempotency skip
+  keys on an active account and a missing row means the opposite of a
+  deprovisioned one.
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
   plaintext lives only in the returned/emailed credential block.
 - **The roster reads records, and cannot read a secret.** `person list` /

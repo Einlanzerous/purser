@@ -208,11 +208,15 @@ func printPersonDetail(d *invite.PersonDetail) {
 
 	fmt.Println("\nACCOUNTS")
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SERVICE\tSTATUS\tUSERNAME\tEXTERNAL ID\tRECORDED\tUPDATED")
+	fmt.Fprintln(w, "SERVICE\tSTATUS\tUSERNAME\tEXTERNAL ID\tRECORDED\tUPDATED\tREVOKED")
 	for _, a := range d.Accounts {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		revoked := dash
+		if a.DeprovisionedAt != nil {
+			revoked = a.DeprovisionedAt.Format(dateFormat)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			a.ServiceKey, a.Status, orDash(a.Username), orDash(a.ExternalID),
-			a.CreatedAt.Format(dateFormat), a.UpdatedAt.Format(dateFormat))
+			a.CreatedAt.Format(dateFormat), a.UpdatedAt.Format(dateFormat), revoked)
 	}
 	if len(d.Accounts) == 0 {
 		fmt.Fprintln(w, "(none recorded)")
@@ -310,6 +314,10 @@ type accountDTO struct {
 	ExternalID  string    `json:"external_id,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	// DeprovisionedAt is when access was last revoked; absent if never. It
+	// survives a re-provision on purpose (migration 0006), so an active account
+	// may still carry one — read status for the current state.
+	DeprovisionedAt *time.Time `json:"deprovisioned_at,omitempty"`
 }
 
 type inviteDTO struct {
@@ -376,6 +384,8 @@ func newAccountDTOs(accounts []store.AccountRecord) []accountDTO {
 			ExternalID:  a.ExternalID,
 			CreatedAt:   a.CreatedAt,
 			UpdatedAt:   a.UpdatedAt,
+
+			DeprovisionedAt: a.DeprovisionedAt,
 		})
 	}
 	return out

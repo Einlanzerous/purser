@@ -23,6 +23,51 @@ import (
 // 0004's one-shot backfill, so changing its text is a schema-adjacent edit.
 var ErrPending = errors.New("connector: provisioning not yet available")
 
+// ErrRevokeUnavailable is Deprovision's counterpart to ErrPending: the connector
+// is registered but cannot revoke — its upstream has no delete, disable, or
+// token-invalidation endpoint, or its credential isn't configured.
+//
+// It exists as a separate sentinel purely so the *message* can be right.
+// ErrPending's text is "provisioning not yet available", which is nonsense on an
+// offboard, and it cannot be reworded: migration 0004's one-shot backfill matches
+// that string as a literal prefix, so its wording is schema-adjacent. Callers
+// that bucket by outcome should accept either — see IsUnavailable — since both
+// mean the same thing to the orchestrator (model.TaskUnavailable) and differ only
+// in which half of the lifecycle they are describing.
+var ErrRevokeUnavailable = errors.New("connector: revoking not yet available")
+
+// IsUnavailable reports whether err is either "not built yet" sentinel. Use it
+// instead of matching one, so a connector that reaches for the wrong half of the
+// pair is still bucketed correctly rather than reported as a breakage.
+func IsUnavailable(err error) bool {
+	return errors.Is(err, ErrPending) || errors.Is(err, ErrRevokeUnavailable)
+}
+
+// RevokeChecker is an optional interface a Connector implements to answer "could
+// you revoke, if asked?" without calling anything upstream.
+//
+// The offboard preview needs this. Argosy's Deprovision is an unconditional
+// ErrRevokeUnavailable and an Unavailable stub's always is too, so a dry run that
+// reported "revoke" for them would promise something --apply then refuses — and
+// "the preview is exactly what the apply does" is the property that makes a
+// preview worth having on the one command you cannot take back.
+//
+// A connector that does not implement it is assumed able; only connectors that
+// know they cannot need to say so.
+type RevokeChecker interface {
+	// CanDeprovision returns nil when Deprovision could act, or an error
+	// (normally wrapping ErrRevokeUnavailable) explaining why it could not.
+	CanDeprovision() error
+}
+
+// CanDeprovision asks c whether it could revoke, without contacting upstream.
+func CanDeprovision(c Connector) error {
+	if rc, ok := c.(RevokeChecker); ok {
+		return rc.CanDeprovision()
+	}
+	return nil
+}
+
 // ErrReconcileUnsupported is returned by Reconcile when the target system has
 // no way to look a person up without creating them — i.e. the only "does this
 // account exist?" signal available is a 409 from the create endpoint, which is

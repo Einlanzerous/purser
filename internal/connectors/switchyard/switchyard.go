@@ -420,7 +420,7 @@ func (c *Connector) Reconcile(ctx context.Context, in connector.Input) (connecto
 // a re-run finds nothing to do and succeeds. A person with no Switchyard user at
 // all is also a success — there is no access to take away.
 func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
-	userID, err := c.resolveUserID(ctx, in)
+	userID, recorded, err := c.resolveUserID(ctx, in)
 	if err != nil {
 		return err
 	}
@@ -428,17 +428,43 @@ func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
 		return nil // no such user upstream; nothing to revoke
 	}
 
-	tokens, err := c.liveTokens(ctx, userID)
+	tokens, found, err := c.liveTokens(ctx, userID)
 	if err != nil {
 		return err
 	}
-	for _, t := range tokens {
-		status, raw, err := c.do(ctx, http.MethodDelete, "/v1/users/"+userID+"/tokens/"+t.ID, "", nil)
+	// A 404 against the id Purser *recorded* does not mean "no access" — it means
+	// the record is wrong. Treating it as success would mark the account
+	// deprovisioned while the real user's tokens stay live, and the next run would
+	// skip them: silent, permanent, and worse than a failure. So fall back to the
+	// email lookup, which is the authority, and revoke whatever that finds.
+	if !found && recorded {
+		looked, _, err := c.lookupUserID(ctx, in)
 		if err != nil {
 			return err
 		}
-		// 404 means someone else revoked it between the list and here, which is
-		// the outcome we wanted anyway.
+		if looked == "" {
+			return nil // genuinely no user upstream
+		}
+		if looked == userID {
+			return fmt.Errorf("switchyard: user %s vanished between lookup and token read", userID)
+		}
+		userID = looked
+		if tokens, found, err = c.liveTokens(ctx, userID); err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("switchyard: user %s has no token list", userID)
+		}
+	}
+
+	for _, t := range tokens {
+		path := "/v1/users/" + url.PathEscape(userID) + "/tokens/" + url.PathEscape(t.ID)
+		status, raw, err := c.do(ctx, http.MethodDelete, path, "", nil)
+		if err != nil {
+			return err
+		}
+		// 404 here means someone else revoked it between the list and now, which
+		// is the outcome we wanted anyway.
 		if status != http.StatusNoContent && status != http.StatusOK && status != http.StatusNotFound {
 			return apiError("revoke token "+t.ID, status, raw)
 		}
@@ -454,21 +480,26 @@ func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
 // empty, and a display-name match on this path would revoke a same-named
 // stranger's tokens. So the empty address is refused rather than guessed at,
 // exactly as Reconcile refuses it.
-func (c *Connector) resolveUserID(ctx context.Context, in connector.Input) (string, error) {
+// It also reports whether the id came from the record, so the caller can tell a
+// wrong record from a genuinely absent user when the id turns out not to exist.
+func (c *Connector) resolveUserID(ctx context.Context, in connector.Input) (id string, recorded bool, err error) {
 	if id := strings.TrimSpace(in.ExternalID); id != "" {
-		return id, nil
+		return id, true, nil
 	}
+	id, _, err = c.lookupUserID(ctx, in)
+	return id, false, err
+}
+
+// lookupUserID finds the user by email, refusing to answer without one.
+func (c *Connector) lookupUserID(ctx context.Context, in connector.Input) (string, bool, error) {
 	if strings.TrimSpace(in.Email) == "" {
-		return "", errors.New("switchyard: an email is required to deprovision")
+		return "", false, errors.New("switchyard: an email is required to deprovision")
 	}
 	u, found, err := c.findUser(ctx, in.PersonName, in.Email)
-	if err != nil {
-		return "", err
+	if err != nil || !found {
+		return "", false, err
 	}
-	if !found {
-		return "", nil
-	}
-	return u.ID, nil
+	return u.ID, true, nil
 }
 
 // token is one API token as the list endpoint reports it. RevokedAt is the field
@@ -479,31 +510,33 @@ type token struct {
 	RevokedAt *string `json:"revoked_at"`
 }
 
-// liveTokens lists the user's tokens that have not already been revoked.
-func (c *Connector) liveTokens(ctx context.Context, userID string) ([]token, error) {
-	status, raw, err := c.do(ctx, http.MethodGet, "/v1/users/"+userID+"/tokens", "", nil)
+// liveTokens lists the user's tokens that have not already been revoked. found
+// is false when the user id itself is unknown upstream — reported separately
+// from "no live tokens", because those mean opposite things about the record.
+func (c *Connector) liveTokens(ctx context.Context, userID string) (live []token, found bool, err error) {
+	status, raw, err := c.do(ctx, http.MethodGet, "/v1/users/"+url.PathEscape(userID)+"/tokens", "", nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if status == http.StatusNotFound {
-		return nil, nil // user vanished under us; nothing to revoke
+		return nil, false, nil
 	}
 	if status != http.StatusOK {
-		return nil, apiError("list tokens", status, raw)
+		return nil, false, apiError("list tokens", status, raw)
 	}
 	var list struct {
 		Items []token `json:"items"`
 	}
 	if err := json.Unmarshal(raw, &list); err != nil {
-		return nil, fmt.Errorf("switchyard: decode token list: %w", err)
+		return nil, false, fmt.Errorf("switchyard: decode token list: %w", err)
 	}
-	live := make([]token, 0, len(list.Items))
+	live = make([]token, 0, len(list.Items))
 	for _, t := range list.Items {
 		if t.RevokedAt == nil {
 			live = append(live, t)
 		}
 	}
-	return live, nil
+	return live, true, nil
 }
 
 // do performs a JSON request against the Switchyard API and returns the status

@@ -425,10 +425,22 @@ leaves the account standing. Revoking is reversible, it preserves authorship, an
 Lyceum is documented as deleting rather than being quietly folded in, because the
 interface's gentler wording would otherwise imply a reversibility it hasn't got.
 
-Argosy returns `ErrPending`, recorded as `TaskUnavailable`. That is PRSR-21
-earning its keep: a three-of-four offboard reports "three revoked, one still
-open and needing a hand" instead of either looking broken or — far worse —
+Argosy returns `ErrRevokeUnavailable`, bucketed exactly like `ErrPending`. That
+is PRSR-21 earning its keep: a three-of-four offboard reports "three revoked, one
+still open and needing a hand" instead of either looking broken or — far worse —
 claiming success. It is also why this shipped without waiting on an ARGY endpoint.
+
+The separate sentinel exists only so the *sentence* is right: `ErrPending` reads
+"provisioning not yet available", which is nonsense on an offboard, and its text
+cannot be reworded because migration `0004`'s backfill matches it as a literal
+prefix. Callers bucket with `connector.IsUnavailable`, which accepts either.
+
+A connector that cannot revoke also says so *without being called*, via the
+optional `RevokeChecker` interface. The offboard preview needs that: Argosy's
+`Deprovision` is an unconditional refusal and so is every `Unavailable` stub, so
+a dry run reporting "revoke" for them would promise what `--apply` declines —
+breaking the one property that makes previewing worth doing. Each such connector's
+`Deprovision` delegates to its own `CanDeprovision`, so the two cannot drift.
 
 ### Two things that must not collapse
 
@@ -438,6 +450,23 @@ claiming success. It is also why this shipped without waiting on an ARGY endpoin
 read forever after by the audit, by `person show`, and by the next invite's
 idempotency skip. Recording a revoke that didn't happen tells all three that
 access was removed while it is live.
+
+The inverse is its own state, `revoked-not-recorded`: the connector succeeded and
+the database write didn't. Access *is* gone and Purser's records are wrong, which
+is the opposite of a failure and needs the opposite advice — so they are not one
+status, and a write failure mid-run no longer aborts the report. Aborting used to
+discard every finding accumulated so far, leaving the operator one error line and
+no idea what had already been taken away.
+
+The same rule reaches into the connectors. A 404 against the `external_id` Purser
+*recorded* means the record is wrong, not that access is absent; both Switchyard
+and Lyceum fall back to the email lookup and revoke what that finds. Reporting
+success there would mark the row `deprovisioned` while the real account stays
+live, and the next run would skip it — silent and permanent, where a failure at
+least announces itself. Lyceum carries a second trap: `Provision`'s 409 branch
+records the *email* in `external_id`, and its DELETE handler `ParseInt`s the path
+segment, so anyone who already had a Lyceum account when they were invited was
+permanently un-offboardable until a non-numeric id was made to resolve by lookup.
 
 **Revoking Switchyard does not close Switchyard's door.** Its tokens gate the
 API. The sign-in is gated by the *Cloudflare Access group*, which is a different
@@ -454,6 +483,15 @@ orchestrator's skip keys on an *active* account, so a missing row and a
 deprovisioned one mean opposite things to the next invite. Marking it is also
 what finally makes `deprovisioned` a state something writes, and `person list`
 hides it by default while reporting the count.
+
+Marking alone turned out not to be enough. `status` plus `updated_at` is erased
+by the next `UpsertAccount` — which sets active and bumps the timestamp — so a
+re-invite, an ordinary thing to do, destroyed the answer to "when was it taken
+away". Migration `0006` adds `deprovisioned_at`, written on the transition into
+`deprovisioned` and never cleared. A re-provisioned account keeps the date it was
+last revoked, because that is history and history doesn't stop having happened;
+read `status` for the current state and this for the last revocation. `person
+show` renders it as a REVOKED column.
 
 ## Delivery
 

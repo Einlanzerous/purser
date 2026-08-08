@@ -270,7 +270,18 @@ func TestDeprovision_ReportsUnavailableNotSuccess(t *testing.T) {
 	if err == nil {
 		t.Fatal("Deprovision must not report success — the account is still there")
 	}
-	if !errors.Is(err, connector.ErrPending) {
-		t.Errorf("err = %v, want it to wrap connector.ErrPending", err)
+	// ErrRevokeUnavailable, not ErrPending: same bucket for the orchestrator, but
+	// "provisioning not yet available" is the wrong sentence on an offboard, and
+	// ErrPending's text can't be reworded (migration 0004 matches it literally).
+	if !errors.Is(err, connector.ErrRevokeUnavailable) {
+		t.Errorf("err = %v, want it to wrap connector.ErrRevokeUnavailable", err)
+	}
+	if !connector.IsUnavailable(err) {
+		t.Errorf("err = %v must bucket as unavailable, not as a breakage", err)
+	}
+	// The preview asks the same question without calling anything, and the two
+	// must not drift.
+	if got := c.CanDeprovision(); got.Error() != err.Error() {
+		t.Errorf("CanDeprovision = %v, Deprovision = %v — these must agree", got, err)
 	}
 }
