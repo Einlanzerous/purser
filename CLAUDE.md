@@ -250,10 +250,15 @@ shipped the bootstrap fallback and is closed; the hardening is what's left). The
 and that is blocked on SERV-49: the assistant's MCP token holds no
 `users:manage`, so `create_user_token` 403s. Service spin-up is a separate axis,
 not started: epic PRSR-22. Its prereq PRSR-11 was split (2026-08-15) once it
-turned out to gate more than it had to — PRSR-11 is now the CF token scopes
-(Zone→DNS→Edit, Tunnel→Edit **and** Tunnel→Read, the last so a tunnel
-`Reconcile` can stay read-only) plus the zone/tunnel ids and the config plumbing
-that carries them, which is code and is actionable now; PRSR-26 is the spike
-asking whether cloudflared is remotely-managed or driven by a local `config.yml`,
-and it gates only the tunnel connector. The DNS connector is the first build and
-waits on PRSR-11 alone.
+turned out to gate more than it had to, and its **access half is now done** — the
+CF token carries Zone→DNS→Edit (scoped to `zerogravity.industries`) and
+Account→Cloudflare Tunnel→Edit, both probed against the live API, and the zone
+and tunnel ids are recorded on the ticket. Edit subsumes Read in Cloudflare's
+model, so there is no separate read scope to grant: keeping `Reconcile`
+read-only is a constraint on the code, not on the token. What is left of PRSR-11
+is the repo-side plumbing — `PURSER_CF_ZONE_ID` / `PURSER_CF_TUNNEL_ID` through
+`internal/config`, `.env.example`, the deploy compose, and the README's scope
+docs. PRSR-26 asked whether cloudflared is remotely-managed or driven by a local
+`config.yml` and closed done: `source: "cloudflare"`, so the tunnel connector is
+an ordinary API client and no tunnel migration is needed. The DNS connector is
+the first build and waits on PRSR-11's plumbing alone.
