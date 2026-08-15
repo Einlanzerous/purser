@@ -586,6 +586,40 @@ Each connector registers as Unavailable rather than failing when its
 credentials are absent, so a partial config is safe — `--to` a service with no
 credentials reports the gap instead of half-provisioning the person.
 
+### The Cloudflare API token
+
+One token (`PURSER_CF_API_TOKEN`) covers every Cloudflare call. The scopes it
+actually needs, which had drifted from what the docs claimed:
+
+| scope | level | used by |
+|---|---|---|
+| Access: Organizations, Identity Providers, and Groups → Edit | Account | `invite` — the Access group's member list |
+| Access: Apps → Edit | Account | service spin-up |
+| Access: Policies → Edit | Account | service spin-up |
+| Cloudflare Tunnel → Edit | Account | service spin-up — tunnel ingress |
+| DNS → Edit | **Zone**, scoped to the one zone | service spin-up — DNS records |
+
+Only the first is needed to run `invite`; the rest belong to the service
+spin-up axis. **Edit subsumes Read**, so there is no separate Read scope to
+grant — and keeping `reconcile` read-only is a property of the code, not
+something the token enforces.
+
+Three naming traps in the dashboard, all of which cost time at least once:
+
+- **"Account DNS Settings"** and **"Zone DNS Settings"** are both *settings*.
+  **"DNS Views"** is the Internal DNS product. The one that grants records is
+  the plain **DNS** group at **Zone** scope. The first column of each
+  permission row is the scope selector; if it says Account, you're in the wrong
+  family whatever the label reads.
+- Every row's description says *"Grants read access to…"* until you actually
+  select Edit, at which point it updates. The radio is authoritative, not the
+  blurb.
+- **Cloudflare Tunnel** is still **"Argo Tunnel"** in older docs and UI copy.
+
+`GET /user/tokens/verify` returns `success: false` for this token even when
+every functional call succeeds — that endpoint is user-scoped and is not a
+health check here. Probe the real endpoints instead.
+
 ## Development
 
 ```
@@ -611,7 +645,8 @@ Purser is deployed as a container pulled from
    `PURSER_SWITCHYARD_TOKEN`, and (optionally) `PURSER_LYCEUM_OWNER_TOKEN` /
    `PURSER_CF_*` / `PURSER_SMTP_*`. On construct-server, deploys write `.env`
    from the **`PROD_ENV_FILE`** secret on the `home-server` environment — a var
-   added only to the local `.env` is lost on the next deploy.
+   added only to the local `.env` is lost on the next deploy. That applies to
+   every new var, including `PURSER_CF_ZONE_ID` / `PURSER_CF_TUNNEL_ID`.
 4. Paste the `purser:` service from
    [`deploy/construct-server.compose.yml`](deploy/construct-server.compose.yml)
    into `docker-compose.yml`.
