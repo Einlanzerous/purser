@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/Einlanzerous/purser/compare/v0.13.0...v0.14.0) (2026-08-15)
+
+
+### Features
+
+* **config:** carry the Cloudflare zone + tunnel ids (PRSR-11) ([#33](https://github.com/Einlanzerous/purser/issues/33)) ([3354ab9](https://github.com/Einlanzerous/purser/commit/3354ab90b99917d1047014ce9195c87d258d489b))
+
 ## [0.13.0](https://github.com/Einlanzerous/purser/compare/v0.12.0...v0.13.0) (2026-08-08)
 
 
