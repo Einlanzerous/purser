@@ -148,3 +148,30 @@ func TestLauncherURL_DoesNotDoublePrefixAScheme(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_SpinUpIDsFromEnv(t *testing.T) {
+	t.Setenv("PURSER_CF_ZONE_ID", "471930d941a96887211671e1651753f2")
+	t.Setenv("PURSER_CF_TUNNEL_ID", "aef21667-03ce-45d3-b83c-d634822661cd")
+	cf := Load().Cloudflare
+	if cf.ZoneID != "471930d941a96887211671e1651753f2" {
+		t.Errorf("ZoneID = %q", cf.ZoneID)
+	}
+	if cf.TunnelID != "aef21667-03ce-45d3-b83c-d634822661cd" {
+		t.Errorf("TunnelID = %q", cf.TunnelID)
+	}
+}
+
+// Unlike TeamDomain, these two must never acquire a default. That default is
+// already a documented footgun for a link; for a zone id it would be a write —
+// a tenant who sets PURSER_CF_* and forgets the zone would have Purser creating
+// DNS records in this repo's zone rather than their own. Empty is the only safe
+// unset value, and an empty id fails loudly at the API rather than quietly
+// succeeding against the wrong account.
+func TestLoad_SpinUpIDsHaveNoDefault(t *testing.T) {
+	t.Setenv("PURSER_CF_ZONE_ID", "")
+	t.Setenv("PURSER_CF_TUNNEL_ID", "")
+	cf := Load().Cloudflare
+	if cf.ZoneID != "" || cf.TunnelID != "" {
+		t.Errorf("expected no defaults, got ZoneID=%q TunnelID=%q", cf.ZoneID, cf.TunnelID)
+	}
+}

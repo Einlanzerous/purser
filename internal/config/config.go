@@ -171,6 +171,24 @@ type CloudflareConfig struct {
 	TeamDomain string // PURSER_CF_TEAM_DOMAIN
 	AppsNote   string // PURSER_CF_APPS_NOTE
 	Launcher   string // PURSER_LAUNCHER_URL; empty => derived from TeamDomain
+
+	// ZoneID and TunnelID are the service spin-up axis's coordinates (PRSR-22):
+	// the zone DNS records get created in, and the cloudflared tunnel whose
+	// ingress those hostnames route through. The tunnel is remotely-managed
+	// (PRSR-26), so both are reachable over the API.
+	//
+	// Nothing reads them yet — the spin-up connectors aren't built. They are
+	// carried here so the deploy-side plumbing (.env, the PROD_ENV_FILE secret,
+	// the compose file) lands once instead of twice, and they stay out of the
+	// Access connector's Config on purpose: it does not use them, and folding
+	// them into its readiness check would take `--to cloudflare` offline for
+	// every deployment that hasn't set them.
+	//
+	// Neither gets a default, unlike TeamDomain above. They are account-specific
+	// opaque ids, and a wrong one here would have Purser writing DNS records
+	// into somebody else's zone rather than merely rendering a wrong link.
+	ZoneID   string // PURSER_CF_ZONE_ID
+	TunnelID string // PURSER_CF_TUNNEL_ID
 }
 
 // LauncherURL is Cloudflare's App Launcher — the page listing the Access-gated
@@ -239,6 +257,8 @@ func Load() Config {
 			TeamDomain: envOr("PURSER_CF_TEAM_DOMAIN", "zero-gravity-industries.cloudflareaccess.com"),
 			AppsNote:   envOr("PURSER_CF_APPS_NOTE", "Switchyard and the other tunneled Construct apps"),
 			Launcher:   os.Getenv("PURSER_LAUNCHER_URL"),
+			ZoneID:     os.Getenv("PURSER_CF_ZONE_ID"),
+			TunnelID:   os.Getenv("PURSER_CF_TUNNEL_ID"),
 		},
 		Lyceum: LyceumConfig{
 			BaseURL:    envOr("PURSER_LYCEUM_BASE_URL", "http://lyceum:4005"),

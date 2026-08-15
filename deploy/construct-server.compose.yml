@@ -33,6 +33,11 @@
       - PURSER_CF_ACCESS_GROUP_ID=${PURSER_CF_ACCESS_GROUP_ID:-}
       - PURSER_CF_ACCESS_GROUP_NAME=zerogravity-members
       - PURSER_CF_TEAM_DOMAIN=zero-gravity-industries.cloudflareaccess.com
+      # Service spin-up coordinates (PRSR-22). Unread until those connectors
+      # exist; carried now so the env plumbing lands once. Unset changes nothing.
+      # PURSER_CF_TUNNEL_ID is the same value as CLOUDFLARE_TUNNEL_ID.
+      - PURSER_CF_ZONE_ID=${PURSER_CF_ZONE_ID:-}
+      - PURSER_CF_TUNNEL_ID=${PURSER_CF_TUNNEL_ID:-}
       # App Launcher the credential block leads with (Access-granted invites
       # only). Defaults to https:// + the team domain above.
       - PURSER_LAUNCHER_URL=${PURSER_LAUNCHER_URL:-}
