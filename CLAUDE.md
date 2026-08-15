@@ -245,7 +245,15 @@ Open, in rough priority order: nothing runs the audit on a schedule (PRSR-18).
 Argosy has no delete or disable endpoint, so it is the one service `offboard`
 cannot close (ARGY ticket pending). Purser still authenticates to Switchyard as
 the instance bootstrap token rather than a dedicated one (PRSR-25 — PRSR-3
-shipped the bootstrap fallback and is closed; the hardening is what's left).
-Service spin-up is a separate axis, not started: epic PRSR-22, gated on its
-prereq PRSR-11 (a tunnel config-management decision plus CF token scopes —
-neither is code).
+shipped the bootstrap fallback and is closed; the hardening is what's left). The
+`purser` agent user exists now, so all that remains there is minting its token,
+and that is blocked on SERV-49: the assistant's MCP token holds no
+`users:manage`, so `create_user_token` 403s. Service spin-up is a separate axis,
+not started: epic PRSR-22. Its prereq PRSR-11 was split (2026-08-15) once it
+turned out to gate more than it had to — PRSR-11 is now the CF token scopes
+(Zone→DNS→Edit, Tunnel→Edit **and** Tunnel→Read, the last so a tunnel
+`Reconcile` can stay read-only) plus the zone/tunnel ids and the config plumbing
+that carries them, which is code and is actionable now; PRSR-26 is the spike
+asking whether cloudflared is remotely-managed or driven by a local `config.yml`,
+and it gates only the tunnel connector. The DNS connector is the first build and
+waits on PRSR-11 alone.
