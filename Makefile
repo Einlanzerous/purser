@@ -1,8 +1,18 @@
 SHELL := /bin/bash
 GO ?= go
 BIN := bin/purser
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X github.com/Einlanzerous/purser/internal/version.Version=$(VERSION)
+# `sed 's/^v//'` is not cosmetic (PRSR-32). `git describe` returns the tag as
+# written — `v0.14.0` — and that string is what /healthz would then report,
+# while the image label carries the BARE `0.14.0` that metadata-action stamps.
+# Switchyard compares the two with strict equality, so a "v" here is a permanent
+# `claimed_not_confirmed` row. Stripping it locally keeps the form identical
+# everywhere the version is produced, which is the only way that comparison
+# stays honest.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
+COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
+LDFLAGS := -s -w \
+	-X github.com/Einlanzerous/purser/internal/version.Version=$(VERSION) \
+	-X github.com/Einlanzerous/purser/internal/version.Commit=$(COMMIT)
 IMAGE ?= ghcr.io/einlanzerous/purser
 
 .PHONY: all build run invite test test-db vet fmt tidy lint docker-build clean help
@@ -42,7 +52,9 @@ lint: ## golangci-lint (falls back to go vet)
 	@which golangci-lint >/dev/null 2>&1 && golangci-lint run || $(GO) vet ./...
 
 docker-build: ## Build the production image
-	docker build -f deploy/Dockerfile --build-arg VERSION=$(VERSION) -t $(IMAGE):latest .
+	docker build -f deploy/Dockerfile \
+		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(COMMIT) \
+		-t $(IMAGE):latest .
 
 clean: ## Remove build artifacts
 	rm -rf bin

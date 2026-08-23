@@ -17,6 +17,7 @@ import (
 	"github.com/Einlanzerous/purser/internal/invite"
 	"github.com/Einlanzerous/purser/internal/model"
 	"github.com/Einlanzerous/purser/internal/store"
+	"github.com/Einlanzerous/purser/internal/version"
 )
 
 // Server serves the Purser HTTP API.
@@ -44,8 +45,56 @@ func (s *Server) Handler() *http.ServeMux {
 	return mux
 }
 
+// healthResponse is the body of `GET /healthz`.
+//
+// ── Why this grew a version and a sha (PRSR-32) ────────────────────────────
+//
+// Switchyard's delivery reconciler polls this endpoint and records what is
+// actually running, which is the observed half of the estate's delivery ledger
+// (SWY-192 defines the contract; SERV-128 owns the rollout across services).
+// Before these two fields purser probed as `no_version`: reachable and
+// speaking, but unable to say WHICH build was speaking — so no deploy of purser
+// could ever be corroborated.
+//
+// The field names and types are the contract, not a local choice:
+//
+//	version  bare semver ("0.14.0") or the literal "dev". Never a "v" prefix —
+//	         it is compared with strict equality against the image's
+//	         org.opencontainers.image.version label, which docker's
+//	         metadata-action stamps bare. A prefix here files every deploy
+//	         report as `claimed_not_confirmed`, permanently.
+//	sha      the full 40-char commit, or JSON null. Never abbreviated: the
+//	         cross-service comparison is an equality test, not a prefix match.
+//
+// A struct rather than the previous map[string]string, because `sha` has to be
+// able to marshal as null and a map of strings cannot express that.
+type healthResponse struct {
+	Status  string  `json:"status"`
+	Service string  `json:"service"`
+	Version string  `json:"version"`
+	SHA     *string `json:"sha"`
+}
+
+// handleHealth answers the liveness probe and the build-identity contract.
+//
+// Deliberately does not consult Postgres or any upstream connector. Liveness and
+// readiness answer different questions, and a liveness probe that fails on a
+// degraded dependency gets the container killed and restarted at exactly the
+// moment somebody wants to look at it.
+//
+// That is also why there is only a 200 path here rather than the 200/503 pair
+// the contract permits. The contract's rule is that a 503 must carry the SAME
+// body shape — a degraded service is still running a version, and it is the one
+// most worth identifying — so if a readiness verdict is ever added it belongs
+// in this struct on both branches, not in a second shape.
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "purser"})
+	id := version.Get()
+	writeJSON(w, http.StatusOK, healthResponse{
+		Status:  "ok",
+		Service: "purser",
+		Version: id.Version,
+		SHA:     id.SHA,
+	})
 }
 
 // inviteRequest is the POST /v1/invites body.
