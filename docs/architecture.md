@@ -107,6 +107,16 @@ safe rather than half-provisioning someone.
   running | succeeded | skipped | failed | unavailable`; `unavailable` was added
   by `0004` (see [Task status](#task-status)).
 
+The spin-up axis has one table of its own, added by `0007` and joined to none of
+the above (see [Service spin-up](#service-spin-up-epic-prsr-22)):
+
+- `service_resource` — an edge object Purser created for a service, and the
+  coordinates to find it again: `kind` (`tunnel_route | access_app |
+  dns_record`), `external_id`, and the `parent_id` of the zone/account/tunnel it
+  lives in. **Unique on (lower(hostname), kind)** — this axis's idempotency key,
+  case-folded because hostnames are. `service_key` is *not* a foreign key to
+  `service`: a service being stood up need never be an invite target.
+
 ## Idempotency
 
 Re-running the same invite is safe and **retries only failed services**: a
@@ -566,38 +576,92 @@ Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
 - **Argosy cannot be offboarded.** Its admin API has create and lookup but no
   delete, disable, or token-invalidation. `offboard` reports it `unavailable`
   rather than skipping it; an ARGY ticket is pending, same shape as ARGY-163.
-- **PRSR-25 — a dedicated Switchyard provisioning token.** Purser authenticates
-  as the instance bootstrap token: functional, but not attributable and not
-  independently revocable. PRSR-3 shipped that fallback and is closed; this is the
-  hardening half, and it needs an operator with a `users:manage`-capable token.
-- **PRSR-22 — service spin-up** (below), gated on its prereq **PRSR-11**.
+- **PRSR-25 — a dedicated Switchyard provisioning token.** Closed as done on the
+  board, while its own last comment records the token mint still blocked on
+  SERV-49 (no `users:manage` on the assistant's MCP token). The `purser` agent
+  user exists; whether `PURSER_SWITCHYARD_TOKEN` is still the instance bootstrap
+  token is worth checking rather than asserting.
+- **PRSR-22 — service spin-up** (below). In progress: its prerequisites and its
+  foundation have landed, the three provisioners have not.
 
-## Future direction: service spin-up (epic PRSR-22)
+## Service spin-up (epic PRSR-22)
 
 Everything above provisions **people into existing services** (the person ×
-service axis). A separate, larger direction is standing up the Cloudflare edge
-for a *new* Construct app in one command — DNS record, tunnel ingress route, and
-Access application + policy — so bringing `argosy`, `interlock`, `cook_book`,
-`centrifuge`, etc. online stops being a manual dashboard operation.
+service axis). This is the other one: standing up the Cloudflare edge for a
+service in one command — DNS record, tunnel ingress route, Access application —
+so bringing `interlock`, `cook_book`, `centrifuge` online stops being a manual
+dashboard operation.
 
-This is a **different axis** (keyed on hostname/service, not person × service),
-so it does *not* extend the person-shaped `Connector`. The plan is a parallel
-`ServiceProvisioner` interface (`Ensure(ServiceSpec) / Teardown`) with its own
-orchestrator path — a `purser provision-service` sibling to `purser invite` —
-reusing the existing CF API client, registry, store, and idempotency ethos.
+It is a **different axis**, keyed on hostname rather than on (person × service),
+and it does not extend the person-shaped `Connector` — bending one interface to
+carry both would mean widening `Input` until neither axis's fields mean
+anything. It lives in `internal/spinup`, which imports `internal/model` and
+nothing else of ours.
 
-- **Reusable today:** the CF `do()` client (bearer + `{success,errors}`
-  envelope), the registry / `ErrPending`-degrade idiom, config, store/migrator.
-- **New work:** DNS, tunnel-route, and Access-*application* operations (the
-  connector only manages Access *group* membership today); a `ServiceSpec` +
-  resource table recording created CF resource IDs for idempotent teardown.
-- **Token scopes:** Access *Apps & Policies* Edit is already held; **Zone → DNS
-  → Edit** and **Account → Cloudflare Tunnel → Edit** are not yet provisioned.
-- **Open blocker:** whether the cloudflared tunnel is remotely-managed (routes
-  settable via the CF API) or driven by a local `config.yml` (not API-settable).
-  Argosy sidesteps it entirely — it's on the *direct / non-tunnelled* path, so
-  its spin-up is DNS-to-static-IP + Access app only, and is the natural pilot.
+### What has landed
 
-Epic PRSR-22 carries the full assessment and breakdown; PRSR-11 is its only
-currently-actionable part — the tunnel decision above plus the token scopes, both
-decisions and access changes rather than code.
+**Prerequisites.** PRSR-11 provisioned the token scopes (**Zone → DNS → Edit**
+scoped to the one zone, **Account → Cloudflare Tunnel → Edit**, both probed
+against the live API) and shipped `PURSER_CF_ZONE_ID` / `PURSER_CF_TUNNEL_ID`.
+PRSR-26 answered the tunnel question: it is **remotely-managed**
+(`source: "cloudflare"`), so ingress routes are settable over the API and no
+tunnel migration is needed.
+
+**Foundation (PRSR-27).** `ServiceSpec`, the `ServiceProvisioner` interface, its
+registry, and the `Ensure` orchestrator, plus `service_resource` (migration
+0007). Two decisions were settled here so the three provisioners cannot
+disagree:
+
+- **`Ensure` previews by default; `--apply` acts** — `offboard`'s posture, not
+  `invite`'s. Creation is additive and idempotent, which argues for acting, but
+  the tunnel step is a read-modify-write of one document holding every *other*
+  service's routes. Preview and apply are one code path: a single read-only
+  `Inspect` per step decides the plan, and `--apply` is that decision plus the
+  write.
+- **The tunnel is a spec field, not a global** (PRSR-33) — the account has two
+  healthy tunnels, and a dev instance of a service is the same shape pointed at
+  a different one. Specs name a ref (`prod` | `dev`); `TunnelSet` resolves it to
+  an id once per run, before any step, so the ingress route and the DNS record
+  cannot describe different tunnels. Only `prod` is wired.
+
+### The tunnelled/direct split reaches three steps
+
+The epic described this as a DNS-and-tunnel distinction. It also reaches Access,
+which is what makes it a spec-level decision rather than a per-connector one:
+
+| step | tunnelled | direct |
+|---|---|---|
+| tunnel ingress | append a hostname rule | **skipped entirely** |
+| Access | `self_hosted` app + policy → `zerogravity-members` | **`bookmark` app**, no policy |
+| DNS | proxied CNAME → `<tunnel-id>.cfargotunnel.com` | A/AAAA (or CNAME) → the static endpoint |
+
+A bookmark is a *different application type*, not a gated app minus its policy,
+so a spec that could only emit `self_hosted` could not describe the direct path
+at all — and Argosy, the pilot, is on it.
+
+**DNS is applied last**, which is the order of that table. It is the step that
+makes the hostname live; the other two are inert until something resolves.
+Publishing the record first leaves a tunnelled service answering 502 until its
+route lands, and a service meant to be gated reachable *ungated* until its
+Access app exists.
+
+### What is left
+
+- **PRSR-28** — the DNS record. Reuses the existing CF `do()` client unchanged:
+  it takes a free-form path, so `/zones/{zone}/…` works as well as
+  `/accounts/{acct}/…`.
+- **PRSR-29** — the Access application. `logo_url` must be verified reachable
+  before it is written: Cloudflare stores any URL and never validates it, so a
+  dead one is indistinguishable from an unset one and the launcher silently
+  falls back to grey initials.
+- **PRSR-30** — the tunnel ingress route. Insert *before* the terminal catch-all
+  rule (a rule appended after it never matches, and nothing errors), and guard
+  the shared document the way the Access connector guards the group's email list.
+- **PRSR-31** — `purser provision-service` and Argosy end to end. On the direct
+  path, so it needs PRSR-28 and PRSR-29 but not PRSR-30. The first honest
+  exercise is `Ensure` against a service that is already up, reporting no-ops.
+
+`Teardown` is on the interface — the resource table exists to give it concrete
+ids to target rather than a hostname to guess from — but nothing orchestrates
+one yet. Its ordering, and the question of whether a hostname is still someone
+else's, belong with the command that needs them.
