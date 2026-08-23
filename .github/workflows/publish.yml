@@ -39,7 +39,27 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Build identity for /healthz (PRSR-32) — see deploy/Dockerfile.
+          #
+          # VERSION is passed ONLY on a tag build. On a push to main
+          # `steps.meta.outputs.version` is `latest`, and `latest` names a
+          # moving target rather than a build: it was already being linked into
+          # the binary before this change and was harmless only because nothing
+          # read it. Now that /healthz reports it, passing it through would have
+          # purser claim to run a version called "latest" — stored as an
+          # identity, compared against the image label, disagreeing for ever.
+          # Blank instead, which `internal/version` maps to "dev".
+          #
+          # On a tag build metadata-action's `version` output is already the
+          # BARE semver (`0.14.0`), matching the image label character for
+          # character. That agreement is the whole point: the reconciler
+          # observes this string and the deploy reporter reports the label, and
+          # the matrix compares the two as identities.
+          #
+          # GIT_SHA is passed on both paths. A main build has a real commit and
+          # should say so; it just has no release to name.
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
+            VERSION=${{ github.ref_type == 'tag' && steps.meta.outputs.version || '' }}
+            GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

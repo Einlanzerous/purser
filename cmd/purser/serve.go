@@ -32,7 +32,7 @@ func runServe() {
 	defer stop()
 
 	go func() {
-		log.Printf("purser %s listening on %s", version.Version, a.cfg.Addr)
+		log.Printf("purser %s listening on %s", version.Get().Version, a.cfg.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("server error: %v", err)
 			stop()

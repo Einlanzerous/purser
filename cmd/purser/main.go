@@ -67,7 +67,7 @@ func main() {
 	case "migrate":
 		runMigrate()
 	case "version":
-		fmt.Println(version.Version)
+		fmt.Println(version.Get().Version)
 	default:
 		fmt.Fprintf(os.Stderr, "purser: unknown command %q\n", cmd)
 		fmt.Fprintln(os.Stderr, "commands: serve, invite, offboard, person, audit, reconcile, migrate, version")

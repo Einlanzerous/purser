@@ -11,9 +11,29 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ARG VERSION=docker
-RUN CGO_ENABLED=0 go build \
-    -ldflags "-s -w -X github.com/Einlanzerous/purser/internal/version.Version=${VERSION}" \
+# Build identity (PRSR-32). Stamped into the binary and reported by /healthz,
+# which Switchyard's delivery reconciler polls to record what is actually
+# running (the SWY-192 contract, rolled out by SERV-128).
+#
+# Both default to EMPTY, not to a placeholder like "docker". The old "docker"
+# default put that literal string where a version belongs for every hand-built
+# image; `internal/version` maps empty back to "dev", which is the same rule
+# that already had to cover an ARG declared but never passed — one that expands
+# to an empty string regardless of what default is written here.
+#
+# There is deliberately no default of the release version: an image built
+# outside the publish workflow must not be able to claim it is a release.
+#
+# VERSION is bare semver, no "v" prefix — it is compared with strict equality
+# against org.opencontainers.image.version, which metadata-action stamps bare.
+# GIT_SHA is the full 40-char commit; /healthz reports it verbatim rather than
+# abbreviating.
+ARG VERSION=
+ARG GIT_SHA=
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w \
+      -X github.com/Einlanzerous/purser/internal/version.Version=${VERSION} \
+      -X github.com/Einlanzerous/purser/internal/version.Commit=${GIT_SHA}" \
     -o /out/purser ./cmd/purser
 
 # 2) Runtime: slim Alpine with ca-certificates (HTTPS to the Cloudflare API +
