@@ -8,7 +8,7 @@ BIN := bin/purser
 # `claimed_not_confirmed` row. Stripping it locally keeps the form identical
 # everywhere the version is produced, which is the only way that comparison
 # stays honest.
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
+VERSION ?= $(shell (git describe --tags --always --dirty 2>/dev/null || echo dev) | sed 's/^v//')
 COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
 LDFLAGS := -s -w \
 	-X github.com/Einlanzerous/purser/internal/version.Version=$(VERSION) \
