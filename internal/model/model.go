@@ -135,6 +135,91 @@ type Invite struct {
 	CreatedAt   time.Time
 }
 
+// ResourceKind is one class of edge object the service spin-up axis creates
+// (PRSR-27). Unlike everything above it, these are keyed on hostname rather than
+// on a person: they are the infrastructure that makes a service exist, not
+// somebody's access to one.
+//
+// The values match service_resource.kind's CHECK constraint, and their order in
+// KindOrder is the order they are applied in — see that variable for why DNS
+// comes last.
+type ResourceKind string
+
+const (
+	// ResourceTunnelRoute is a hostname rule in a cloudflared tunnel's ingress
+	// configuration. It has no id of its own: the configuration is one document
+	// per tunnel, so the route is identified by its tunnel plus its hostname.
+	ResourceTunnelRoute ResourceKind = "tunnel_route"
+	// ResourceAccessApp is a Cloudflare Access application — either a gated
+	// `self_hosted` app with a policy, or a `bookmark` launcher tile. Which one
+	// is a property of the spec, not of this kind.
+	ResourceAccessApp ResourceKind = "access_app"
+	// ResourceDNSRecord is the zone record that makes the hostname resolve.
+	ResourceDNSRecord ResourceKind = "dns_record"
+)
+
+// KindOrder is every resource kind in the order a spin-up applies them, and the
+// order reports list them in.
+//
+// **DNS is last, because DNS is what makes the hostname live.** The other two
+// steps are inert until something resolves: an ingress route for a hostname that
+// doesn't resolve serves nobody, and an Access application in front of a
+// hostname that doesn't resolve gates nobody. Publishing the record first
+// inverts that — a tunnelled service answers 502 until its route lands, and,
+// far worse, a service meant to be gated is reachable *ungated* for as long as
+// its Access app takes to create. Ordering is the only thing standing between a
+// spin-up and that window, so it lives here rather than in each caller.
+var KindOrder = []ResourceKind{ResourceTunnelRoute, ResourceAccessApp, ResourceDNSRecord}
+
+// ResourceStatus is whether a recorded edge resource is still in place.
+//
+// There is deliberately no counterpart to AccountStale. That status exists on
+// the person axis to re-arm provisioning, because the invite orchestrator's
+// idempotency skip reads the account row; the spin-up path reads *upstream*
+// instead, so a record that disagrees with reality changes nothing about what it
+// does next.
+type ResourceStatus string
+
+const (
+	ResourceActive ResourceStatus = "active"
+	// ResourceRemoved — torn down. The row is kept, like a deprovisioned
+	// account: it is the record that this hostname once held this resource.
+	ResourceRemoved ResourceStatus = "removed"
+)
+
+// ServiceResource is one edge object Purser created for a service, and the
+// coordinates needed to find it again. It maps 1:1 onto service_resource
+// (migration 0007).
+//
+// A row exists only for a resource that actually exists upstream: a step that
+// failed writes nothing, so "no row" means "we did not put anything here",
+// never "we tried". That is what lets Teardown target ids rather than guessing
+// by hostname — deleting a DNS record somebody else created by hand is not
+// recoverable by re-running.
+type ServiceResource struct {
+	ID uuid.UUID
+	// ServiceKey names the service this belongs to. It is not a reference to
+	// Service.Key: that type is a target system for *invites*, and a service
+	// being stood up here need never be one.
+	ServiceKey string
+	Hostname   string
+	Kind       ResourceKind
+	// ExternalID is the resource's own upstream id, or "" for a kind that has
+	// none (ResourceTunnelRoute).
+	ExternalID string
+	// ParentID is the container it lives in — zone, account, or tunnel id.
+	// Recorded per row because the tunnel is a per-spec choice (PRSR-33), so
+	// config is not a reliable answer to "which document did this go into?".
+	ParentID  string
+	Status    ResourceStatus
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	// RemovedAt is when it was torn down, or nil if it never was. Never cleared
+	// by standing the hostname back up — see migration 0006 for the same
+	// decision on the person axis, and why it isn't derived from UpdatedAt.
+	RemovedAt *time.Time
+}
+
 // ProvisionTask is one service's slice of an invite. It records attempts and
 // the last error so a re-run can retry only what failed.
 type ProvisionTask struct {

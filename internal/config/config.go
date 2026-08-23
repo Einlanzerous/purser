@@ -177,12 +177,17 @@ type CloudflareConfig struct {
 	// ingress those hostnames route through. The tunnel is remotely-managed
 	// (PRSR-26), so both are reachable over the API.
 	//
-	// Nothing reads them yet — the spin-up connectors aren't built. They are
-	// carried here so the deploy-side plumbing (.env, the PROD_ENV_FILE secret,
-	// the compose file) lands once instead of twice, and they stay out of the
-	// Access connector's Config on purpose: it does not use them, and folding
-	// them into its readiness check would take `--to cloudflare` offline for
-	// every deployment that hasn't set them.
+	// Nothing reads them yet — the spin-up provisioners aren't built (PRSR-28,
+	// -29, -30). They are carried here so the deploy-side plumbing (.env, the
+	// PROD_ENV_FILE secret, the compose file) lands once instead of twice, and
+	// they stay out of the Access connector's Config on purpose: it does not use
+	// them, and folding them into its readiness check would take `--to
+	// cloudflare` offline for every deployment that hasn't set them.
+	//
+	// TunnelID is the `prod` entry of a spinup.TunnelSet, not the tunnel: a
+	// ServiceSpec names a ref and the set resolves it, because the account has a
+	// second tunnel serving the dev edge (PRSR-33). Wiring that one adds an id
+	// here, not a fork of everything downstream.
 	//
 	// Neither gets a default, unlike TeamDomain above. They are account-specific
 	// opaque ids, and a wrong one here would have Purser writing DNS records
