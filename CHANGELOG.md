@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/Einlanzerous/purser/compare/v0.14.0...v0.15.0) (2026-08-23)
+
+
+### Features
+
+* **health:** report version and sha on /healthz (PRSR-32) ([#35](https://github.com/Einlanzerous/purser/issues/35)) ([0b3ff3c](https://github.com/Einlanzerous/purser/commit/0b3ff3c65fc0915d5b7959b795277944810f6569))
+
 ## [0.14.0](https://github.com/Einlanzerous/purser/compare/v0.13.0...v0.14.0) (2026-08-15)
 
 
