@@ -15,13 +15,22 @@
 # nowhere to land. A large hand-written file is exactly what the reviewer should
 # be spending its budget on.
 
-# release-please owns both of these and rewrites them wholesale. A release PR
-# touching only these is already skipped a rule earlier, by the release-PR test
-# that derives its expected set from `release-please-config.json`; this covers
-# the case where one rides along with code. `CHANGELOG.md` is also `.md`, so the
-# docs-only rule would catch it alone; the manifest would not.
+# release-please owns this and rewrites it wholesale. A release PR is already
+# skipped a rule earlier, by the release-PR test that derives its expected set
+# from `release-please-config.json`; this covers the case where the changelog
+# rides along with code.
+#
+# `.release-please-manifest.json` is deliberately NOT here, though release-please
+# owns it just as wholly. This filter has no author check — unlike the release-PR
+# rule above it, which gates on author *and* branch *and* file list precisely so a
+# person cannot hand-push generated release material past review. Excluding both
+# paths leaves a human-authored PR touching only those two files with an empty
+# reviewable set, and it skips as "only generated files changed" whoever opened
+# it. `CHANGELOG.md` alone costs nothing, because it is `.md` and the docs-only
+# rule would skip that PR anyway; the manifest is not, so excluding it creates a
+# skip that would not otherwise exist. A manifest bump riding along with code is
+# two extra lines in the patch, which is the cheaper side of the trade.
 ^CHANGELOG\.md$
-^\.release-please-manifest\.json$
 
 # NOT excluded, deliberately, and each for a reason:
 #
