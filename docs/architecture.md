@@ -643,7 +643,15 @@ at all — and Argosy, the pilot, is on it.
 makes the hostname live; the other two are inert until something resolves.
 Publishing the record first leaves a tunnelled service answering 502 until its
 route lands, and a service meant to be gated reachable *ungated* until its
-Access app exists.
+Access app exists — and only one of those two announces itself.
+
+Ordering alone doesn't close that window, though: it only helps if the earlier
+step actually landed. So DNS also **depends** on the steps in front of it, and is
+held (`blocked`) when a prerequisite failed, was unavailable, or couldn't be
+read. A *bookmark* Access app is not a prerequisite — it is a launcher tile in
+front of a service with its own login, so its absence costs an icon, not a gate.
+Blocking withholds changes, not the report: a record that already matches is
+already published, so it is still reported and still adopted.
 
 ### What is left
 

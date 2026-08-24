@@ -21,12 +21,15 @@ func tunnelledSpec() ServiceSpec {
 
 // directSpec is Argosy's shape: the epic's pilot, and the case a spec that could
 // only describe tunnelled services would not be able to express.
+//
+// Upstream is a bare address, not a URL — on this path it becomes a DNS
+// record's value.
 func directSpec() ServiceSpec {
 	return ServiceSpec{
 		Key:      "argosy",
 		Hostname: "argosy.zerogravity.industries",
 		Mode:     ModeDirect,
-		Upstream: "https://100.64.0.7:8096",
+		Upstream: "100.64.0.7",
 		Access:   AccessBookmark,
 	}
 }
@@ -94,14 +97,6 @@ func TestValidate_Refusals(t *testing.T) {
 			want: "hostname is required",
 		},
 		{
-			// It would otherwise be recorded as this axis's identity key and
-			// then written into a DNS record.
-			name: "hostname must not be a url",
-			base: directSpec(),
-			spec: func(s ServiceSpec) ServiceSpec { s.Hostname = "https://argosy.zerogravity.industries"; return s },
-			want: "not a URL",
-		},
-		{
 			name: "hostname must be fully qualified",
 			base: directSpec(),
 			spec: func(s ServiceSpec) ServiceSpec { s.Hostname = "argosy"; return s },
@@ -114,12 +109,38 @@ func TestValidate_Refusals(t *testing.T) {
 			want: "upstream is required",
 		},
 		{
+			// A DNS record's value has nowhere to put a scheme, a port or a
+			// path, so this resolves for nobody and reads as a DNS fault.
+			name: "direct upstream must not be a url",
+			base: directSpec(),
+			spec: func(s ServiceSpec) ServiceSpec { s.Upstream = "https://100.64.0.7:8096"; return s },
+			want: "ip address or a hostname",
+		},
+		{
+			// cloudflared's ingress `service` value needs one.
+			name: "tunnelled upstream must carry a scheme",
+			base: tunnelledSpec(),
+			spec: func(s ServiceSpec) ServiceSpec { s.Upstream = "interlock:4010"; return s },
+			want: "origin url",
+		},
+		{
 			// The launcher loads it from the viewer's browser, so a relative
 			// path cannot resolve for anyone.
 			name: "logo url must be absolute",
 			base: directSpec(),
 			spec: func(s ServiceSpec) ServiceSpec { s.LogoURL = "/assets/argosy.png"; return s },
-			want: "must be absolute",
+			want: "must be an absolute https:// url",
+		},
+		{
+			// Blocked as mixed content inside the launcher's https page, which
+			// is the silent grey-initials failure the field exists to avoid.
+			name: "logo url must be https",
+			base: directSpec(),
+			spec: func(s ServiceSpec) ServiceSpec {
+				s.LogoURL = "http://placard.zerogravity.industries/argosy.png"
+				return s
+			},
+			want: "must be an absolute https:// url",
 		},
 	}
 	for _, tc := range tests {
@@ -152,40 +173,158 @@ func TestNormalized_FoldsHostname(t *testing.T) {
 	}
 }
 
+// Key is folded too. service_key is compared exactly by the store, so two
+// casings would be two services sharing one hostname's resources — and
+// ServiceResourcesFor would answer each of them with half the truth.
+func TestNormalized_FoldsKey(t *testing.T) {
+	s := directSpec()
+	s.Key = " Argosy "
+	got, err := s.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Key != "argosy" {
+		t.Errorf("key = %q, want it lowercased", got.Key)
+	}
+}
+
+// Whatever passes validation becomes this axis's identity key *and* the name in
+// a DNS record, so the check is an allow-list. These are the shapes a looser one
+// lets through.
+func TestValidate_RejectsNonHostnames(t *testing.T) {
+	for _, host := range []string{
+		"argosy.zerogravity.industries:8096", // a port
+		"https://argosy.zerogravity.industries",
+		"argosy.zerogravity.industries/path",
+		"*.zerogravity.industries", // would claim every hostname in the zone
+		".zerogravity.industries",  // leading dot: an empty label
+		"argosy..zerogravity.industries",
+		"argo\nsy.zerogravity.industries",
+		"argosy zerogravity.industries",
+		"-argosy.zerogravity.industries",
+		"argosy-.zerogravity.industries",
+		"argosy@zerogravity.industries",
+		"argosy?.zerogravity.industries",
+		strings.Repeat("a", 64) + ".zerogravity.industries",
+	} {
+		s := directSpec()
+		s.Hostname = host
+		if _, err := s.Validate(); err == nil {
+			t.Errorf("accepted %q as a hostname", host)
+		}
+	}
+}
+
+// Trailing dots are trimmed however many there are: one left behind is an empty
+// label, and an empty label is a second identity key for the same host.
+func TestValidate_AcceptsOrdinaryHostnames(t *testing.T) {
+	for _, host := range []string{
+		"argosy.zerogravity.industries",
+		"argosy.zerogravity.industries..",
+		"argosy-dev.zerogravity.industries",
+		"a.b.c.zerogravity.industries",
+	} {
+		s := directSpec()
+		s.Hostname = host
+		if _, err := s.Validate(); err != nil {
+			t.Errorf("rejected %q: %v", host, err)
+		}
+	}
+}
+
 // The tunnelled/direct split reaches three steps, not two: a direct service
 // skips the ingress route entirely and takes a different Access application
 // type. Getting this wrong is the design risk the foundation ticket names.
-func TestSteps(t *testing.T) {
+//
+// Asserted through callsFor, which is the predicate the orchestrator itself
+// calls — a separate "which steps does this spec have" helper would be a second
+// implementation of the same decision, and the tested one would not be the one
+// that runs.
+func TestCallsFor(t *testing.T) {
+	tests := []struct {
+		name string
+		spec ServiceSpec
+		want map[model.ResourceKind]bool
+	}{
+		{
+			name: "tunnelled and gated: all three",
+			spec: tunnelledSpec(),
+			want: map[model.ResourceKind]bool{
+				model.ResourceTunnelRoute: true, model.ResourceAccessApp: true, model.ResourceDNSRecord: true,
+			},
+		},
+		{
+			name: "direct: no ingress route",
+			spec: directSpec(),
+			want: map[model.ResourceKind]bool{
+				model.ResourceTunnelRoute: false, model.ResourceAccessApp: true, model.ResourceDNSRecord: true,
+			},
+		},
+		{
+			name: "ungated tunnelled service: no access app",
+			spec: func() ServiceSpec { s := tunnelledSpec(); s.Access = AccessNone; return s }(),
+			want: map[model.ResourceKind]bool{
+				model.ResourceTunnelRoute: true, model.ResourceAccessApp: false, model.ResourceDNSRecord: true,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for kind, want := range tc.want {
+				if got := tc.spec.callsFor(kind); got != want {
+					t.Errorf("callsFor(%q) = %v, want %v", kind, got, want)
+				}
+			}
+		})
+	}
+}
+
+// DNS is ordered last so a gated service never resolves before its gate exists,
+// and ordering only means something if the later step knows what it waited for.
+// A bookmark is deliberately not a prerequisite: it is a tile, not a gate.
+func TestDependsOn(t *testing.T) {
 	tests := []struct {
 		name string
 		spec ServiceSpec
 		want []model.ResourceKind
 	}{
 		{
-			name: "tunnelled and gated: all three",
+			name: "tunnelled and gated waits for both",
 			spec: tunnelledSpec(),
-			want: []model.ResourceKind{model.ResourceTunnelRoute, model.ResourceAccessApp, model.ResourceDNSRecord},
+			want: []model.ResourceKind{model.ResourceTunnelRoute, model.ResourceAccessApp},
 		},
 		{
-			name: "direct: no ingress route",
+			name: "direct bookmark waits for nothing",
 			spec: directSpec(),
-			want: []model.ResourceKind{model.ResourceAccessApp, model.ResourceDNSRecord},
+			want: nil,
 		},
 		{
-			name: "ungated tunnelled service: no access app",
+			name: "direct and gated waits for the access app",
+			spec: func() ServiceSpec { s := directSpec(); s.Access = AccessGated; return s }(),
+			want: []model.ResourceKind{model.ResourceAccessApp},
+		},
+		{
+			name: "tunnelled and ungated waits for the route",
 			spec: func() ServiceSpec { s := tunnelledSpec(); s.Access = AccessNone; return s }(),
-			want: []model.ResourceKind{model.ResourceTunnelRoute, model.ResourceDNSRecord},
+			want: []model.ResourceKind{model.ResourceTunnelRoute},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := tc.spec.Steps()
+			got := tc.spec.dependsOn(model.ResourceDNSRecord)
 			if len(got) != len(tc.want) {
-				t.Fatalf("steps = %v, want %v", got, tc.want)
+				t.Fatalf("dependsOn(dns) = %v, want %v", got, tc.want)
 			}
 			for i := range got {
 				if got[i] != tc.want[i] {
-					t.Fatalf("steps = %v, want %v", got, tc.want)
+					t.Fatalf("dependsOn(dns) = %v, want %v", got, tc.want)
+				}
+			}
+			// Nothing else has prerequisites; the route and the app are
+			// independent of each other.
+			for _, k := range []model.ResourceKind{model.ResourceTunnelRoute, model.ResourceAccessApp} {
+				if deps := tc.spec.dependsOn(k); deps != nil {
+					t.Errorf("dependsOn(%q) = %v, want none", k, deps)
 				}
 			}
 		})

@@ -303,8 +303,11 @@ func TestEnsure_FailedInspectIsUnknownAndDoesNotAct(t *testing.T) {
 }
 
 // Per-resource failures must not abort the whole spec — the same rule the invite
-// path has, and it matters more here because the earlier steps have already
-// changed the edge by the time a later one fails.
+// path has — but "don't abort" is not "carry on regardless". An *independent*
+// step still runs; a step that depends on the failed one is held.
+//
+// The route and the Access app are independent of each other, so the app runs
+// after the route fails. DNS depends on both, so it does not.
 func TestEnsure_PerStepFailureDoesNotAbort(t *testing.T) {
 	route := &fakeProv{kind: model.ResourceTunnelRoute, ensureErr: errors.New("ingress write rejected")}
 	app := absent(model.ResourceAccessApp, "app-1")
@@ -321,9 +324,118 @@ func TestEnsure_PerStepFailureDoesNotAbort(t *testing.T) {
 		t.Error("a failed step reported Applied")
 	}
 	wantStatus(t, res, model.ResourceAccessApp, StepCreate)
-	wantStatus(t, res, model.ResourceDNSRecord, StepCreate)
-	if app.ensures != 1 || dns.ensures != 1 {
-		t.Error("one step's failure stopped the rest of the spec")
+	if app.ensures != 1 {
+		t.Error("a failure in an unrelated step stopped the Access app from being created")
+	}
+	wantStatus(t, res, model.ResourceDNSRecord, StepBlocked)
+	if dns.ensures != 0 {
+		t.Error("DNS was published while the route it depends on had failed")
+	}
+}
+
+// The whole reason DNS is ordered last: it is the step that makes the hostname
+// live, so publishing it after a failed Access step is what turns "gated" into
+// "reachable by anyone". Ordering alone doesn't prevent that — only a step that
+// refuses to run does.
+func TestEnsure_GatedAccessFailureBlocksDNS(t *testing.T) {
+	app := &fakeProv{kind: model.ResourceAccessApp, ensureErr: errors.New("policy rejected")}
+	dns := absent(model.ResourceDNSRecord, "rec-1")
+	spec := directSpec()
+	spec.Access = AccessGated // direct, so the route is out of the picture
+	st := newStore()
+
+	res, err := New(st, NewRegistry(app, dns)).Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantStatus(t, res, model.ResourceAccessApp, StepFailed)
+	f := wantStatus(t, res, model.ResourceDNSRecord, StepBlocked)
+	if dns.ensures != 0 {
+		t.Fatal("a gated service was published with no Access application — reachable, and ungated")
+	}
+	if !strings.Contains(f.Detail, string(model.ResourceAccessApp)) {
+		t.Errorf("a blocked step must name what held it: %q", f.Detail)
+	}
+	if st.count() != 0 {
+		t.Error("a blocked step recorded a resource")
+	}
+	if res.Pending() != 0 {
+		t.Error("blocked steps must not count as pending — re-running with --apply is not what fixes them")
+	}
+}
+
+// Every non-landed state blocks, not just failure: unavailable and unknown mean
+// the gate is equally absent. Unavailable is knowable without acting, so the
+// hold shows up in the *plan*, before anyone types --apply.
+func TestEnsure_UnavailableOrUnknownDependencyBlocksDNS(t *testing.T) {
+	spec := directSpec()
+	spec.Access = AccessGated
+
+	t.Run("unavailable, in the preview", func(t *testing.T) {
+		app := NewUnavailable(model.ResourceAccessApp, "Access application", "set PURSER_CF_API_TOKEN to enable")
+		dns := absent(model.ResourceDNSRecord, "rec-1")
+		res, err := New(newStore(), NewRegistry(app, dns)).Ensure(context.Background(), Request{Spec: spec})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantStatus(t, res, model.ResourceAccessApp, StepUnavailable)
+		wantStatus(t, res, model.ResourceDNSRecord, StepBlocked)
+	})
+
+	t.Run("unknown", func(t *testing.T) {
+		app := &fakeProv{kind: model.ResourceAccessApp, inspectErr: errors.New("502 from the api")}
+		dns := absent(model.ResourceDNSRecord, "rec-1")
+		res, err := New(newStore(), NewRegistry(app, dns)).Ensure(context.Background(), Request{Spec: spec, Apply: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantStatus(t, res, model.ResourceAccessApp, StepUnknown)
+		wantStatus(t, res, model.ResourceDNSRecord, StepBlocked)
+		if dns.ensures != 0 {
+			t.Error("published a gated hostname while the gate's state was unreadable")
+		}
+	})
+}
+
+// A bookmark is a launcher tile in front of a service that holds its own login,
+// so its absence costs an icon, not a gate. Blocking a working service's DNS
+// over a missing tile would be the wrong trade — and this is the distinction
+// that makes AccessShape more than a flag.
+func TestEnsure_BookmarkAccessFailureDoesNotBlockDNS(t *testing.T) {
+	app := &fakeProv{kind: model.ResourceAccessApp, ensureErr: errors.New("logo fetch failed")}
+	dns := absent(model.ResourceDNSRecord, "rec-1")
+
+	res, err := New(newStore(), NewRegistry(app, dns)).
+		Ensure(context.Background(), Request{Spec: directSpec(), Apply: true}) // bookmark
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceAccessApp, StepFailed)
+	f := wantStatus(t, res, model.ResourceDNSRecord, StepCreate)
+	if !f.Applied || dns.ensures != 1 {
+		t.Error("a failed launcher tile held back a service that has its own login")
+	}
+}
+
+// Blocking withholds *changes*, not the report. A record that is already correct
+// is already published, so refusing to look at it protects nobody and hides the
+// state — and an adopt writes a row without touching the edge.
+func TestEnsure_BlockingDoesNotHideAnAlreadyPublishedRecord(t *testing.T) {
+	app := &fakeProv{kind: model.ResourceAccessApp, ensureErr: errors.New("policy rejected")}
+	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
+	spec := directSpec()
+	spec.Access = AccessGated
+	st := newStore()
+
+	res, err := New(st, NewRegistry(app, dns)).Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceAccessApp, StepFailed)
+	f := wantStatus(t, res, model.ResourceDNSRecord, StepAdopt)
+	if !f.Applied || st.count() != 1 {
+		t.Error("an adopt was blocked; it changes nothing upstream and the record is what makes teardown possible")
 	}
 }
 
@@ -551,6 +663,107 @@ func TestRegistry_DuplicateKindPanics(t *testing.T) {
 		}
 	}()
 	NewRegistry(absent(model.ResourceDNSRecord, "a"), absent(model.ResourceDNSRecord, "b"))
+}
+
+// The orchestrator walks KindOrder, so a provisioner registered under a kind
+// that isn't in it is never asked for anything and never appears in a report:
+// the spin-up looks complete while one of its steps was never run.
+func TestRegistry_UnknownKindPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("a kind the orchestrator never asks for must panic at wiring time, not run silently never")
+		}
+	}()
+	NewRegistry(absent(model.ResourceKind("dns_recrod"), "a"))
+}
+
+// A Service with no registry reports every step unavailable — what an
+// unconfigured deployment should look like — rather than panicking partway
+// through a spec.
+func TestRegistry_NilIsEveryStepUnavailable(t *testing.T) {
+	res, err := New(newStore(), nil).Ensure(context.Background(), Request{Spec: directSpec(), Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceDNSRecord, StepUnavailable)
+	wantStatus(t, res, model.ResourceAccessApp, StepUnavailable)
+}
+
+// Purser recorded it and upstream doesn't have it: the apply recreates, so the
+// action is a create — but reporting it as one never tells the operator that
+// something they created was deleted outside Purser.
+func TestEnsure_RecordedButGoneUpstreamIsMissing(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; return s }()
+	st := newStore()
+	st.put(model.ServiceResource{
+		ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceDNSRecord,
+		ExternalID: "rec-1", ParentID: "zone-1",
+	})
+	dns := absent(model.ResourceDNSRecord, "rec-2")
+
+	res, err := New(st, NewRegistry(dns)).Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := wantStatus(t, res, model.ResourceDNSRecord, StepMissing)
+	if !f.Applied || f.ExternalID != "rec-2" {
+		t.Errorf("the recreate should have rebound the row to the new id: %+v", f)
+	}
+}
+
+// A provisioner that returns a partial Resource must not blank out a known-good
+// external_id: that id is Teardown's only handle, and an empty one means "this
+// kind has none" rather than "we lost it".
+func TestEnsure_PartialResourceKeepsTheKnownID(t *testing.T) {
+	dns := &fakeProv{
+		kind:  model.ResourceDNSRecord,
+		state: State{Exists: true, Matches: false, ExternalID: "rec-1", ParentID: "zone-1", Detail: "old target"},
+		// A successful update that reported nothing back.
+		ensured: Resource{},
+	}
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; return s }()
+	st := newStore()
+
+	res, err := New(st, NewRegistry(dns)).Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := wantStatus(t, res, model.ResourceDNSRecord, StepUpdate)
+	if f.ExternalID != "rec-1" {
+		t.Errorf("external id = %q, want the id Inspect found rather than an empty one", f.ExternalID)
+	}
+	row := st.rows[key(spec.Hostname, model.ResourceDNSRecord)]
+	if row.ExternalID != "rec-1" || row.ParentID != "zone-1" {
+		t.Errorf("recorded %+v; a partial result wiped the coordinates teardown needs", row)
+	}
+	// And Detail is the result, not the state that was just replaced.
+	if f.Detail == "old target" {
+		t.Error("the finding describes the pre-change state as though it were the outcome")
+	}
+}
+
+// A hostname reassigned to another service must be re-attributed, or
+// ServiceResourcesFor answers for the old owner for ever.
+func TestEnsure_ReassignedHostnameIsAdopted(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; s.Key = "interlock"; return s }()
+	st := newStore()
+	st.put(model.ServiceResource{
+		ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceDNSRecord,
+		ExternalID: "rec-1", ParentID: "zone-1",
+	})
+	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
+
+	res, err := New(st, NewRegistry(dns)).Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceDNSRecord, StepAdopt)
+	if dns.ensures != 0 {
+		t.Error("re-attributing a record is a row change, not an upstream one")
+	}
+	if got := st.rows[key(spec.Hostname, model.ResourceDNSRecord)].ServiceKey; got != "interlock" {
+		t.Errorf("service_key = %q, want the spec's owner", got)
+	}
 }
 
 // An existing resource that does not match the spec is an update, not a create:

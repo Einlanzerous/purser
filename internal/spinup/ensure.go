@@ -3,6 +3,7 @@ package spinup
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/Einlanzerous/purser/internal/model"
 )
@@ -92,6 +93,16 @@ const (
 	StepAdopt StepStatus = "adopt"
 	// StepCreate — nothing is there; apply creates it.
 	StepCreate StepStatus = "create"
+	// StepMissing — Purser recorded this resource and upstream does not have
+	// it. Apply recreates it, so the action is a create; the *news* is not.
+	//
+	// Distinct from StepCreate because something Purser created was removed
+	// outside Purser, and a report that calls that "create" never says so. It is
+	// this axis's AccountStale, with one difference: marking the row there
+	// re-arms provisioning, because the invite orchestrator reads the row —
+	// here Ensure reads upstream, so there is nothing to re-arm and nothing to
+	// mark. The row is rebound to whatever the recreate returns.
+	StepMissing StepStatus = "missing"
 	// StepUpdate — something is there and does not match the spec; apply
 	// updates it in place. Kept distinct from create because on the tunnel this
 	// is the read-modify-write of shared state, and an operator reading a plan
@@ -106,6 +117,20 @@ const (
 	// live. Distinct from skipped: the same line would otherwise say "nothing to
 	// think about" for a resource that is still serving traffic.
 	StepOrphaned StepStatus = "orphaned"
+	// StepBlocked — this step would have acted, and was held back because a step
+	// it depends on is not in place. See ServiceSpec.dependsOn.
+	//
+	// It is what makes KindOrder more than a preference. Ordering puts DNS last
+	// so a gated service never resolves before its Access application exists,
+	// but ordering alone only closes that window when the earlier step
+	// *succeeded* — publish the record anyway after a failed, unavailable or
+	// unreadable Access step and the service is live and ungated, which is the
+	// one outcome this axis must not produce quietly.
+	//
+	// Only creates and changes are blocked. A resource that already matches the
+	// spec is reported normally: it is already published, so withholding a row
+	// (or a report line) protects nobody and hides the state.
+	StepBlocked StepStatus = "blocked"
 	// StepUnavailable — no provisioner for the kind, or one that isn't
 	// configured. Nothing broke and nothing was done; mirrors
 	// model.TaskUnavailable.
@@ -185,20 +210,43 @@ func (r *Result) Changed() int {
 }
 
 // Pending reports how many steps still want doing — the count that makes
-// "nothing to do" distinguishable from "re-run with --apply". Statuses that
-// need a human (unavailable, unknown, failed) are not counted here: re-running
-// with --apply does not fix them.
+// "nothing to do" distinguishable from "re-run with --apply". Statuses that need
+// a human (unavailable, unknown, failed) are not counted here, and neither is
+// blocked: re-running with --apply does not fix any of them, because the reason
+// they didn't happen was never the missing flag.
 func (r *Result) Pending() int {
 	n := 0
 	for _, f := range r.Findings {
 		switch f.Status {
-		case StepCreate, StepUpdate, StepAdopt:
+		case StepCreate, StepUpdate, StepAdopt, StepMissing:
 			if !f.Applied {
 				n++
 			}
 		}
 	}
 	return n
+}
+
+// inPlace reports whether this step leaves its resource in place for a later
+// step to depend on. It is the predicate behind StepBlocked.
+//
+// StepCreate and StepUpdate count because they only *survive* as those statuses
+// when the write landed — an apply that failed reports StepFailed — and on a dry
+// run they describe what the apply is going to do, which is what makes a plan's
+// DNS line read "create" rather than "blocked" when the whole spec is new.
+// StepAppliedNotRecorded counts too: the edge changed, and only the bookkeeping
+// didn't.
+//
+// Everything else is false, including a failed adopt — where upstream was
+// already correct and only the row write failed. Over-blocking there is
+// deliberate: Purser's records are wrong at that moment, and publishing a
+// hostname is the wrong response to not knowing what you have.
+func (f StepFinding) inPlace() bool {
+	switch f.Status {
+	case StepOK, StepAdopt, StepCreate, StepUpdate, StepAppliedNotRecorded:
+		return true
+	}
+	return false
 }
 
 // Ensure runs a spin-up, or — by default — reports what it would do.
@@ -243,15 +291,45 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 	}
 
 	res := &Result{Spec: spec, Applied: req.Apply}
+	// Findings so far, so a step can see whether the steps it depends on are in
+	// place. KindOrder is an apply order, so a dependency has always been
+	// decided by the time its dependent is reached.
+	done := make(map[model.ResourceKind]StepFinding, len(model.KindOrder))
 	for _, kind := range model.KindOrder {
 		rec, hasRec := active[kind]
+		var f StepFinding
 		if !spec.callsFor(kind) {
-			res.Findings = append(res.Findings, notApplicable(kind, spec, rec, hasRec, s.registry))
-			continue
+			f = notApplicable(kind, spec, rec, hasRec, s.registry)
+		} else {
+			f = s.ensureOne(ctx, target, kind, rec, hasRec, req.Apply, unmetDeps(spec, kind, done))
 		}
-		res.Findings = append(res.Findings, s.ensureOne(ctx, target, kind, rec, hasRec, req.Apply))
+		done[kind] = f
+		res.Findings = append(res.Findings, f)
 	}
 	return res, nil
+}
+
+// unmetDeps returns the prerequisites of kind that this run has not put in
+// place. Empty is the normal case: only DNS has any.
+func unmetDeps(spec ServiceSpec, kind model.ResourceKind, done map[model.ResourceKind]StepFinding) []model.ResourceKind {
+	var unmet []model.ResourceKind
+	for _, dep := range spec.dependsOn(kind) {
+		if f, decided := done[dep]; !decided || !f.inPlace() {
+			unmet = append(unmet, dep)
+		}
+	}
+	return unmet
+}
+
+// blockedDetail explains which prerequisites held a step back, naming them so
+// the operator doesn't have to infer it from the other lines.
+func blockedDetail(unmet []model.ResourceKind) string {
+	names := make([]string, len(unmet))
+	for i, k := range unmet {
+		names[i] = string(k)
+	}
+	return fmt.Sprintf("held back: %s did not land, and publishing this first is what it is ordered to prevent",
+		strings.Join(names, " and "))
 }
 
 // notApplicable reports a kind this spec doesn't call for — and says so louder
@@ -275,7 +353,7 @@ func notApplicable(kind model.ResourceKind, spec ServiceSpec, rec model.ServiceR
 // Like offboardOne it returns no error: every outcome is a finding. Once a step
 // has changed the edge, aborting would discard the findings accumulated so far
 // and leave the operator with an error and no idea what was already created.
-func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKind, rec model.ServiceResource, hasRec bool, apply bool) StepFinding {
+func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKind, rec model.ServiceResource, hasRec bool, apply bool, unmet []model.ResourceKind) StepFinding {
 	f := StepFinding{Kind: kind, DisplayName: string(kind)}
 
 	prov, ok := s.registry.Get(kind)
@@ -306,17 +384,36 @@ func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKi
 	f.Detail, f.ExternalID = state.Detail, state.ExternalID
 
 	switch {
+	case !state.Exists && hasRec:
+		// Purser created this and something removed it. The apply recreates it,
+		// like a create, but an operator reading "create" would never learn that
+		// a resource of theirs was deleted outside Purser.
+		f.Status = StepMissing
 	case !state.Exists:
 		f.Status = StepCreate
 	case !state.Matches:
 		f.Status = StepUpdate
-	case !hasRec || rec.ExternalID != state.ExternalID || rec.ParentID != state.ParentID:
-		// Correct upstream, but Purser's records don't have it or don't agree
-		// about which object it is. The fix is a row, not an API call.
+	case !hasRec || rec.ExternalID != state.ExternalID || rec.ParentID != state.ParentID || rec.ServiceKey != t.Spec.Key:
+		// Correct upstream, but Purser's records don't have it, don't agree
+		// about which object it is, or still attribute it to the service that
+		// held this hostname before. The fix is a row, not an API call — and the
+		// service_key comparison is what stops a reassigned hostname reporting
+		// `ok` forever while `ServiceResourcesFor` answers with the old owner.
 		f.Status = StepAdopt
 	default:
 		f.Status = StepOK
 		return f
+	}
+
+	// Held back rather than run. Only acting statuses are gated: an adopt writes
+	// a row and changes nothing upstream, and an already-correct resource is
+	// already published, so neither can open the window this guards.
+	if len(unmet) > 0 {
+		switch f.Status {
+		case StepCreate, StepUpdate, StepMissing:
+			f.Status, f.Detail = StepBlocked, blockedDetail(unmet)
+			return f
+		}
 	}
 
 	if !apply {
@@ -344,12 +441,23 @@ func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKi
 		f.Status, f.Err = StepFailed, err.Error()
 		return f
 	}
-	if res.Detail != "" {
-		f.Detail = res.Detail
-	}
-	f.ExternalID = res.ExternalID
+	// Overwritten, not merged: Detail describes what is there *now*, and keeping
+	// Inspect's description of the state this call just replaced would present
+	// the old world as the result. A provisioner that returns none leaves the
+	// line without a description, which is honest.
+	f.Detail = res.Detail
 
-	if _, err := s.record(ctx, t, kind, res.ExternalID, res.ParentID); err != nil {
+	// The ids are merged the other way round, and deliberately. A provisioner
+	// that returns a partial Resource — an update that had nothing new to say,
+	// a create whose response omitted the id — must not blank out a known-good
+	// external_id, because that id is the only handle Teardown has: an empty one
+	// means "this kind has none" (a tunnel route), so a wiped id reads as a
+	// resource that can never be targeted rather than as a lost value. Falls
+	// back to what Inspect just saw, then to what was already recorded.
+	f.ExternalID = firstNonEmpty(res.ExternalID, state.ExternalID, rec.ExternalID)
+	parentID := firstNonEmpty(res.ParentID, state.ParentID, rec.ParentID)
+
+	if _, err := s.record(ctx, t, kind, f.ExternalID, parentID); err != nil {
 		// The edge changed and the bookkeeping didn't. Reported as its own state
 		// and never swallowed: a teardown targets recorded ids, so until a later
 		// run adopts this back, Purser cannot remove what it just created.
@@ -358,6 +466,16 @@ func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKi
 	}
 	f.Applied = true
 	return f
+}
+
+// firstNonEmpty returns the first non-empty string, or "".
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // record writes the durable "this exists at the edge" row.

@@ -7,7 +7,19 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Einlanzerous/purser/internal/model"
+	"github.com/Einlanzerous/purser/internal/spinup"
 )
+
+// The orchestrator's Store interface says *store.Store satisfies it. Nothing
+// wires the two together yet — the provisioners and the CLI are still to come —
+// so without this the claim is a comment, and the first thing to try wiring them
+// would be the first thing to find out it wasn't true.
+//
+// It lives here rather than in spinup because the dependency only runs one way:
+// spinup imports internal/model and nothing else of ours, deliberately, so that
+// the provisioner packages don't pull the store in behind it. A test-only import
+// in this direction costs nothing and cannot become a cycle.
+var _ spinup.Store = (*Store)(nil)
 
 // resourceStore is testStore plus the spin-up table, which the person-axis
 // truncate deliberately doesn't touch — the two axes share nothing.

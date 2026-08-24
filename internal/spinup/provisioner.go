@@ -120,28 +120,58 @@ type Registry struct {
 	byKind map[model.ResourceKind]ServiceProvisioner
 }
 
-// NewRegistry builds a registry. It panics on a duplicate kind, which is a
-// wiring error rather than a runtime condition: two provisioners for one kind
-// means one of them silently never runs.
+// NewRegistry builds a registry. It panics on a duplicate kind, and on a kind
+// outside model.KindOrder — both are wiring errors rather than runtime
+// conditions, and both fail the same silent way if tolerated.
+//
+// The unknown-kind check is the less obvious of the two and the more dangerous.
+// The orchestrator walks KindOrder, so a provisioner registered under a typo'd
+// or not-yet-supported kind is never asked to do anything and never appears in a
+// report: the spin-up looks complete while a step of it was never run. A panic
+// at wiring time is the only place that can be caught cheaply.
 func NewRegistry(ps ...ServiceProvisioner) *Registry {
 	r := &Registry{byKind: make(map[model.ResourceKind]ServiceProvisioner, len(ps))}
 	for _, p := range ps {
-		if _, dup := r.byKind[p.Kind()]; dup {
-			panic(fmt.Sprintf("spinup: duplicate provisioner kind %q", p.Kind()))
+		kind := p.Kind()
+		if !knownKind(kind) {
+			panic(fmt.Sprintf("spinup: provisioner kind %q is not one the orchestrator runs (known: %v)", kind, model.KindOrder))
 		}
-		r.byKind[p.Kind()] = p
+		if _, dup := r.byKind[kind]; dup {
+			panic(fmt.Sprintf("spinup: duplicate provisioner kind %q", kind))
+		}
+		r.byKind[kind] = p
 	}
 	return r
 }
 
+// knownKind reports whether the orchestrator will ever ask for this kind.
+func knownKind(kind model.ResourceKind) bool {
+	for _, k := range model.KindOrder {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
 // Get returns the provisioner for a kind, or (nil, false).
+//
+// Nil-safe: a Service built with no registry reports every step unavailable —
+// which is what an unconfigured deployment should look like — rather than
+// panicking partway through a spec.
 func (r *Registry) Get(kind model.ResourceKind) (ServiceProvisioner, bool) {
+	if r == nil {
+		return nil, false
+	}
 	p, ok := r.byKind[kind]
 	return p, ok
 }
 
 // Kinds returns the registered kinds, in model.KindOrder.
 func (r *Registry) Kinds() []model.ResourceKind {
+	if r == nil {
+		return nil
+	}
 	out := make([]model.ResourceKind, 0, len(r.byKind))
 	for _, k := range model.KindOrder {
 		if _, ok := r.byKind[k]; ok {

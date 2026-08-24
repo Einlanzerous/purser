@@ -88,29 +88,40 @@ func (s *Store) MarkServiceResourceRemoved(ctx context.Context, id uuid.UUID) er
 // in KindOrder — including removed ones, so a caller can tell "never created"
 // from "torn down". Matched case-insensitively, like the index.
 func (s *Store) ServiceResourcesForHostname(ctx context.Context, hostname string) ([]model.ServiceResource, error) {
-	return s.serviceResources(ctx, `lower(hostname) = lower($1)`, hostname)
+	return s.serviceResources(ctx, &hostname, nil)
 }
 
 // ServiceResourcesFor returns every resource recorded for a service, across all
 // of its hostnames — a dev and a prod hostname are separate rows for the same
 // service_key (PRSR-33).
+//
+// Matched exactly: ServiceSpec.Normalized lowercases the key before anything
+// writes it, so the folding happens once, at the boundary, rather than on every
+// read of an unindexed column.
 func (s *Store) ServiceResourcesFor(ctx context.Context, serviceKey string) ([]model.ServiceResource, error) {
-	return s.serviceResources(ctx, `service_key = $1`, serviceKey)
+	return s.serviceResources(ctx, nil, &serviceKey)
 }
 
 // serviceResources is the shared body of the two lookups above: one column list
 // and one ordering, so they cannot drift.
 //
+// Both filters are nullable parameters rather than a SQL fragment the caller
+// passes in — the same shape accountRecords uses. A concatenated WHERE has to
+// agree with hardcoded placeholder numbers further down the statement, so the
+// first predicate that needs two parameters binds the kind-order array to the
+// wrong one, and it fails as wrong rows rather than as an error.
+//
 // The ordering is by kind's position in model.KindOrder rather than
 // alphabetically, so a report reads in the order a spin-up applies the steps.
-func (s *Store) serviceResources(ctx context.Context, where string, arg any) ([]model.ServiceResource, error) {
+func (s *Store) serviceResources(ctx context.Context, hostname, serviceKey *string) ([]model.ServiceResource, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, service_key, hostname, kind, external_id, parent_id, status,
 		       created_at, updated_at, removed_at
 		FROM service_resource
-		WHERE `+where+`
-		ORDER BY hostname, array_position($2::text[], kind)`,
-		arg, kindOrderText())
+		WHERE ($1::text IS NULL OR lower(hostname) = lower($1))
+		  AND ($2::text IS NULL OR service_key = $2)
+		ORDER BY hostname, array_position($3::text[], kind)`,
+		hostname, serviceKey, kindOrderText())
 	if err != nil {
 		return nil, fmt.Errorf("store: service resources: %w", err)
 	}

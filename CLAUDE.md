@@ -233,11 +233,19 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   that is the mistake re-running doesn't fix. As with `offboard`, preview and
   apply are one code path: a single `Inspect` per step (read-only by contract)
   decides the plan, and `--apply` is that same decision plus the write.
-- **DNS is applied last** (`model.KindOrder`). It is the step that makes the
-  hostname live; the other two are inert until something resolves. Publishing
-  the record first leaves a tunnelled service answering 502 until its route
-  lands and — the reason this is an invariant — a service meant to be gated
-  reachable *ungated* until its Access app exists.
+- **DNS is applied last, and only if what it depends on landed.**
+  `model.KindOrder` puts it last because it is the step that makes the hostname
+  live; the other two are inert until something resolves. But ordering only
+  closes the window when the earlier step *succeeded*, so `ServiceSpec.dependsOn`
+  holds the DNS step (`StepBlocked`) when a prerequisite is failed, unavailable
+  or unknown. Publishing anyway leaves a tunnelled service answering 502 until
+  its route lands and — the reason this is an invariant and not a preference — a
+  service meant to be gated reachable *ungated*, which is self-concealing in a
+  way the 502 isn't. A **bookmark** Access app is deliberately not a
+  prerequisite: it is a launcher tile in front of a service with its own login,
+  so its absence costs an icon, not a gate. Blocking withholds changes, never the
+  report — an already-correct record is already published, and an `adopt` writes
+  a row without touching the edge.
 - **An already-correct resource is adopted, not recreated.** Upstream matching
   the spec with no record of ours is `adopt`: `--apply` writes the row and makes
   no upstream call. Argosy's edge predates this axis, so the pilot is a service
