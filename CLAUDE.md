@@ -16,12 +16,17 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `person add|list|show`, `audit`, `reconcile`, `migrate`, `version`).
   Composition root: `setup()` wires store + connectors + orchestrator.
 - `internal/model/` — domain types (person, service, account, invite,
-  provision_task), 1:1 with the schema.
+  provision_task, service_resource), 1:1 with the schema.
 - `internal/connector/` — the `Connector` interface + `Registry` +
   `Unavailable` (registered-but-unconfigured) + `ErrPending`.
 - `internal/connectors/{switchyard,cloudflare,lyceum,argosy}/` — per-service connectors.
 - `internal/invite/` — the orchestrator (`Run`) + credential-block renderer. This
   is where idempotency lives.
+- `internal/spinup/` — the **second axis** (PRSR-27): `ServiceSpec`, the
+  `ServiceProvisioner` interface, its own `Registry`/`Unavailable`/
+  `ErrUnavailable`, and the `Ensure` orchestrator. Keyed on hostname, not on a
+  person. It imports `internal/model` and nothing else of ours — deliberately
+  not `internal/connector`, and not `internal/store`.
 - `internal/store/` — pgx pool, embedded migrator, repo queries.
 - `internal/delivery/` — SMTP sender (email delivery).
 - `internal/api/` — thin HTTP surface.
@@ -210,6 +215,62 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   failed-only retry is safe.
 - Per-service failures must not abort the whole invite.
 
+### The spin-up axis (`internal/spinup`, PRSR-27)
+
+- **It is a second interface, not a widened first one.** Everything above is
+  person-shaped — `Connector.Provision(Input{PersonName, Email, …})`, idempotent
+  per (person × service). Spin-up provisions the infrastructure that makes a
+  service *exist*, is keyed on hostname, and is idempotent per (hostname, kind).
+  Bending `Connector` to serve both would mean widening `Input` until neither
+  axis's fields mean anything. The two share an ethos and no types; `spinup`
+  does not import `connector`, and its `ErrUnavailable` is its own sentinel
+  because `ErrPending`'s wording is pinned by migration 0004's backfill.
+- **`Ensure` previews; `--apply` acts.** The inverse of `invite`, matching
+  `offboard`, and settled here so the DNS/Access/tunnel provisioners can't
+  disagree. Two of the three steps are additive and idempotent, which argues for
+  acting — but the third appends to a tunnel's ingress configuration, a
+  read-modify-write of one document holding every *other* service's routes, and
+  that is the mistake re-running doesn't fix. As with `offboard`, preview and
+  apply are one code path: a single `Inspect` per step (read-only by contract)
+  decides the plan, and `--apply` is that same decision plus the write.
+- **DNS is applied last, and only if what it depends on landed.**
+  `model.KindOrder` puts it last because it is the step that makes the hostname
+  live; the other two are inert until something resolves. But ordering only
+  closes the window when the earlier step *succeeded*, so `ServiceSpec.dependsOn`
+  holds the DNS step (`StepBlocked`) when a prerequisite is failed, unavailable
+  or unknown. Publishing anyway leaves a tunnelled service answering 502 until
+  its route lands and — the reason this is an invariant and not a preference — a
+  service meant to be gated reachable *ungated*, which is self-concealing in a
+  way the 502 isn't. A **bookmark** Access app is deliberately not a
+  prerequisite: it is a launcher tile in front of a service with its own login,
+  so its absence costs an icon, not a gate. Blocking withholds changes, never the
+  report — an already-correct record is already published, and an `adopt` writes
+  a row without touching the edge.
+- **An already-correct resource is adopted, not recreated.** Upstream matching
+  the spec with no record of ours is `adopt`: `--apply` writes the row and makes
+  no upstream call. Argosy's edge predates this axis, so the pilot is a service
+  that already exists — a spin-up that can only recognise what it built itself is
+  one nobody will point at production, and re-creating a live DNS record to
+  obtain a row is the wrong way to learn its id.
+- **A resource row exists only for a resource that exists.** A failed step
+  records nothing, so "no row" means "we put nothing here", never "we tried".
+  That is what lets `Teardown` target recorded ids instead of guessing by
+  hostname — deleting a record someone made by hand is not fixed by re-running.
+  The inverse gets its own status: `applied-not-recorded` means the edge changed
+  and the write didn't, the opposite advice from `failed` (compare
+  `revoked-not-recorded`, PRSR-17). And `service_resource.hostname` is unique
+  case-insensitively, for the same reason `person.email` is (migration 0003).
+- **The tunnel is a spec field, not a global** (PRSR-33). The account has two
+  healthy tunnels; a dev instance is the same shape pointed at a different one.
+  Specs name a ref (`prod` | `dev`) and `TunnelSet` resolves it to an id once per
+  run, before any step, so the ingress route and the DNS record cannot end up
+  describing different tunnels. Only `prod` is wired; `dev` resolves to a
+  refusal rather than falling back — which is the entire point of a named ref.
+- **Never treat unverifiable as absent**, here too. A failed `Inspect` is
+  `unknown`, and `--apply` does not act on an unknown step: acting on a state
+  that couldn't be read creates a second copy of something, or rebuilds a shared
+  ingress document from a read that just failed.
+
 ## Testing
 
 - `make test` — unit tests (fake store + fake connectors for the orchestrator;
@@ -241,24 +302,43 @@ what" from local records so nobody has to reach for psql, and `purser offboard`
 connectors revoking, Argosy reporting `unavailable` until it has an endpoint, and
 `deprovisioned` finally a status something writes.
 
-Open, in rough priority order: nothing runs the audit on a schedule (PRSR-18).
-Argosy has no delete or disable endpoint, so it is the one service `offboard`
-cannot close (ARGY ticket pending). Purser still authenticates to Switchyard as
-the instance bootstrap token rather than a dedicated one (PRSR-25 — PRSR-3
-shipped the bootstrap fallback and is closed; the hardening is what's left). The
-`purser` agent user exists now, so all that remains there is minting its token,
-and that is blocked on SERV-49: the assistant's MCP token holds no
-`users:manage`, so `create_user_token` 403s. Service spin-up is a separate axis,
-not started: epic PRSR-22. Its prereq PRSR-11 was split (2026-08-15) once it
-turned out to gate more than it had to, and its **access half is now done** — the
-CF token carries Zone→DNS→Edit (scoped to `zerogravity.industries`) and
-Account→Cloudflare Tunnel→Edit, both probed against the live API, and the zone
-and tunnel ids are recorded on the ticket. Edit subsumes Read in Cloudflare's
-model, so there is no separate read scope to grant: keeping `Reconcile`
-read-only is a constraint on the code, not on the token. What is left of PRSR-11
-is the repo-side plumbing — `PURSER_CF_ZONE_ID` / `PURSER_CF_TUNNEL_ID` through
-`internal/config`, `.env.example`, the deploy compose, and the README's scope
-docs. PRSR-26 asked whether cloudflared is remotely-managed or driven by a local
-`config.yml` and closed done: `source: "cloudflare"`, so the tunnel connector is
-an ordinary API client and no tunnel migration is needed. The DNS connector is
-the first build and waits on PRSR-11's plumbing alone.
+**Service spin-up (epic PRSR-22) is in progress**, and its prerequisites are
+done. PRSR-11 closed both halves: the CF token carries Zone→DNS→Edit (scoped to
+`zerogravity.industries`) and Account→Cloudflare Tunnel→Edit, both probed
+against the live API, and `PURSER_CF_ZONE_ID` / `PURSER_CF_TUNNEL_ID` ship
+through `internal/config`, `.env.example` and the deploy compose as of v0.14.0.
+Edit subsumes Read in Cloudflare's model, so there is no separate read scope to
+grant: keeping `Reconcile` read-only is a constraint on the code, not on the
+token. PRSR-26 closed done — the tunnel is remotely-managed (`source:
+"cloudflare"`), so the tunnel connector is an ordinary API client and no tunnel
+migration is needed.
+
+PRSR-27 landed the foundation: `internal/spinup` (spec, `ServiceProvisioner`,
+registry, `Ensure` orchestrator) and `service_resource` (migration 0007). It
+settled the two questions the connectors were waiting on — preview by default,
+and the tunnel as a spec field — and it deliberately stops short of the three
+provisioners and the CLI. `Teardown` is on the interface, because the resource
+table exists to give it concrete ids to target, but nothing orchestrates a
+teardown yet: its ordering and its "is this hostname still someone's?" question
+belong with the command that needs them.
+
+Next on that axis, and independent of each other now: **PRSR-28** (DNS record),
+**PRSR-29** (Access application — `self_hosted` + policy vs `bookmark`, and a
+`logo_url` that must be verified reachable before it is written) and **PRSR-30**
+(tunnel ingress route — insert before the terminal catch-all rule, and guard the
+shared document the way the Access connector guards the group's email list).
+Then **PRSR-31** — the `provision-service` CLI/HTTP surface and Argosy end to
+end, on the direct path, so it needs PRSR-28 and PRSR-29 but not PRSR-30.
+**PRSR-33** wires the `dev` tunnel ref that PRSR-27 left resolving to a refusal.
+
+Also open: nothing runs the audit on a schedule (PRSR-18). Argosy has no delete
+or disable endpoint, so it is the one service `offboard` cannot close (ARGY
+ticket pending).
+
+PRSR-25 — the dedicated Switchyard provisioning token — reads as closed/done on
+the board, but its own last comment (2026-08-15) records step 2, minting the
+token, as still blocked on SERV-49, which is still in Backlog: the assistant's
+MCP token holds no `users:manage`. The `purser` agent user itself has existed
+since 2026-08-01. Check what `PURSER_SWITCHYARD_TOKEN` actually holds before
+repeating either answer — the board and the thread disagree, and this file has
+been wrong about it in both directions.
