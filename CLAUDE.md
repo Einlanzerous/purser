@@ -320,7 +320,10 @@ and the tunnel as a spec field — and it deliberately stops short of the three
 provisioners and the CLI. `Teardown` is on the interface, because the resource
 table exists to give it concrete ids to target, but nothing orchestrates a
 teardown yet: its ordering and its "is this hostname still someone's?" question
-belong with the command that needs them.
+are **PRSR-34**. That has a key rather than a comment on a closed ticket for a
+reason — twice now this project has lost the remaining half of a piece of work
+by closing the ticket that described it (see PRSR-25, below) — so don't delete
+that interface method as dead code; it is waiting on a walk, not unused.
 
 Next on that axis, and independent of each other now: **PRSR-28** (DNS record),
 **PRSR-29** (Access application — `self_hosted` + policy vs `bookmark`, and a
