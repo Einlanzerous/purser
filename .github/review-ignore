@@ -1,0 +1,40 @@
+# Paths the PR reviewer does not read (SERV-87).
+#
+# One extended regex per line, matched against the repository-relative path of
+# every changed file. `#` comments and blank lines are ignored.
+#
+# Per-repo on purpose even though the workflow is shared (SERV-92): which
+# artifacts are generated is a fact about this repository. The shared workflow
+# reads this from the BASE ref of the PR under review, so widening it in a PR
+# does not exempt that PR — and this path is in `sensitive_paths`, so the PR
+# proposing the edit gets the deeper pass.
+#
+# What belongs here is regenerated artifacts, not merely large files. The test
+# is: if this file is wrong, is the fix to edit it? For a generated file the
+# answer is no — you re-run the generator — so a review comment on its diff has
+# nowhere to land. A large hand-written file is exactly what the reviewer should
+# be spending its budget on.
+
+# release-please owns both of these and rewrites them wholesale. A release PR
+# touching only these is already skipped a rule earlier, by the release-PR test
+# that derives its expected set from `release-please-config.json`; this covers
+# the case where one rides along with code. `CHANGELOG.md` is also `.md`, so the
+# docs-only rule would catch it alone; the manifest would not.
+^CHANGELOG\.md$
+^\.release-please-manifest\.json$
+
+# NOT excluded, deliberately, and each for a reason:
+#
+#   go.sum        — a dependency tree, but also the checksum database. A line
+#                   moving here without a matching go.mod change is the shape of
+#                   a supply-chain problem, and that is worth a read.
+#   migrations/   — hand-written SQL, applied automatically at boot by the
+#                   in-process migrator. In `sensitive_paths`.
+#   docs/architecture.md — 676 lines of hand-written design record. The
+#                   docs-only rule already skips a PR that touches nothing else;
+#                   excluding it here would also drop it from a code PR, where
+#                   a design doc contradicting the diff is the finding.
+#   deploy/Dockerfile, deploy/construct-server.compose.yml, Makefile — hand-
+#                   written build and deploy definitions, and the place the
+#                   version string has to agree with `internal/version` and
+#                   `publish.yml` character for character (PRSR-32).
