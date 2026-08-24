@@ -668,8 +668,9 @@ already published, so it is still reported and still adopted.
 - **PRSR-31** — `purser provision-service` and Argosy end to end. On the direct
   path, so it needs PRSR-28 and PRSR-29 but not PRSR-30. The first honest
   exercise is `Ensure` against a service that is already up, reporting no-ops.
-
-`Teardown` is on the interface — the resource table exists to give it concrete
-ids to target rather than a hostname to guess from — but nothing orchestrates
-one yet. Its ordering, and the question of whether a hostname is still someone
-else's, belong with the command that needs them.
+- **PRSR-34** — orchestrating `Teardown`. The interface method exists and the
+  resource table exists to give it concrete ids to target rather than a hostname
+  to guess from, but nothing walks it. Its ordering is almost certainly the
+  inverse of the table above — remove the DNS record first, so the hostname stops
+  resolving, before pulling the route or the gate — and the open question is
+  whether a recorded hostname is still that service's to remove.
