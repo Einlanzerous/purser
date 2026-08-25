@@ -432,7 +432,7 @@ func TestEnsure_CreatesGatedAppWithPolicyAndLogo(t *testing.T) {
 	if len(policies) != 1 {
 		t.Fatalf("want one policy, got %v", api.lastBody["policies"])
 	}
-	if !allowsGroup(rawApp(api.lastBody), testGroup) {
+	if groupPolicy(rawApp(api.lastBody), testGroup) != policyAdmitsGroup {
 		t.Fatalf("the created policy must admit the members group, got %v", policies)
 	}
 }
@@ -455,7 +455,7 @@ func TestEnsure_BrokenLogoIsOmittedNotFatal(t *testing.T) {
 	if !strings.Contains(res.Detail, "logo omitted") {
 		t.Fatalf("the report must say the logo was dropped, got %q", res.Detail)
 	}
-	if !allowsGroup(rawApp(api.lastBody), testGroup) {
+	if groupPolicy(rawApp(api.lastBody), testGroup) != policyAdmitsGroup {
 		t.Fatal("the gate must still have been created")
 	}
 }
@@ -617,6 +617,115 @@ func TestFindApp_NoResultInfoMeansOnePage(t *testing.T) {
 	}
 	if api.listPages != 1 {
 		t.Fatalf("made %d list requests, want exactly 1", api.listPages)
+	}
+}
+
+// The reviewer's scenario, and the one the round-2 test missed because its live
+// app carried an empty policy list: a gated app that already admits the members
+// group *and* something else. The only drift is a rotted logo, so the plan says
+// "fix a logo" — and an assignment to `policies` would quietly remove the other
+// policy while doing it.
+func TestEnsure_UpdateKeepsPoliciesThatAreNotPursers(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	monitor := map[string]any{
+		"decision": "allow",
+		"include":  []any{map[string]any{"service_token": map[string]any{"token_id": "uptime-monitor"}}},
+	}
+	api := &accessAPI{apps: []map[string]any{{
+		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
+		"app_launcher_visible": true, "logo_url": "https://dead.example/mark.png",
+		"policies": []any{
+			map[string]any{
+				"decision": "allow",
+				"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
+			},
+			monitor,
+		},
+	}}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	sent, _ := api.lastBody["policies"].([]any)
+	if len(sent) != 2 {
+		t.Fatalf("sent %d policies, want both kept: %v", len(sent), sent)
+	}
+	if groupPolicy(rawApp(api.lastBody), testGroup) != policyAdmitsGroup {
+		t.Error("the members policy must survive")
+	}
+	var keptMonitor bool
+	for _, raw := range sent {
+		pol, _ := raw.(map[string]any)
+		inc, _ := pol["include"].([]any)
+		for _, r := range inc {
+			if rule, _ := r.(map[string]any); rule != nil {
+				if _, ok := rule["service_token"]; ok {
+					keptMonitor = true
+				}
+			}
+		}
+	}
+	if !keptMonitor {
+		t.Error("the service-token policy was deleted by an update that only meant to fix a logo")
+	}
+}
+
+// Missing the members policy is an append, not a replacement: the gate goes in
+// and whatever else was there stays.
+func TestEnsure_MissingGroupPolicyIsAppended(t *testing.T) {
+	other := map[string]any{
+		"decision": "allow",
+		"include":  []any{map[string]any{"email": map[string]any{"email": "ops@example.com"}}},
+	}
+	api := &accessAPI{apps: []map[string]any{{
+		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
+		"app_launcher_visible": true,
+		"policies":             []any{other},
+	}}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, "")}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	sent, _ := api.lastBody["policies"].([]any)
+	if len(sent) != 2 {
+		t.Fatalf("sent %d policies, want the existing one plus ours: %v", len(sent), sent)
+	}
+	if groupPolicy(rawApp(api.lastBody), testGroup) != policyAdmitsGroup {
+		t.Error("the members policy should have been appended")
+	}
+}
+
+// A policy list this cannot interpret is left exactly as it is, and reported as
+// a note rather than as drift — rewriting a gate on the strength of not being
+// able to read it is worse than not knowing.
+func TestUnreadablePolicyListIsLeftAlone(t *testing.T) {
+	live := []any{"pol-abc123", "pol-def456"} // bare references
+	api := &accessAPI{apps: []map[string]any{{
+		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
+		"app_launcher_visible": true,
+		"policies":             live,
+	}}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, GroupName: "zerogravity-members"})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !st.Matches {
+		t.Fatalf("an unreadable policy list is not drift: %s", st.Detail)
+	}
+	if !strings.Contains(st.Detail, "could not be read") {
+		t.Fatalf("detail should report the unverified policies, got %q", st.Detail)
+	}
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, "")}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	sent, _ := api.lastBody["policies"].([]any)
+	if len(sent) != 2 {
+		t.Fatalf("the reference list must be carried through untouched, got %v", sent)
 	}
 }
 

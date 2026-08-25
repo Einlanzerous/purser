@@ -376,6 +376,16 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   logo would delete the rule that gates the service, which then stays up, keeps
   resolving, and admits everyone. Only spec-owned keys are written and only
   `id`/`uid`/`aud`/`created_at`/`updated_at` are stripped.
+  **`policies` is appended to, never assigned** — that was the same bug by a
+  second route, and worse for being invisible: an app already admitting the
+  members group reports only its rotted logo as drift, so the plan says "fix a
+  logo" while the apply deletes whoever else was allowed (a service token for an
+  uptime monitor, a second group). The spec says this service is gated by the
+  members group; it does not say the group is the only thing that may reach it,
+  and the difference is somebody else's access. A policy list that cannot be
+  read — Cloudflare is documented to return bare references for apps whose
+  policies are managed separately — is left untouched and reported as a note,
+  for the same reason an unfetchable logo is.
 - **A logo has three outcomes, not two, and none of them fails the step.**
   Cloudflare stores any `logo_url` without validating it and the launcher falls
   back to the service's initials, so a wrong URL is indistinguishable from an

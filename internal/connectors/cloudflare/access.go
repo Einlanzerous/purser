@@ -342,13 +342,45 @@ func (p *AccessProvisioner) desiredApp(base rawApp, spec spinup.ServiceSpec, log
 
 	switch spec.Access {
 	case spinup.AccessGated:
-		out["policies"] = []any{p.membersPolicy()}
+		// Appended, never assigned. Assigning `[membersPolicy]` here would delete
+		// every *other* policy the application carries — a service token for an
+		// uptime monitor, a second group — which is the identical outcome to the
+		// naive PUT that rawApp exists to prevent, reached by a different route.
+		//
+		// It is also invisible in the plan: diff only emits a policy line when the
+		// group is NOT admitted, so an app that already has the members policy plus
+		// one more reports its rotted logo as the single drift, and the operator
+		// approves "fix a logo" while the apply removes somebody's access.
+		//
+		// The spec says this service is gated by the members group. It does not
+		// say the members group is the only thing that may reach it, and the
+		// difference is somebody else's access.
+		switch groupPolicy(base, p.cfg.GroupID) {
+		case policyMissingGroup:
+			out["policies"] = append(livePolicies(base), p.membersPolicy())
+		default:
+			// Already admitted, or a list this cannot read (see groupPolicy).
+			// Either way the existing value carries through from base untouched —
+			// rewriting a policy list we could not verify is the same mistake as
+			// clearing a logo we could not fetch.
+		}
 	case spinup.AccessBookmark:
-		// A bookmark has no policy. Sent explicitly rather than omitted so a
-		// shape that was converted from gated does not keep its old gate.
+		// A bookmark is the one case that *is* an assignment, because a bookmark
+		// has no policies by definition: a shape converted from gated must not
+		// keep its old gate, and there is nothing here anyone could have added
+		// deliberately.
 		out["policies"] = []any{}
 	}
 	return out
+}
+
+// livePolicies returns the application's current policy list, or nil.
+func livePolicies(app rawApp) []any {
+	if app == nil {
+		return nil
+	}
+	ps, _ := app["policies"].([]any)
+	return ps
 }
 
 // membersPolicy is the allow-the-members-group policy a gated app carries.
@@ -416,12 +448,20 @@ func (p *AccessProvisioner) diff(ctx context.Context, live rawApp, spec spinup.S
 		diffs = append(diffs, "hidden from the App Launcher")
 	}
 
-	if spec.Access == spinup.AccessGated && !allowsGroup(live, p.cfg.GroupID) {
-		// The one difference that matters more than the rest put together: a
-		// self_hosted app whose policy does not admit the members group is a gate
-		// nobody can pass, and one that lost its policies is a gate that may not
-		// be gating.
-		diffs = append(diffs, fmt.Sprintf("no policy admits the members group (%s)", p.displayGroup()))
+	if spec.Access == spinup.AccessGated {
+		switch groupPolicy(live, p.cfg.GroupID) {
+		case policyMissingGroup:
+			// The one difference that matters more than the rest put together: a
+			// self_hosted app whose policy does not admit the members group is a
+			// gate nobody can pass, and one that lost its policies is a gate that
+			// may not be gating.
+			diffs = append(diffs, fmt.Sprintf("no policy admits the members group (%s)", p.displayGroup()))
+		case policyUnreadable:
+			// A note, not drift. An update is a full-replacement PUT, and the one
+			// thing worse than not knowing whether the gate is in place is
+			// rewriting the list that holds it on the strength of not knowing.
+			notes = append(notes, fmt.Sprintf("policies could not be read, so whether %s is admitted is unverified — they are left as they are", p.displayGroup()))
+		}
 	}
 
 	logoDiffs, logoNotes := p.logoDiff(ctx, appStr(live, "logo_url"), spec.LogoURL)
@@ -460,27 +500,45 @@ func (p *AccessProvisioner) logoDiff(ctx context.Context, live, want string) (di
 	return nil, nil
 }
 
-// allowsGroup reports whether any of the application's policies allows the
-// group id.
+// policyVerdict is what an application's policy list says about the members
+// group. Three values rather than a bool, for the reason the logo has three:
+// "cannot tell" and "no" want different actions, and collapsing them is how a
+// list nobody could read gets rewritten anyway.
+type policyVerdict int
+
+const (
+	// policyAdmitsGroup — a policy object allows the members group.
+	policyAdmitsGroup policyVerdict = iota
+	// policyMissingGroup — the list was readable and nothing in it admits the
+	// group. The gate is not in place; append one.
+	policyMissingGroup
+	// policyUnreadable — the list holds something this cannot interpret, so
+	// whether the group is admitted is unknown. Cloudflare is documented to
+	// return bare policy *references* on applications whose policies are managed
+	// through /apps/{id}/policies — not a shape this repo has observed, which is
+	// exactly why an unreadable list is left alone rather than replaced.
+	policyUnreadable
+)
+
+// groupPolicy reports what the live application's policies say about groupID.
 //
-// Tolerant of the two shapes an app's `policies` array is known to take: full
-// policy objects, and bare id references on applications whose policies are
-// managed separately. A reference-only list cannot be checked from here, so it
-// is treated as *not* verifiably allowing the group — the conservative
-// direction, which costs an unnecessary update rather than leaving a gate
-// unverified.
-func allowsGroup(live rawApp, groupID string) bool {
-	if groupID == "" {
-		return false
-	}
+// An empty groupID is policyMissingGroup rather than unreadable: `available`
+// refuses a gated spec without one long before this is reached, so the only way
+// here is a bookmark, which never consults it.
+func groupPolicy(live rawApp, groupID string) policyVerdict {
 	policies, ok := live["policies"].([]any)
 	if !ok {
-		return false
+		// No policies key at all — a create, or an app that carries none.
+		// Readable, and it plainly does not admit the group.
+		return policyMissingGroup
 	}
+	unreadable := false
 	for _, raw := range policies {
 		pol, ok := raw.(map[string]any)
 		if !ok {
-			continue // a bare id reference: not checkable here
+			// A bare id reference. Nothing about it can be checked from here.
+			unreadable = true
+			continue
 		}
 		if decision, _ := pol["decision"].(string); decision != "allow" {
 			continue
@@ -498,12 +556,15 @@ func allowsGroup(live rawApp, groupID string) bool {
 			if !ok {
 				continue
 			}
-			if id, _ := grp["id"].(string); id == groupID {
-				return true
+			if id, _ := grp["id"].(string); id != "" && id == groupID {
+				return policyAdmitsGroup
 			}
 		}
 	}
-	return false
+	if unreadable {
+		return policyUnreadable
+	}
+	return policyMissingGroup
 }
 
 // domainHost reduces an application's `domain` to a bare lowercase hostname, so
