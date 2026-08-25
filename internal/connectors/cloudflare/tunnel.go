@@ -105,8 +105,11 @@ func NewTunnel(cfg TunnelConfig) *TunnelProvisioner {
 	return &TunnelProvisioner{cfg: cfg, api: newClient(cfg.APIToken, cfg.HTTPClient)}
 }
 
+// Kind is the resource kind this provisioner owns.
 func (p *TunnelProvisioner) Kind() model.ResourceKind { return model.ResourceTunnelRoute }
-func (p *TunnelProvisioner) DisplayName() string      { return "Cloudflare Tunnel ingress route" }
+
+// DisplayName is the label the plan uses for this step.
+func (p *TunnelProvisioner) DisplayName() string { return "Cloudflare Tunnel ingress route" }
 
 func (p *TunnelProvisioner) configured() bool {
 	return p.cfg.APIToken != "" && p.cfg.AccountID != ""
