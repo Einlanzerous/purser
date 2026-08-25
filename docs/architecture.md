@@ -581,8 +581,9 @@ Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
   SERV-49 (no `users:manage` on the assistant's MCP token). The `purser` agent
   user exists; whether `PURSER_SWITCHYARD_TOKEN` is still the instance bootstrap
   token is worth checking rather than asserting.
-- **PRSR-22 — service spin-up** (below). In progress: its prerequisites and its
-  foundation have landed, the three provisioners have not.
+- **PRSR-22 — service spin-up** (below). In progress: its prerequisites, its
+  foundation and the DNS provisioner (PRSR-28) have landed; Access and the
+  tunnel route have not, and no command wires any of them yet.
 
 ## Service spin-up (epic PRSR-22)
 
@@ -653,11 +654,62 @@ front of a service with its own login, so its absence costs an icon, not a gate.
 Blocking withholds changes, not the report: a record that already matches is
 already published, so it is still reported and still adopted.
 
+**The DNS record (PRSR-28).** `cloudflare.DNSProvisioner`, in the same package
+as the Access connector because it speaks to the same API through the same
+transport — `do()` already took a free-form path, so `/zones/{zone}/…` works as
+well as `/accounts/{acct}/…`, and it moved to a small `client` type two callers
+can hold. It does **not** share `cloudflare.Config`: the zone coordinates stay
+out of the Access connector's readiness check, or `--to cloudflare` goes offline
+for every deployment that hasn't set them.
+
+What it decides, and why:
+
+- **The two shapes.** Tunnelled is a **proxied** CNAME to
+  `<tunnel-id>.cfargotunnel.com` — the orange cloud is not a preference
+  (SERV-45), since the tunnel is reachable only from Cloudflare's edge and an
+  unproxied record resolves to something nothing can connect to. Direct is an
+  A/AAAA/CNAME chosen from the upstream's own shape, created **DNS-only**.
+- **Proxying is compared only when the spec requires it.** A direct spec says
+  nothing about the orange cloud, so neither does the match — and an update on
+  that path preserves whatever is set. Reporting it as drift would have `--apply`
+  flip the traffic path of a service that is already running.
+- **Ambiguity is refused, not guessed.** Several records answer for a name and
+  none matches the spec → the step is `unknown` and `--apply` does not act. A
+  dual-stack A + AAAA is *not* ambiguous: the spec claims one record, not the
+  name.
+- **A full page of results is refused too.** The name filter goes to the API and
+  the exact match is re-applied locally, but a hundred records back means the
+  filter narrowed nothing — and reading page one of the zone as "nothing here"
+  creates a duplicate. Unreadable is not absent, here as everywhere.
+- **A hostname outside the zone is caught after the write.** Cloudflare treats
+  such a name as *relative* and silently appends the zone, producing
+  `svc.example.org.zerogravity.industries`. `ServiceSpec` can't catch it (it
+  validates the shape of a hostname, not which zone the token points at), and a
+  token scoped to Zone → DNS → Edit cannot read the zone object to find out
+  beforehand — so the created record is checked and removed when its name is
+  wrong.
+- **Teardown targets the recorded id** and refuses without one, confirms the id
+  still names this hostname before deleting, and treats an already-absent record
+  as success — where "absent" means Cloudflare's record code (81044) and *not* a
+  bare 404. A teardown that reported a deletion it never performed would leave
+  the row marked removed for a record that still resolves, which is silent and
+  survives a re-run; the opposite error is a visible retry.
+- **The envelope is not assumed to be universal.** `do()` reads an absent
+  `success` field on a 2xx as success rather than as failure, because a plain
+  bool made the zero value mean failure. PRSR-29 and PRSR-30 share the client;
+  check each new route's real response shape rather than the fake's — the fake
+  wrapping the DNS delete in an envelope is how this got as far as review.
+
+Two premises those rest on come from Cloudflare's **published schema and have
+not been confirmed against the live API**: that `DELETE
+/zones/{zone}/dns_records/{id}` answers with a bare `{"result":{"id":…}}`, and
+that a "could not route" error is a 404. Both fixes hold under either answer —
+the envelope change is a widening that a route sending one never reaches, and
+requiring the error code trades a silent lie for a visible retry — so this is a
+caveat on the *claims*, not on the code. **PRSR-36** carries the probe.
+
 ### What is left
 
-- **PRSR-28** — the DNS record. Reuses the existing CF `do()` client unchanged:
-  it takes a free-form path, so `/zones/{zone}/…` works as well as
-  `/accounts/{acct}/…`.
 - **PRSR-29** — the Access application. `logo_url` must be verified reachable
   before it is written: Cloudflare stores any URL and never validates it, so a
   dead one is indistinguishable from an unset one and the launcher silently
@@ -666,8 +718,13 @@ already published, so it is still reported and still adopted.
   rule (a rule appended after it never matches, and nothing errors), and guard
   the shared document the way the Access connector guards the group's email list.
 - **PRSR-31** — `purser provision-service` and Argosy end to end. On the direct
-  path, so it needs PRSR-28 and PRSR-29 but not PRSR-30. The first honest
-  exercise is `Ensure` against a service that is already up, reporting no-ops.
+  path, so it needs PRSR-29 but not PRSR-30, and it is what first *wires* a
+  provisioner into the composition root — PRSR-28 shipped the DNS one with no
+  caller, the way PRSR-27 shipped the orchestrator. The first honest exercise is
+  `Ensure` against a service that is already up, reporting no-ops; the DNS half
+  of that already runs in `dns_spinup_test.go`, where an Argosy-shaped spec
+  against a live record reports `adopt` and writes a row without an upstream
+  call.
 - **PRSR-34** — orchestrating `Teardown`. The interface method exists and the
   resource table exists to give it concrete ids to target rather than a hostname
   to guess from, but nothing walks it. Its ordering is almost certainly the

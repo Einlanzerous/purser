@@ -20,21 +20,16 @@
 package cloudflare
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Einlanzerous/purser/internal/connector"
 )
-
-const apiBase = "https://api.cloudflare.com/client/v4"
 
 // Config configures the Cloudflare Access connector.
 type Config struct {
@@ -55,9 +50,11 @@ type Config struct {
 
 // Connector adds people to a Cloudflare Access group.
 type Connector struct {
-	cfg     Config
-	http    *http.Client
-	baseURL string // Cloudflare API base; overridable in tests
+	cfg Config
+	// api is the shared Cloudflare transport (client.go), held rather than
+	// embedded so the DNS provisioner on the spin-up axis can hold its own
+	// without inheriting this connector's group credentials.
+	api *client
 	// groupMu serializes the group read-modify-write so two concurrent invites
 	// (e.g. batch-provisioning several people to Cloudflare) can't lost-update
 	// each other's email onto the shared group. Cloudflare's Access-group API
@@ -70,11 +67,7 @@ type Connector struct {
 // unconfigured connector is valid and degrades to manual instructions at
 // Provision time (so `purser invite --to cloudflare` is always wired).
 func New(cfg Config) *Connector {
-	hc := cfg.HTTPClient
-	if hc == nil {
-		hc = &http.Client{Timeout: 15 * time.Second}
-	}
-	return &Connector{cfg: cfg, http: hc, baseURL: apiBase}
+	return &Connector{cfg: cfg, api: newClient(cfg.APIToken, cfg.HTTPClient)}
 }
 
 func (c *Connector) Key() string         { return "cloudflare" }
@@ -176,7 +169,7 @@ func (c *Connector) addEmailToGroup(ctx context.Context, email string) (bool, er
 
 func (c *Connector) getGroup(ctx context.Context) (group, error) {
 	path := fmt.Sprintf("/accounts/%s/access/groups/%s", c.cfg.AccountID, c.cfg.GroupID)
-	raw, err := c.do(ctx, http.MethodGet, path, nil)
+	raw, err := c.api.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return group{}, err
 	}
@@ -197,7 +190,7 @@ func (c *Connector) putGroup(ctx context.Context, g group) error {
 		"exclude": g.Exclude,
 		"require": g.Require,
 	}
-	_, err := c.do(ctx, http.MethodPut, path, body)
+	_, err := c.api.do(ctx, http.MethodPut, path, body)
 	return err
 }
 
@@ -274,54 +267,4 @@ func (c *Connector) Deprovision(ctx context.Context, in connector.Input) error {
 	}
 	g.Include = kept
 	return c.putGroup(ctx, g)
-}
-
-// do performs a Cloudflare API request and returns the raw body, translating the
-// {"success":false,"errors":[…]} envelope into a Go error.
-func (c *Connector) do(ctx context.Context, method, path string, body any) ([]byte, error) {
-	var reader io.Reader
-	if body != nil {
-		buf, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("cloudflare: marshal body: %w", err)
-		}
-		reader = bytes.NewReader(buf)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
-	if err != nil {
-		return nil, fmt.Errorf("cloudflare: new request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.cfg.APIToken)
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("cloudflare: %s %s: %w", method, path, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, fmt.Errorf("cloudflare: read body: %w", err)
-	}
-
-	var env struct {
-		Success bool `json:"success"`
-		Errors  []struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("cloudflare: %s %s: %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	if !env.Success {
-		if len(env.Errors) > 0 {
-			return nil, fmt.Errorf("cloudflare: %s %s: %d %s", method, path, env.Errors[0].Code, env.Errors[0].Message)
-		}
-		return nil, fmt.Errorf("cloudflare: %s %s: request unsuccessful (%d)", method, path, resp.StatusCode)
-	}
-	return raw, nil
 }

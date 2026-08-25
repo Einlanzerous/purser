@@ -20,6 +20,10 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 - `internal/connector/` — the `Connector` interface + `Registry` +
   `Unavailable` (registered-but-unconfigured) + `ErrPending`.
 - `internal/connectors/{switchyard,cloudflare,lyceum,argosy}/` — per-service connectors.
+  `cloudflare/` serves **both** axes: the Access `Connector` (person × service)
+  and `DNSProvisioner` (spin-up, PRSR-28), over one shared API client in
+  `client.go`. They have separate Config structs on purpose — see the invariant
+  below.
 - `internal/invite/` — the orchestrator (`Run`) + credential-block renderer. This
   is where idempotency lives.
 - `internal/spinup/` — the **second axis** (PRSR-27): `ServiceSpec`, the
@@ -310,13 +314,82 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 - **Never treat unverifiable as absent**, here too. A failed `Inspect` is
   `unknown`, and `--apply` does not act on an unknown step: acting on a state
   that couldn't be read creates a second copy of something, or rebuilds a shared
-  ingress document from a read that just failed.
+  ingress document from a read that just failed. The DNS provisioner extends
+  this past outright failure: **several records answering for one name, none of
+  them the spec's, is also `unknown`** — a guess there changes whichever record
+  wasn't this service's — and so is a lookup that comes back a *full page*,
+  which means the name filter narrowed nothing and page one of the zone would
+  otherwise read as "nothing here".
+- **A direct spec pins the record's value and nothing else.** A tunnelled record
+  must be proxied (SERV-45: an unproxied CNAME to `cfargotunnel.com` reaches
+  nothing, since the tunnel is only reachable from Cloudflare's edge), so that is
+  checked and an update turns it on, and its TTL is pinned to automatic because a
+  proxied record requires it. A **direct** spec expresses neither, so
+  `recordMatches` ignores both and an update carries the *existing* values
+  across. `ttlAuto` and unproxied are **create-time defaults only** — applying
+  them on an update would flip the traffic path of a running service and
+  overwrite a TTL a human set, and since neither field is compared or printed,
+  the plan the operator approved would not have mentioned either. A direct
+  service that wants proxying is a spec field somebody adds.
+- **`DNSConfig` is not `cloudflare.Config`.** Same package, same API client, two
+  credentials sets: the zone id must stay out of the Access connector's
+  readiness check, or `--to cloudflare` goes offline for every deployment that
+  hasn't set `PURSER_CF_ZONE_ID`. An unconfigured DNS provisioner reports
+  `spinup.ErrUnavailable` — one step of a spin-up, not a broken connector.
+- **Don't assume every Cloudflare route sends the `{success, errors}`
+  envelope, or sends a body at all.** `do()` decodes `success` into a `*bool`:
+  absent plus a 2xx is success, and only an actual `false` is a failure. A plain
+  bool made the zero value mean failure, which would report a deletion that
+  *happened* as one that didn't — PRSR-17's lie backwards. An **empty** body is
+  the same question one step out and has to be answered *before* the decode,
+  since `json.Unmarshal` fails on `""` and would take the error branch: a 204
+  would report as a failure through the door the `*bool` cannot cover.
+  Both survived because the DNS delete is the first `DELETE` this client ever
+  sent, and because the fake wrapped that response in an envelope — the second
+  one was still there after the first was fixed, and it is the first test with
+  the fake writing nothing. **When a fake models the shape you assumed, the
+  suite asserts your model rather than the API.** PRSR-29/30 share this client:
+  check each new route's real response instead of the fake's.
+- **Absence is spelled per-product, so each resource type owns its own
+  predicate.** `dnsRecordNotFound` lives in `dns.go`, not in the shared client,
+  and is named for what it answers about: 81044 is *DNS's* code and means
+  nothing to an Access application or a tunnel route. A general-looking
+  `notFound()` in `client.go` would be reached for by the two provisioners that
+  share the file and would answer `false` for ever — safe, but silently wrong.
+  `client.go` exposes `errorCode(err)` and stops there.
+  The code decides it and **a bare 404 is not enough**. `Teardown` reads the
+  predicate as "already gone", so treating any 404 as absence risks reporting a
+  deletion that never happened — and the next run reads the row as removed,
+  which makes it silent and permanent, where the opposite error is a noisy retry
+  on a record that was already gone. The asymmetry is the whole argument; it does
+  not depend on knowing every 404 the API can emit. Only 81044 is listed, and
+  only codes actually observed in a response may be added — a guessed one turns
+  an unrelated failure into a reported deletion.
+- **Two premises behind those are read from Cloudflare's published schema and
+  have not been confirmed against the live API** (PRSR-36): that the DNS delete
+  answers with a bare `{"result":{"id":…}}`, and that a "could not route" error
+  comes back as a 404. Both fixes are the safe direction under *either* answer —
+  the envelope change is a widening a route that sends one never reaches, and
+  requiring the code trades a silent lie for a visible retry — so the **code**
+  needs no caveat and the **claims about Cloudflare** do. This file has been
+  wrong in both directions about an unverified premise before (see PRSR-25,
+  below); don't harden either sentence into fact without a probe.
+- **Cloudflare appends the zone to a name it doesn't recognise.** A hostname from
+  another domain becomes `svc.example.org.zerogravity.industries` with no error
+  anywhere. `ServiceSpec` can't catch it (it validates the shape of a hostname,
+  not which zone the token points at) and a Zone→DNS→Edit token can't read the
+  zone object to find out first — so the *created* record's name is checked
+  against what was asked for, and a mismatch deletes it. Cleanup runs on the
+  create path only: on an update the record predates Purser, and removing it
+  would destroy something nobody asked to have removed.
 
 ## Testing
 
 - `make test` — unit tests (fake store + fake connectors for the orchestrator;
-  httptest for the Switchyard/Cloudflare connectors; in-process SMTP for
-  delivery). DB-backed store tests skip unless `PURSER_TEST_DATABASE_URL` is set.
+  httptest for the Switchyard/Cloudflare connectors and the DNS provisioner —
+  `dns_test.go` runs a stateful fake zone, so create → read back → delete is a
+  test rather than a manual probe; in-process SMTP for delivery). DB-backed store
+  tests skip unless `PURSER_TEST_DATABASE_URL` is set.
 - `make test-db` — spins a throwaway Postgres 16 and runs everything.
 - Never point tests (or `purser migrate`) at the live shared `postgres` — use a
   throwaway container / the `_test` DB.
@@ -363,6 +436,13 @@ token. PRSR-26 closed done — the tunnel is remotely-managed (`source:
 "cloudflare"`), so the tunnel connector is an ordinary API client and no tunnel
 migration is needed.
 
+PRSR-28 landed the first of the three provisioners: `cloudflare.DNSProvisioner`
+— both record shapes, idempotent by lookup-then-write, recording
+`dns_record_id` so `Teardown` targets an id rather than re-resolving a name.
+Nothing wires it into the composition root yet; that is PRSR-31, and the DNS
+half of its "run it against a service that is already up" is already covered by
+`dns_spinup_test.go`.
+
 PRSR-27 landed the foundation: `internal/spinup` (spec, `ServiceProvisioner`,
 registry, `Ensure` orchestrator) and `service_resource` (migration 0007). It
 settled the two questions the connectors were waiting on — preview by default,
@@ -375,14 +455,23 @@ reason — twice now this project has lost the remaining half of a piece of work
 by closing the ticket that described it (see PRSR-25, below) — so don't delete
 that interface method as dead code; it is waiting on a walk, not unused.
 
-Next on that axis, and independent of each other now: **PRSR-28** (DNS record),
-**PRSR-29** (Access application — `self_hosted` + policy vs `bookmark`, and a
-`logo_url` that must be verified reachable before it is written) and **PRSR-30**
-(tunnel ingress route — insert before the terminal catch-all rule, and guard the
-shared document the way the Access connector guards the group's email list).
-Then **PRSR-31** — the `provision-service` CLI/HTTP surface and Argosy end to
-end, on the direct path, so it needs PRSR-28 and PRSR-29 but not PRSR-30.
+Next on that axis, and independent of each other: **PRSR-29** (Access
+application — `self_hosted` + policy vs `bookmark`, and a `logo_url` that must
+be verified reachable before it is written) and **PRSR-30** (tunnel ingress
+route — insert before the terminal catch-all rule, and guard the shared document
+the way the Access connector guards the group's email list). Then **PRSR-31** —
+the `provision-service` CLI/HTTP surface and Argosy end to end, on the direct
+path, so it needs PRSR-29 but not PRSR-30, and it is the first thing to wire any
+provisioner into `setup()`.
 **PRSR-33** wires the `dev` tunnel ref that PRSR-27 left resolving to a refusal.
+
+**PRSR-36** confirms two Cloudflare response shapes that PRSR-28's fixes are
+currently reasoning about from the published schema rather than from a response
+anybody has seen — whether the DNS delete carries the `{success, errors}`
+envelope, and what status accompanies a "could not route" error. It blocks
+PRSR-34: both fixes are safe under either answer, but `Teardown` being
+orchestrated is the point at which a wrong one starts marking rows removed for
+records that still resolve.
 
 Also open: nothing runs the audit on a schedule (PRSR-18). Argosy has no delete
 or disable endpoint, so it is the one service `offboard` cannot close (ARGY
