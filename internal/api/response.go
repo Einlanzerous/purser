@@ -156,9 +156,14 @@ type spinupResponse struct {
 	// edge that is already correct. Everything needed to tell them apart is in
 	// `counts` and each finding's `status`, but so was the CLI's — and reading
 	// the pending count as success is exactly the bug PRSR-31 shipped and then
-	// fixed on that surface. Empty means the edge is as the spec asks. It is
-	// computed from the same list the CLI's exit code uses, so the two cannot
-	// disagree about what counts as fine.
+	// fixed on that surface. It is computed from the same list the CLI's exit
+	// code uses, so the two cannot disagree about what counts as fine.
+	//
+	// Empty means everything the spec asks for is in place — which is not quite
+	// "the edge holds nothing else". A resource recorded at this hostname that
+	// the spec no longer calls for reports `orphaned` and is excluded here on
+	// purpose (see Result.NeedsAttention), because nothing this endpoint can do
+	// would remove it. Read the finding's own status for that.
 	NeedsAttention []string `json:"needs_attention,omitempty"`
 }
 

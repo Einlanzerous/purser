@@ -937,3 +937,48 @@ func TestEnsure_CarriesAWarningFromAStepThatSucceeded(t *testing.T) {
 		t.Errorf("it must not also be folded into the description: %q", f.Detail)
 	}
 }
+
+// An orphan is the one status where "nothing needs attention" is true and "the
+// edge holds only what the spec asks for" is not — everything the spec calls
+// for is in place, and something it no longer calls for is still live.
+//
+// Excluded on purpose: Ensure only adds and updates, so counting it would have
+// every run of a deliberately narrowed spec report trouble for ever with no
+// command to type. Pinned so the exclusion is a decision rather than an
+// oversight, and so PRSR-34 has to come past this test to change it.
+func TestNeedsAttention_ExcludesAnOrphanButNotTheRest(t *testing.T) {
+	// A spec that no longer wants an Access app, with one still recorded.
+	spec := directSpec()
+	spec.Access = AccessNone
+	st := newStore()
+	st.put(model.ServiceResource{
+		ServiceKey: spec.Key, Hostname: spec.Hostname,
+		Kind: model.ResourceAccessApp, ExternalID: "app-1", Status: model.ResourceActive,
+	})
+
+	res, err := New(st, NewRegistry(present(model.ResourceDNSRecord, "rec-1", "zone-1"))).
+		Ensure(context.Background(), Request{Spec: spec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceAccessApp, StepOrphaned)
+	if n := len(res.NeedsAttention()); n != 0 {
+		t.Errorf("an orphan is not something --apply or this axis can act on, got %d needing attention", n)
+	}
+
+	// ...and the exclusion is specific to orphaned, not a hole in the list.
+	for _, status := range []StepStatus{
+		StepUnavailable, StepRefused, StepUnknown, StepBlocked, StepFailed, StepAppliedNotRecorded,
+	} {
+		r := &Result{Findings: []StepFinding{{Kind: model.ResourceDNSRecord, Status: status}}}
+		if len(r.NeedsAttention()) != 1 {
+			t.Errorf("%s should need attention", status)
+		}
+	}
+	for _, status := range []StepStatus{StepOK, StepAdopt, StepCreate, StepUpdate, StepSkipped, StepMissing, StepOrphaned} {
+		r := &Result{Findings: []StepFinding{{Kind: model.ResourceDNSRecord, Status: status}}}
+		if len(r.NeedsAttention()) != 0 {
+			t.Errorf("%s should not need attention", status)
+		}
+	}
+}

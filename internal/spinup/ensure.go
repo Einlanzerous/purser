@@ -278,6 +278,23 @@ func (r *Result) Pending() int {
 // drift about what counts as fine. `blocked` is included — the step did not
 // happen, and the hostname does not work — even though what needs attention is
 // really its prerequisite.
+//
+// `orphaned` is deliberately NOT included, and it is the one exclusion worth
+// arguing rather than assuming. Everything the spec asks for is in place; what
+// is extra is a resource this spec no longer calls for, left over from an
+// earlier one. So the claim this answers is "the spec is satisfied", not
+// "nothing else is here" — the honest weaker one, and the caller-facing wording
+// must not round it up.
+//
+// It is excluded because nothing here can act on it. `Ensure` only ever adds and
+// updates; removing an orphan is `Teardown`'s, which nothing orchestrates yet
+// (PRSR-34). Counting it would make every run of a deliberately narrowed spec
+// report trouble and exit non-zero, for ever, with no command to type — the
+// prescribe-a-provable-no-op mistake `offboard`'s SSO warning exists to avoid,
+// which teaches an operator to ignore the signal that matters. It is reported
+// loudly on its own line instead, since nothing else in the report would mention
+// a resource that is still serving traffic. Revisit this when PRSR-34 gives it
+// somewhere to go.
 func (r *Result) NeedsAttention() []StepFinding {
 	var out []StepFinding
 	for _, f := range r.Findings {
