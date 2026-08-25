@@ -353,6 +353,110 @@ func TestTunnel_InspectReportsDuplicatesWithoutTouchingThem(t *testing.T) {
 	}
 }
 
+// --- the dead tail, on the read path ---------------------------------------
+
+// deadTail is a document whose catch-all is not last: everything behind it is
+// already unreachable, wiki included.
+const deadTail = `{"ingress":[
+	{"hostname":"lyceum.zerogravity.industries","service":"http://lyceum:8083"},
+	{"service":"http_status:404"},
+	{"hostname":"wiki.zerogravity.industries","service":"http://wiki:3000"},
+	{"service":"http_status:404"}
+]}`
+
+func TestTunnel_InspectDoesNotReportADeadRuleAsARoute(t *testing.T) {
+	// cloudflared never reaches rule 3. Reporting it as in place would give the
+	// orchestrator `ok` (or `adopt`), which is inPlace(), which unblocks the DNS
+	// step — and publishing a hostname in front of a tunnel that will not serve
+	// it is the exact window model.KindOrder and ServiceSpec.dependsOn exist to
+	// close.
+	f := newFakeTunnel(t, deadTail)
+	tgt := target(t, "wiki.zerogravity.industries", "http://wiki:3000")
+
+	st, err := f.prov(t).Inspect(context.Background(), tgt)
+	if err == nil {
+		t.Fatalf("a rule in the dead tail is not a working route, got %+v", st)
+	}
+	if st.Exists || st.Matches {
+		t.Errorf("no state should come back with the refusal, got %+v", st)
+	}
+	if !strings.Contains(err.Error(), "dead") {
+		t.Errorf("the refusal should say why, got %v", err)
+	}
+}
+
+func TestTunnel_EnsureDoesNotSkipADeadRule(t *testing.T) {
+	// The other half of the same bug: planRoute's already-routed branch would
+	// return "nothing to do" for a route that serves nothing.
+	f := newFakeTunnel(t, deadTail)
+	tgt := target(t, "wiki.zerogravity.industries", "http://wiki:3000")
+
+	res, err := f.prov(t).Ensure(context.Background(), tgt)
+	if err == nil {
+		t.Fatalf("want a refusal, got %+v", res)
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("a refused document must not be written, saw %d PUTs", puts)
+	}
+}
+
+func TestTunnel_InspectReportsAReachableRouteOnAMalformedDocument(t *testing.T) {
+	// The converse, and the reason this is not just "refuse malformed
+	// documents": lyceum is *before* the stray catch-all, so it is served. Its
+	// resource is already published, so withholding the report protects nobody —
+	// the malformation is somebody else's dead rules, and it is said out loud.
+	f := newFakeTunnel(t, deadTail)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+
+	st, err := f.prov(t).Inspect(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("a served hostname is still a served hostname: %v", err)
+	}
+	if !st.Exists || !st.Matches {
+		t.Errorf("want in place, got %+v", st)
+	}
+	if !strings.Contains(st.Detail, "malformed") {
+		t.Errorf("the broken document should be reported, got %q", st.Detail)
+	}
+}
+
+func TestTunnel_PreviewAndApplyAgreeOnEveryDocument(t *testing.T) {
+	// PRSR-27's property: a plan is the first half of the apply, not a guess at
+	// it. The failure this pins is a preview that promises `create` against a
+	// document Ensure then refuses — which is what the dead-tail fix above is
+	// really about, since the absent-hostname case has the same shape as the
+	// dead-rule one.
+	cases := []struct {
+		name     string
+		doc      string
+		host     string
+		upstream string
+	}{
+		{"well-formed, absent", liveShape, "interlock.zerogravity.industries", "http://interlock:8080"},
+		{"well-formed, present", liveShape, "lyceum.zerogravity.industries", "http://lyceum:8083"},
+		{"well-formed, mismatched", liveShape, "lyceum.zerogravity.industries", "http://lyceum:9999"},
+		{"empty ingress", `{"ingress":[]}`, "interlock.zerogravity.industries", "http://interlock:8080"},
+		{"dead tail, absent", deadTail, "interlock.zerogravity.industries", "http://interlock:8080"},
+		{"dead tail, dead rule", deadTail, "wiki.zerogravity.industries", "http://wiki:3000"},
+		{"dead tail, live rule", deadTail, "lyceum.zerogravity.industries", "http://lyceum:8083"},
+		{"no catch-all", `{"ingress":[{"hostname":"a.example.com","service":"http://a:1"}]}`, "interlock.zerogravity.industries", "http://interlock:8080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeTunnel(t, tc.doc)
+			p := f.prov(t)
+			tgt := target(t, tc.host, tc.upstream)
+
+			_, inspectErr := p.Inspect(context.Background(), tgt)
+			_, ensureErr := p.Ensure(context.Background(), tgt)
+
+			if (inspectErr == nil) != (ensureErr == nil) {
+				t.Fatalf("the preview and the apply disagree: Inspect=%v, Ensure=%v", inspectErr, ensureErr)
+			}
+		})
+	}
+}
+
 // --- Ensure: the insert position -------------------------------------------
 
 func TestTunnel_EnsureInsertsBeforeTheTerminalCatchAll(t *testing.T) {
@@ -775,6 +879,9 @@ func TestConcurrentWriteNote(t *testing.T) {
 	}
 	if note := concurrentWriteNote(0, 0, "t"); note != "" {
 		t.Errorf("an API that reports no version should raise nothing: %q", note)
+	}
+	if note := concurrentWriteNote(5, 5, "t"); note != "" {
+		t.Errorf("a read that lagged our own write says nothing about another writer: %q", note)
 	}
 	if note := concurrentWriteNote(5, 8, "t"); note == "" {
 		t.Error("a jump of three is another writer, and must be reported")

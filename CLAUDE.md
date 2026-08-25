@@ -329,6 +329,23 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   Purser doesn't understand is not one to rewrite on a guess. Anything walking
   ingress entries must also tolerate the missing hostname instead of tripping
   over it.
+- **The dead tail is a *read*-path rule too, and that is the half that bites.**
+  The write path refusing a malformed document isn't enough on its own, because
+  `Inspect` is the only call a dry run makes and the status of every step is
+  decided from it. A rule behind a catch-all reported as a working route gives
+  the orchestrator `ok`/`adopt` — both `inPlace()` — so the DNS step unblocks and
+  publishes a hostname in front of a tunnel that will 404 it, which is precisely
+  the window `KindOrder` and `dependsOn` exist to close. So `findRoute` stops
+  where cloudflared stops, at the first catch-all, and a rule behind one is not
+  found. And the gate is `documentShape`, not just "is this rule dead": every
+  answer other than *reachable and already correct* is one `--apply` would write
+  from, so a document it will refuse must preview as `unknown` rather than as
+  `create` or `update` — a plan is the first half of the apply, not a guess at it
+  (PRSR-27), and a preview that promises what apply refuses is the same broken
+  promise `connector.CanDeprovision` exists to stop making on `offboard`. A
+  hostname that *is* served on a document broken elsewhere still reports in
+  place, with the malformation named: that resource is already published, so
+  withholding the line protects nobody.
 - **The ingress document is written back whole.** `PUT …/configurations`
   replaces it, so every key omitted is a setting the tunnel loses —
   `warp-routing`, the tunnel-wide `originRequest`, a per-rule `noTLSVerify`
@@ -539,9 +556,11 @@ holding every hostname on it — so the invariants above are where the work went
 insert before the terminal catch-all and assert it stayed last, write every key
 back verbatim, and guard the read-modify-write with a mutex, a fresh read inside
 it, a read-back, and a version check for the writer the read-back cannot see.
-It also refuses a tunnel that is not remotely managed, because the configuration
-this endpoint returns is then not the one being served and every other guard in
-the file is about *who else wrote it*, not whether it is live.
+The read path refuses the same documents the write path does, which review
+caught as the half that actually reaches production. It also refuses a tunnel
+that is not remotely managed, because the configuration this endpoint returns is
+then not the one being served, and every other guard in the file is about *who
+else wrote it* rather than whether it is live.
 
 With all three provisioners in, nothing yet wires any of them into `setup()`:
 that is **PRSR-31**, the `provision-service` CLI/HTTP surface, which brings

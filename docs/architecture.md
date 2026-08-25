@@ -656,6 +656,17 @@ the other two provisioners do not:
   has therefore already killed the rules behind it) is refused rather than
   rewritten on a guess.
 
+  **The read path refuses the same documents**, which is the half that reaches
+  production: `Inspect` is the only call a dry run makes and every step's status
+  comes from it, so a rule behind a catch-all reported as a working route gives
+  `ok`/`adopt` — both `inPlace()` — and the DNS step then publishes a hostname in
+  front of a tunnel that will 404 it. `findRoute` therefore stops where
+  cloudflared stops, and every answer other than *reachable and already correct*
+  is gated on `documentShape`: what `--apply` will refuse must preview as
+  `unknown`, never as `create` or `update`. A hostname that is genuinely served
+  on a document broken elsewhere still reports in place, with the malformation
+  named.
+
 Nothing wires it into `setup()` yet: the command that would run it is PRSR-31.
 
 ### The tunnelled/direct split reaches three steps

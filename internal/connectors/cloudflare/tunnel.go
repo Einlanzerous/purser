@@ -151,38 +151,55 @@ func (p *TunnelProvisioner) Inspect(ctx context.Context, t spinup.Target) (spinu
 	if err != nil {
 		return spinup.State{}, err
 	}
-	return inspectIngress(doc.ingress, t), nil
+	return inspectIngress(doc.ingress, t)
 }
 
-// inspectIngress turns a fetched ingress list into a State. Split out from
-// Inspect so the shape of the answer is testable without a server, and so the
-// Detail an operator reads in the plan is written in one place.
-func inspectIngress(rules []ingressRule, t spinup.Target) spinup.State {
+// inspectIngress turns a fetched ingress list into a State, or into the reason
+// no honest plan can be made from it. Split out from Inspect so the shape of the
+// answer is testable without a server, and so the Detail an operator reads in
+// the plan is written in one place.
+func inspectIngress(rules []ingressRule, t spinup.Target) (spinup.State, error) {
 	// ParentID is the tunnel, and ExternalID stays empty by nature: the
 	// configuration is one document per tunnel, so a route has no id of its own
 	// and is identified by (tunnel, hostname). Both are set on this path and on
 	// Ensure's, because the orchestrator adopts on a disagreement between them
 	// and the recorded row.
 	st := spinup.State{ParentID: t.TunnelID}
+	host, want := t.Spec.Hostname, t.Spec.Upstream
+	idx, dups := findRoute(rules, host)
+	shape := documentShape(rules)
 
-	idx, dups := findRoute(rules, t.Spec.Hostname)
-	if idx < 0 {
-		st.Detail = fmt.Sprintf("no ingress rule for %s on tunnel %s (%d rules)", t.Spec.Hostname, t.TunnelID, len(rules))
-		return st
+	switch {
+	case idx >= 0 && rules[idx].str("service") == want:
+		// Reachable and serving what the spec asks for. Reported as in place
+		// even when the document is malformed elsewhere, because *this*
+		// hostname works: the resource is already published, so withholding the
+		// line protects nobody, and what is broken is somebody else's dead
+		// rules. Said out loud below rather than left for them to find.
+		st.Exists, st.Matches = true, true
+		st.Detail = fmt.Sprintf("ingress rule %d of %d on tunnel %s → %s", idx+1, len(rules), t.TunnelID, want)
+
+	case shape != nil:
+		// Every remaining answer is one --apply would act on, and this is a
+		// document it will refuse to write. Reported as unreadable rather than
+		// as `create` or `update`: the orchestrator turns this into `unknown`,
+		// which does not act and holds the DNS step behind it — and a hostname
+		// published in front of a tunnel that cannot serve it is exactly what
+		// that ordering exists to prevent.
+		return spinup.State{}, shape
+
+	case idx >= 0:
+		// Compared exactly. A difference the operator can see in the plan and
+		// decline is better than one quietly tolerated, and the alternative — a
+		// fuzzy match — would have to guess which differences are cosmetic on a
+		// value cloudflared parses.
+		st.Exists = true
+		st.Detail = fmt.Sprintf("ingress rule %d of %d on tunnel %s → %s, want %s", idx+1, len(rules), t.TunnelID, rules[idx].str("service"), want)
+
+	default:
+		st.Detail = fmt.Sprintf("no ingress rule for %s on tunnel %s (%d rules)", host, t.TunnelID, len(rules))
 	}
 
-	st.Exists = true
-	svc := rules[idx].str("service")
-	// Compared exactly. A difference the operator can see in the plan and
-	// decline is better than one quietly tolerated, and the alternative — a
-	// fuzzy match — would have to guess which differences are cosmetic on a
-	// value cloudflared parses.
-	st.Matches = svc == t.Spec.Upstream
-	if st.Matches {
-		st.Detail = fmt.Sprintf("ingress rule %d of %d on tunnel %s → %s", idx+1, len(rules), t.TunnelID, svc)
-	} else {
-		st.Detail = fmt.Sprintf("ingress rule %d of %d on tunnel %s → %s, want %s", idx+1, len(rules), t.TunnelID, svc, t.Spec.Upstream)
-	}
 	if dups > 0 {
 		// Reported rather than repaired. cloudflared matches the first rule, so
 		// the route works and the duplicates are inert — but they are somebody's
@@ -190,7 +207,10 @@ func inspectIngress(rules []ingressRule, t spinup.Target) spinup.State {
 		// is not a thing a re-run can undo.
 		st.Detail += fmt.Sprintf(" (%d further rule(s) carry this hostname; cloudflared matches the first)", dups)
 	}
-	return st
+	if shape != nil {
+		st.Detail += fmt.Sprintf(" — this hostname is served, but the tunnel's configuration is malformed elsewhere and no route can be written into it: %v", shape)
+	}
+	return st, nil
 }
 
 // Ensure adds or repoints the hostname's ingress rule, and returns what the
@@ -299,7 +319,10 @@ func (p *TunnelProvisioner) Teardown(ctx context.Context, t spinup.Target, rec m
 	}
 	// Teardown reports success only when the resource is actually gone, so the
 	// read-back is the claim, not the PUT's 200.
-	if idx, _ := findRoute(after.ingress, host); idx >= 0 {
+	// withoutRoute rather than findRoute: the removal took every rule carrying
+	// the hostname, including any behind a catch-all, so the check that it is
+	// gone has to look at the same set rather than only the reachable one.
+	if _, left := withoutRoute(after.ingress, host); left > 0 {
 		return fmt.Errorf("cloudflare: %s is still routed on tunnel %s after the removal — another writer changed the shared configuration at the same time; re-run", host, tunnelID)
 	}
 	if note := concurrentWriteNote(before.version, after.version, tunnelID); note != "" {
@@ -369,13 +392,23 @@ func isRoute(r ingressRule, host string) bool {
 	return r.str("path") == "" && strings.EqualFold(r.str("hostname"), host)
 }
 
-// findRoute returns the index of the hostname's rule and how many *further*
-// rules also carry it. cloudflared matches the first, so the first is the one
-// that decides what the hostname does, and the rest are reported rather than
-// silently rewritten.
+// findRoute returns the index of the rule that decides what the hostname does,
+// and how many *further* rules also carry it. cloudflared matches the first, so
+// the rest are reported rather than silently rewritten.
+//
+// The walk stops at the first catch-all, because that is where cloudflared's
+// stops. A rule behind one is not this hostname's route: it is never matched, so
+// treating it as one would have the read path report a working service for a
+// route that serves nothing — the same silent failure as appending after the
+// terminal rule, one step to the left. Every caller wants the reachable answer:
+// Inspect decides a step's status from it, planRoute decides whether a write is
+// needed, and confirmRoute checks that a write actually landed somewhere live.
 func findRoute(rules []ingressRule, host string) (idx, dups int) {
 	idx = -1
 	for i, r := range rules {
+		if isCatchAll(r) {
+			break
+		}
 		if !isRoute(r, host) {
 			continue
 		}
@@ -397,6 +430,9 @@ func findRoute(rules []ingressRule, host string) (idx, dups int) {
 // rule after it — inserting before the final rule there would put the new route
 // in the dead tail, which is the exact outcome this ticket exists to prevent,
 // one step generalized.
+//
+// It answers for the read path as well as the write one (see documentShape), so
+// its refusals are worded for both.
 func terminalIndex(rules []ingressRule) (int, error) {
 	if len(rules) == 0 {
 		return 0, fmt.Errorf("the ingress configuration is empty, so it has no terminal catch-all rule to insert before")
@@ -404,13 +440,34 @@ func terminalIndex(rules []ingressRule) (int, error) {
 	last := len(rules) - 1
 	for i, r := range rules {
 		if isCatchAll(r) && i != last {
-			return 0, fmt.Errorf("ingress rule %d of %d matches every hostname but is not last, so every rule after it is already dead — a route inserted here would never match and nothing would report it; fix the tunnel's configuration first", i+1, len(rules))
+			return 0, fmt.Errorf("ingress rule %d of %d matches every hostname but is not last, so every rule after it is already dead — a route there is never matched and nothing anywhere reports it; fix the tunnel's configuration first", i+1, len(rules))
 		}
 	}
 	if !isCatchAll(rules[last]) {
 		return 0, fmt.Errorf("the ingress configuration does not end in a catch-all rule (the last one serves %s for %s) — cloudflared requires one, so this is not a document Purser understands well enough to rewrite", rules[last].str("service"), rules[last].str("hostname"))
 	}
 	return last, nil
+}
+
+// documentShape reports why this ingress list is not one a route can be written
+// into, or nil if it is.
+//
+// It is exactly planRoute's precondition, hoisted so the *read* path can consult
+// it too. A plan that promises `create` against a document Ensure will refuse is
+// the same broken promise `connector.CanDeprovision` exists to prevent on the
+// offboard preview — and PRSR-27 settled that a plan is the first half of the
+// apply, not a guess at it.
+//
+// An empty list is not a refusal: planRoute supplies the terminal rule for that
+// one case, so the two agree there as well.
+func documentShape(rules []ingressRule) error {
+	if len(rules) == 0 {
+		return nil
+	}
+	if _, err := terminalIndex(rules); err != nil {
+		return fmt.Errorf("cloudflare: %w", err)
+	}
+	return nil
 }
 
 // planRoute produces the ingress list the hostname's route calls for, whether
@@ -508,11 +565,19 @@ func confirmRoute(rules []ingressRule, host, service string) error {
 //
 // This is the only guard that can see that, and it is worth its ten lines
 // because the obvious check cannot: confirming our own route always passes,
-// since our write necessarily contains everything our own read did. Skipped
-// when either version is absent, so an API or a fixture that doesn't report one
-// produces no false alarm.
+// since our write necessarily contains everything our own read did.
+//
+// **The +1 is an assumption about Cloudflare, and nothing here is evidence for
+// it.** The fake in the tests bumps by one because the test author decided it
+// does. So the guard is written to fail quiet rather than loud: it is skipped
+// when either version is absent, and it only fires on a version that moved by
+// *more* than one — a read that lagged our own write (`after <= before`) tells
+// us nothing about another writer, and would otherwise cry wolf on the one
+// message that most needs to be believed when it is real. One live
+// GET → PUT → GET against construct-server settles it; noted on PRSR-31, which
+// is where a CLI first points this at the real API.
 func concurrentWriteNote(before, after int, tunnelID string) string {
-	if before <= 0 || after <= 0 || after == before+1 {
+	if before <= 0 || after <= 0 || after <= before+1 {
 		return ""
 	}
 	return fmt.Sprintf("tunnel %s went from ingress version %d to %d across this write, not %d: another writer changed the shared configuration at the same time and a route it added may have been lost — check the other services on this tunnel",
