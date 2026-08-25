@@ -295,24 +295,32 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   readiness check, or `--to cloudflare` goes offline for every deployment that
   hasn't set `PURSER_CF_ZONE_ID`. An unconfigured DNS provisioner reports
   `spinup.ErrUnavailable` — one step of a spin-up, not a broken connector.
-- **Not every Cloudflare route sends the `{success, errors}` envelope.**
-  `DELETE /zones/{zone}/dns_records/{id}` answers with a bare
-  `{"result":{"id":…}}`, so `do()` decodes `success` into a `*bool`: absent plus
-  a 2xx is success, and only an actual `false` is a failure. A plain bool read
-  that delete as failed — reporting a deletion that *happened* as one that
-  didn't, which is PRSR-17's lie backwards, and it survived because that was the
-  first `DELETE` this client had ever sent. When a fake models the shape you
-  assumed, the suite asserts your model rather than the API; PRSR-29/30 use this
-  same client, so check the route's real response before trusting the envelope.
+- **Don't assume every Cloudflare route sends the `{success, errors}`
+  envelope.** `do()` decodes `success` into a `*bool`: absent plus a 2xx is
+  success, and only an actual `false` is a failure. A plain bool made the zero
+  value mean failure, which would report a deletion that *happened* as one that
+  didn't — PRSR-17's lie backwards — and it survived because the DNS delete is
+  the first `DELETE` this client ever sent, and because the fake wrapped that
+  response in an envelope. **When a fake models the shape you assumed, the suite
+  asserts your model rather than the API.** PRSR-29/30 share this client: check
+  each new route's real response instead of the fake's.
 - **`notFound` requires Cloudflare's record code, and a bare 404 is not enough.**
-  A 404 is also how the API answers a request it could not *route* — a recorded
-  `parent_id` the current token can no longer address, a base URL that moved —
-  and `Teardown` reads `notFound` as "already gone". Treating any 404 as absence
-  therefore reports a deletion that never happened, and the next run reads the
-  row as removed, so it is silent and permanent; the opposite error is a noisy,
-  retryable failure on a record that was already gone. Only 81044 is listed, and
-  only codes actually observed in a response may be added — a guessed one turns
-  an unrelated failure into a reported deletion.
+  `Teardown` reads `notFound` as "already gone", so treating any 404 as absence
+  risks reporting a deletion that never happened — and the next run reads the row
+  as removed, which makes it silent and permanent, where the opposite error is a
+  noisy retry on a record that was already gone. The asymmetry is the whole
+  argument; it does not depend on knowing every 404 the API can emit. Only 81044
+  is listed, and only codes actually observed in a response may be added — a
+  guessed one turns an unrelated failure into a reported deletion.
+- **Two premises behind those are read from Cloudflare's published schema and
+  have not been confirmed against the live API** (PRSR-36): that the DNS delete
+  answers with a bare `{"result":{"id":…}}`, and that a "could not route" error
+  comes back as a 404. Both fixes are the safe direction under *either* answer —
+  the envelope change is a widening a route that sends one never reaches, and
+  requiring the code trades a silent lie for a visible retry — so the **code**
+  needs no caveat and the **claims about Cloudflare** do. This file has been
+  wrong in both directions about an unverified premise before (see PRSR-25,
+  below); don't harden either sentence into fact without a probe.
 - **Cloudflare appends the zone to a name it doesn't recognise.** A hostname from
   another domain becomes `svc.example.org.zerogravity.industries` with no error
   anywhere. `ServiceSpec` can't catch it (it validates the shape of a hostname,
@@ -394,6 +402,14 @@ the `provision-service` CLI/HTTP surface and Argosy end to end, on the direct
 path, so it needs PRSR-29 but not PRSR-30, and it is the first thing to wire any
 provisioner into `setup()`.
 **PRSR-33** wires the `dev` tunnel ref that PRSR-27 left resolving to a refusal.
+
+**PRSR-36** confirms two Cloudflare response shapes that PRSR-28's fixes are
+currently reasoning about from the published schema rather than from a response
+anybody has seen — whether the DNS delete carries the `{success, errors}`
+envelope, and what status accompanies a "could not route" error. It blocks
+PRSR-34: both fixes are safe under either answer, but `Teardown` being
+orchestrated is the point at which a wrong one starts marking rows removed for
+records that still resolve.
 
 Also open: nothing runs the audit on a schedule (PRSR-18). Argosy has no delete
 or disable endpoint, so it is the one service `offboard` cannot close (ARGY

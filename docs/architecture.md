@@ -690,15 +690,23 @@ What it decides, and why:
   wrong.
 - **Teardown targets the recorded id** and refuses without one, confirms the id
   still names this hostname before deleting, and treats an already-absent record
-  as success — where "absent" means Cloudflare's record code and *not* a bare
-  404, since a 404 is also how the API answers a request it could not route, and
-  reading that as "gone" reports a deletion that never happened.
-- **The envelope is not universal.** `DELETE /zones/{zone}/dns_records/{id}`
-  answers with a bare `{"result":{"id":…}}` and no `{success, errors}` at all —
-  it is the first `DELETE` this client has ever sent — so `do()` treats an absent
-  `success` field on a 2xx as success rather than as failure. PRSR-29 and PRSR-30
-  share the client; check each new route's real response shape rather than the
-  fake's.
+  as success — where "absent" means Cloudflare's record code (81044) and *not* a
+  bare 404. A teardown that reported a deletion it never performed would leave
+  the row marked removed for a record that still resolves, which is silent and
+  survives a re-run; the opposite error is a visible retry.
+- **The envelope is not assumed to be universal.** `do()` reads an absent
+  `success` field on a 2xx as success rather than as failure, because a plain
+  bool made the zero value mean failure. PRSR-29 and PRSR-30 share the client;
+  check each new route's real response shape rather than the fake's — the fake
+  wrapping the DNS delete in an envelope is how this got as far as review.
+
+Two premises those rest on come from Cloudflare's **published schema and have
+not been confirmed against the live API**: that `DELETE
+/zones/{zone}/dns_records/{id}` answers with a bare `{"result":{"id":…}}`, and
+that a "could not route" error is a 404. Both fixes hold under either answer —
+the envelope change is a widening that a route sending one never reaches, and
+requiring the error code trades a silent lie for a visible retry — so this is a
+caveat on the *claims*, not on the code. **PRSR-36** carries the probe.
 
 ### What is left
 
