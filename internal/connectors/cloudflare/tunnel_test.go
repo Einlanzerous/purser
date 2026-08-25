@@ -527,24 +527,111 @@ func TestTunnel_AWildcardIsNeverAdoptedAsOurOwnRoute(t *testing.T) {
 	}
 }
 
-func TestGlobMatch(t *testing.T) {
+func TestHostnameTakes(t *testing.T) {
+	// Pins cloudflared's rule, read from ingress/rule.go and ingress/ingress.go
+	// rather than inferred. A general `*`-glob was wrong here in two directions
+	// at once, and the apex row is the one that decides the dangerous one.
 	cases := []struct {
-		pattern, s string
-		want       bool
+		pattern, host string
+		want          bool
+		why           string
 	}{
-		{"*.zerogravity.industries", "wiki.zerogravity.industries", true},
-		{"*.zerogravity.industries", "zerogravity.industries", false},
-		{"*", "anything.at.all", true},
-		{"wiki.*", "wiki.zerogravity.industries", true},
-		{"*.example.com", "wiki.zerogravity.industries", false},
-		{"wiki.zerogravity.industries", "wiki.zerogravity.industries", true},
-		{"lyceum.zerogravity.industries", "wiki.zerogravity.industries", false},
-		{"*.*.industries", "wiki.zerogravity.industries", true},
+		{"", "wiki.zerogravity.industries", true, "no hostname is the terminal catch-all"},
+		{"*", "wiki.zerogravity.industries", true, "cloudflared special-cases a bare star"},
+		{"*.zerogravity.industries", "wiki.zerogravity.industries", true, "the documented wildcard"},
+		{"*.zerogravity.industries", "zerogravity.industries", false,
+			"only the star is trimmed, so the suffix tested is \".zerogravity.industries\" and the apex lacks the dot"},
+		{"*.zerogravity.industries", "a.b.zerogravity.industries", true, "HasSuffix, so any depth"},
+		{"*.example.com", "wiki.zerogravity.industries", false, "different zone"},
+		{"wiki.*", "wiki.zerogravity.industries", false, "only a LEADING \"*.\" is a wildcard; this is a literal upstream"},
+		{"*.*.industries", "wiki.zerogravity.industries", false, "likewise — the suffix tested is \".*.industries\""},
+		{"wiki.zerogravity.industries", "wiki.zerogravity.industries", true, "exact"},
+		{"WIKI.zerogravity.industries", "wiki.zerogravity.industries", true, "case folded, where cloudflared compares bytes"},
+		{"lyceum.zerogravity.industries", "wiki.zerogravity.industries", false, "different host"},
 	}
 	for _, tc := range cases {
-		if got := globMatch(tc.pattern, tc.s); got != tc.want {
-			t.Errorf("globMatch(%q, %q) = %v, want %v", tc.pattern, tc.s, got, tc.want)
+		if got := hostnameTakes(tc.pattern, tc.host); got != tc.want {
+			t.Errorf("hostnameTakes(%q, %q) = %v, want %v — %s", tc.pattern, tc.host, got, tc.want, tc.why)
 		}
+	}
+}
+
+func TestTunnel_AWildcardDoesNotHoldBackTheApex(t *testing.T) {
+	// cloudflared's `*.zerogravity.industries` does not take the bare apex, so
+	// the apex route belongs in front of the terminal rule and works there.
+	// Blocking it would be a wrong refusal, and putting it behind the wildcard
+	// would be a dead route — this pins which one is right.
+	f := newFakeTunnel(t, wildcardFirst)
+	tgt := target(t, "zerogravity.industries", "http://apex:8080")
+
+	st, err := f.prov(t).Inspect(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if st.Exists {
+		t.Fatalf("want a create, got %+v", st)
+	}
+	if _, err := f.prov(t).Ensure(context.Background(), tgt); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	want := []string{
+		"*.zerogravity.industries=http://holding-page:80",
+		"zerogravity.industries=http://apex:8080",
+		"*=http_status:404",
+	}
+	if got := f.hostnames(t); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("the apex is not shadowed by *.zone, so it goes before the terminal rule.\n got: %v\nwant: %v", got, want)
+	}
+}
+
+func TestTunnel_ALiteralWithAStarInItDoesNotStopTheWalk(t *testing.T) {
+	// The other direction a glob got wrong. Only a leading "*." is a wildcard
+	// upstream, so `wiki.*` matches nothing there — treating it as a pattern
+	// would report `create` for a hostname whose real rule is right below it,
+	// insert a duplicate in front, and call a serving rule "never matched".
+	f := newFakeTunnel(t, `{"ingress":[
+		{"hostname":"wiki.*","service":"http://never-matched:80"},
+		{"hostname":"wiki.zerogravity.industries","service":"http://wiki:3000"},
+		{"service":"http_status:404"}
+	]}`)
+	tgt := target(t, "wiki.zerogravity.industries", "http://wiki:3000")
+
+	st, err := f.prov(t).Inspect(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if !st.Exists || !st.Matches {
+		t.Fatalf("the real rule is reachable, got %+v", st)
+	}
+	if strings.Contains(st.Detail, "never matched") {
+		t.Errorf("nothing is shadowing this route, got %q", st.Detail)
+	}
+	if _, err := f.prov(t).Ensure(context.Background(), tgt); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("an already-correct route needs no write, saw %d PUTs", puts)
+	}
+}
+
+func TestTunnel_AStarHostnameIsACatchAll(t *testing.T) {
+	// cloudflared treats hostname "*" exactly like no hostname, so a mid-list
+	// one kills the tail just the same.
+	f := newFakeTunnel(t, `{"ingress":[
+		{"hostname":"*","service":"http://holding-page:80"},
+		{"hostname":"wiki.zerogravity.industries","service":"http://wiki:3000"},
+		{"service":"http_status:404"}
+	]}`)
+	tgt := target(t, "interlock.zerogravity.industries", "http://interlock:8080")
+
+	if _, err := f.prov(t).Inspect(context.Background(), tgt); err == nil {
+		t.Fatal("a star hostname before the end is a dead tail")
+	}
+	if _, err := f.prov(t).Ensure(context.Background(), tgt); err == nil {
+		t.Fatal("and must not be written into")
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("saw %d PUTs", puts)
 	}
 }
 
@@ -571,6 +658,8 @@ func TestTunnel_PreviewAndApplyAgreeOnEveryDocument(t *testing.T) {
 		{"wildcard first, absent", wildcardFirst, "interlock.zerogravity.industries", "http://interlock:8080"},
 		{"wildcard first, shadowed rule", wildcardShadowing, "wiki.zerogravity.industries", "http://wiki:3000"},
 		{"wildcard first, live rule", wildcardShadowing, "lyceum.zerogravity.industries", "http://lyceum:8083"},
+		{"wildcard first, apex spec", wildcardFirst, "zerogravity.industries", "http://apex:8080"},
+		{"star hostname mid-list", `{"ingress":[{"hostname":"*","service":"http://h:80"},{"hostname":"a.example.com","service":"http://a:1"},{"service":"http_status:404"}]}`, "interlock.zerogravity.industries", "http://interlock:8080"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

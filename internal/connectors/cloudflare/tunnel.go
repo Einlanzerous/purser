@@ -388,11 +388,16 @@ type ingressDoc struct {
 	version int
 }
 
-// isCatchAll reports whether a rule matches everything — no hostname and no
-// path. cloudflared requires the list to end in one, and a rule after it is
-// dead: it never matches, and nothing errors.
+// isCatchAll reports whether a rule matches every request — no path, and a
+// hostname that takes every host. cloudflared requires the list to end in one,
+// and a rule after it is dead: it never matches, and nothing errors.
+//
+// Both spellings count, because cloudflared special-cases both: the live tunnel
+// writes no hostname at all (observed as a trailing null), and an explicit `*`
+// means the same thing there. Reading only the first would miss a mid-list
+// catch-all written the other way, which is the dead-tail case.
 func isCatchAll(r ingressRule) bool {
-	return r.str("hostname") == "" && r.str("path") == ""
+	return r.str("path") == "" && matchesEveryHostname(r.str("hostname"))
 }
 
 // isRoute reports whether a rule is *the* route for a hostname: same host,
@@ -411,51 +416,81 @@ func isRoute(r ingressRule, host string) bool {
 // reaching anything later in the list.
 //
 // cloudflared matches ingress top-down, first match wins, and a rule's hostname
-// may carry `*` wildcards — `*.zerogravity.industries` in front of a holding
-// page is a documented, deliberate configuration, not a malformed document. So
-// the terminal catch-all is not the only thing that ends the walk, it is just
-// the case where the pattern is empty and matches everything.
+// may carry a wildcard — `*.zerogravity.industries` in front of a holding page
+// is a documented, deliberate configuration, not a malformed document. So the
+// terminal catch-all is not the only thing that ends the walk; it is the case
+// where the pattern matches everything.
 //
-// A rule carrying a path is narrower than the hostname: it takes some requests
-// and leaves the rest, so it does not shadow the route.
+// A rule carrying a path is treated as narrower than the hostname and does not
+// shadow. That is cloudflared's shape — it ANDs the host match with a path match
+// — but not quite its arithmetic: `Path` is an unanchored *regexp*, so a rule
+// whose path is `/` does in fact take every request for its host. Modelling Go
+// regexp semantics to decide that is well out of proportion here, and the
+// realistic path rule is `/admin`. Recorded as a known edge rather than guessed
+// at.
 func shadows(r ingressRule, host string) bool {
 	if r.str("path") != "" {
 		return false
 	}
-	pattern := r.str("hostname")
-	if pattern == "" {
-		return true // the catch-all, and any rule shaped like it
-	}
-	return globMatch(strings.ToLower(pattern), strings.ToLower(host))
+	return hostnameTakes(r.str("hostname"), host)
 }
 
-// globMatch reports whether s matches a pattern whose only metacharacter is `*`,
-// standing for any run of characters — cloudflared's hostname matching.
+// matchesEveryHostname reports whether an ingress hostname pattern takes every
+// host. cloudflared special-cases both spellings before its matcher runs.
+func matchesEveryHostname(pattern string) bool {
+	return pattern == "" || pattern == "*"
+}
+
+// hostnameTakes reports whether an ingress rule's hostname field matches host.
 //
-// Iterative with backtracking rather than a compiled regexp: it cannot blow up
-// on a pattern like `*.*.*`, and it needs no escaping of the dots that every
-// hostname is full of.
-func globMatch(pattern, s string) bool {
-	var p, i, star, resume int
-	star = -1
-	for i < len(s) {
-		switch {
-		case p < len(pattern) && pattern[p] == s[i]:
-			p, i = p+1, i+1
-		case p < len(pattern) && pattern[p] == '*':
-			star, resume = p, i
-			p++
-		case star >= 0:
-			resume++
-			p, i = star+1, resume
-		default:
-			return false
-		}
+// This mirrors cloudflared's own matcher rather than approximating it. It was a
+// general `*`-glob first, and a glob is wrong in two directions at once — one of
+// them silently (PRSR-30 review). Read from the source rather than inferred:
+// `Rule.Matches` in ingress/rule.go, and `matchHost` in ingress/ingress.go:
+//
+//	hostMatch := false
+//	if r.Hostname == "" || r.Hostname == "*" {
+//	        hostMatch = true
+//	} else {
+//	        hostMatch = matchHost(r.Hostname, hostname)
+//	}
+//
+//	func matchHost(ruleHost, reqHost string) bool {
+//	        if ruleHost == reqHost { return true }
+//	        if strings.HasPrefix(ruleHost, "*.") {
+//	                toMatch := strings.TrimPrefix(ruleHost, "*")   // the "*" only
+//	                return strings.HasSuffix(reqHost, toMatch)     // so the dot stays
+//	        }
+//	        return false
+//	}
+//
+// Two consequences a glob gets wrong:
+//
+//   - **Only a leading `*.` is a wildcard.** `wiki.*` and `*.*.industries` are
+//     literals upstream and match nothing, so a glob stops the walk at a rule
+//     cloudflared walks straight past — reporting `create` for a hostname whose
+//     real rule is further down, and calling a serving rule "never matched".
+//   - **`*.example.com` does not take the apex `example.com`.** Only the `*` is
+//     trimmed, so the suffix tested still carries its dot. A glob that requires
+//     the dot after the star agrees here by accident; one that does not would
+//     wrongly hold an apex route back.
+//
+// Case is folded, where cloudflared compares bytes. Hostnames are
+// case-insensitive and Cloudflare stores them lowercased, and the fold errs
+// toward "this shadows" — a false shadow is a refusal an operator can see, a
+// missed one is a route that is never matched with nothing reporting it.
+func hostnameTakes(pattern, host string) bool {
+	if matchesEveryHostname(pattern) {
+		return true
 	}
-	for p < len(pattern) && pattern[p] == '*' {
-		p++
+	if strings.EqualFold(pattern, host) {
+		return true
 	}
-	return p == len(pattern)
+	if strings.HasPrefix(pattern, "*.") {
+		// pattern[1:] keeps the dot, exactly as TrimPrefix(ruleHost, "*") does.
+		return strings.HasSuffix(strings.ToLower(host), strings.ToLower(pattern[1:]))
+	}
+	return false
 }
 
 // routeScan is what one walk of the ingress list found for a hostname. It is a

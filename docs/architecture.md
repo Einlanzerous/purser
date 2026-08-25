@@ -676,6 +676,14 @@ the other two provisioners do not:
   wildcard is never adopted as Purser's own route: `Teardown` would then delete a
   rule standing in front of the whole zone.
 
+  `hostnameTakes` mirrors cloudflared's matcher rather than approximating it —
+  `""`/`"*"` match everything, otherwise exact, otherwise only a leading `*.` is
+  a wildcard and the suffix it tests keeps its dot. Read from `ingress/rule.go`
+  and `ingress/ingress.go`, because the general glob it replaced was wrong in
+  both directions: `wiki.*` is a literal upstream and stopped a walk it should
+  not have, and the apex question (`*.zone` does *not* take `zone`) decides
+  whether an apex route is published or dead.
+
 Nothing wires it into `setup()` yet: the command that would run it is PRSR-31.
 
 ### The tunnelled/direct split reaches three steps

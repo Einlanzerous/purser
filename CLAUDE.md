@@ -363,6 +363,20 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   wildcard is **never adopted as ours** even when it serves exactly what the spec
   asks: `isRoute` matches literally, because adopting it would have `Teardown`
   delete a rule standing in front of every other hostname in the zone.
+- **`hostnameTakes` mirrors cloudflared's matcher; it does not approximate it.**
+  It was a general `*`-glob first, and a glob is wrong in two directions at once.
+  The rule, read from `Rule.Matches` in cloudflared's `ingress/rule.go` and
+  `matchHost` in `ingress/ingress.go` rather than inferred: `""` and `"*"` match
+  everything; otherwise exact equality; otherwise, **only** a leading `*.` is a
+  wildcard, and it trims the `*` alone so the suffix tested keeps its dot. So
+  `wiki.*` and `*.*.industries` are *literals* upstream and stop nothing — a glob
+  treating them as patterns reports `create` for a hostname whose real rule is
+  right below, inserts a duplicate in front of it, and calls a serving rule
+  "never matched". And `*.zerogravity.industries` does **not** take the apex
+  `zerogravity.industries`, so an apex route belongs in front of the terminal
+  rule and works there. Both are pinned in `TestHostnameTakes` with the reason on
+  each row; if that matcher is ever rewritten, check the source again rather than
+  reasoning from the shape of the wildcard.
 - **The ingress document is written back whole.** `PUT …/configurations`
   replaces it, so every key omitted is a setting the tunnel loses —
   `warp-routing`, the tunnel-wide `originRequest`, a per-rule `noTLSVerify`
