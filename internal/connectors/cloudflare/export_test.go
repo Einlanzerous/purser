@@ -28,3 +28,12 @@ func newAccessWithBase(t *testing.T, base string, cfg AccessConfig) *AccessProvi
 	p.api.baseURL = base
 	return p
 }
+
+// newTunnelWithBase builds an ingress-route provisioner pointed at a test server
+// instead of the real Cloudflare API.
+func newTunnelWithBase(t *testing.T, base string, cfg TunnelConfig) *TunnelProvisioner {
+	t.Helper()
+	p := NewTunnel(cfg)
+	p.api.baseURL = base
+	return p
+}

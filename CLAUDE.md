@@ -21,9 +21,14 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `Unavailable` (registered-but-unconfigured) + `ErrPending`.
 - `internal/connectors/{switchyard,cloudflare,lyceum,argosy}/` — per-service connectors.
   `cloudflare/` serves **both** axes: the Access `Connector` (person × service)
-  and, on the spin-up axis, `DNSProvisioner` (PRSR-28, `dns.go`) and
-  `AccessProvisioner` (PRSR-29, `access.go`) — over one shared API client in
-  `client.go`. All three have separate Config structs on purpose — see the
+  and, on the spin-up axis, `DNSProvisioner` (PRSR-28, `dns.go`),
+  `AccessProvisioner` (PRSR-29, `access.go`) and `TunnelProvisioner` (PRSR-30,
+  `tunnel.go`) — over one shared API transport in `client.go`. Grouped by
+  **upstream, not by axis**: one API, one token, one place the read-modify-write
+  hazard is solved and the next person to meet it can see the precedent. The axes
+  stay separate where it counts — `spinup` imports neither `connector` nor this
+  package, and a `ServiceProvisioner` and a `Connector` remain two types sharing
+  no fields. All four have separate Config structs on purpose — see the
   invariant below.
 - `internal/invite/` — the orchestrator (`Run`) + credential-block renderer. This
   is where idempotency lives.
@@ -312,6 +317,36 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   run, before any step, so the ingress route and the DNS record cannot end up
   describing different tunnels. Only `prod` is wired; `dev` resolves to a
   refusal rather than falling back — which is the entire point of a named ref.
+- **The terminal catch-all rule stays last, and that is checked rather than
+  assumed.** A tunnel's ingress list ends in a rule matching everything (no
+  hostname, no path — typically `http_status:404`), which cloudflared requires. A
+  rule appended *after* it is never matched and **nothing errors**: the route
+  simply doesn't work, which is why this is asserted on the document before the
+  PUT and again on the read-back, rather than trusted. The generalisation is the
+  same bug one step out — a catch-all that isn't last has already killed every
+  rule behind it, so inserting before the final rule there would land the new
+  route in the dead tail. Both shapes are refused, not repaired: a document
+  Purser doesn't understand is not one to rewrite on a guess. Anything walking
+  ingress entries must also tolerate the missing hostname instead of tripping
+  over it.
+- **The ingress document is written back whole.** `PUT …/configurations`
+  replaces it, so every key omitted is a setting the tunnel loses —
+  `warp-routing`, the tunnel-wide `originRequest`, a per-rule `noTLSVerify`
+  somebody set once by hand. Rules are held as raw JSON per key for exactly that
+  reason: a field this build doesn't model is still one it can hand back
+  byte-for-byte. Don't decode ingress into a tidy struct.
+- **The lost update is the hazard, and one guard doesn't cover it.** There is no
+  per-hostname write, so a stale read doesn't corrupt this service's route — it
+  deletes somebody else's. `TunnelProvisioner.docMu` serializes the
+  read-modify-write the way `groupMu` does for the Access group's email list, and
+  `Ensure`/`Teardown` take their **own fresh read inside that lock** rather than
+  building a write on the plan's `Inspect`, which ran outside it. The read-back
+  then confirms our own route landed — and the configuration's `version` is
+  checked to have moved by exactly one, because that is the only thing that can
+  see a *different process* writing in between: confirming our own route always
+  passes, since our write necessarily contains everything our own read did. A
+  version jump is a warning on a step that succeeded, not a failure of it; what
+  may have been lost is another service's route.
 - **Never treat unverifiable as absent**, here too. A failed `Inspect` is
   `unknown`, and `--apply` does not act on an unknown step: acting on a state
   that couldn't be read creates a second copy of something, or rebuilds a shared
@@ -498,15 +533,24 @@ reason — twice now this project has lost the remaining half of a piece of work
 by closing the ticket that described it (see PRSR-25, below) — so don't delete
 that interface method as dead code; it is waiting on a walk, not unused.
 
-Next on that axis, and independent of each other: **PRSR-29** (Access
-application — `self_hosted` + policy vs `bookmark`, and a `logo_url` that must
-be verified reachable before it is written) and **PRSR-30** (tunnel ingress
-route — insert before the terminal catch-all rule, and guard the shared document
-the way the Access connector guards the group's email list). Then **PRSR-31** —
-the `provision-service` CLI/HTTP surface and Argosy end to end, on the direct
-path, so it needs PRSR-29 but not PRSR-30, and it is the first thing to wire any
-provisioner into `setup()`.
-**PRSR-33** wires the `dev` tunnel ref that PRSR-27 left resolving to a refusal.
+PRSR-30 completes the three: `TunnelProvisioner` in `tunnel.go`, the ingress
+route. It is the step with the blast radius — one shared document per tunnel
+holding every hostname on it — so the invariants above are where the work went:
+insert before the terminal catch-all and assert it stayed last, write every key
+back verbatim, and guard the read-modify-write with a mutex, a fresh read inside
+it, a read-back, and a version check for the writer the read-back cannot see.
+It also refuses a tunnel that is not remotely managed, because the configuration
+this endpoint returns is then not the one being served and every other guard in
+the file is about *who else wrote it*, not whether it is live.
+
+With all three provisioners in, nothing yet wires any of them into `setup()`:
+that is **PRSR-31**, the `provision-service` CLI/HTTP surface, which brings
+Argosy up end to end on the direct path. **PRSR-33** wires the `dev` tunnel ref
+that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
+spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
+the `Teardown` walk, **PRSR-36** the Cloudflare response shapes still read from
+the published schema rather than observed, and **PRSR-37** resolving a service's
+logo from Placard instead of hand-writing the URL into a spec.
 
 **PRSR-36** confirms two Cloudflare response shapes that PRSR-28's fixes are
 currently reasoning about from the published schema rather than from a response
