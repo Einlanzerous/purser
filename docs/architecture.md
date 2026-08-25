@@ -684,6 +684,15 @@ the other two provisioners do not:
   not have, and the apex question (`*.zone` does *not* take `zone`) decides
   whether an apex route is published or dead.
 
+- **Is this the document the tunnel serves?** `getConfig` refuses any tunnel
+  whose `source` is not `cloudflare`. A locally-managed tunnel runs a YAML file
+  on the origin machine, so the remote configuration is not in force — and none
+  of the four guards above can see that, since each is about *who else wrote this
+  document*. Unchecked, the whole sequence succeeds silently and DNS publishes a
+  hostname the tunnel has never heard of. An absent `source` is refused as well.
+  PRSR-26 verified `construct-server` by hand, once; nothing re-asserted it at
+  run time, and PRSR-33 adds a tunnel whose mode nobody has checked.
+
 Nothing wires it into `setup()` yet: the command that would run it is PRSR-31.
 
 ### The tunnelled/direct split reaches three steps

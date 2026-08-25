@@ -39,6 +39,9 @@ type fakeTunnel struct {
 	puts   int
 	paths  []string
 	getErr string // when set, GET fails with this Cloudflare error message
+	// source is what the tunnel reports about how it is managed. Only
+	// "cloudflare" means the document this endpoint serves is the one in force.
+	source string
 
 	// getDelay makes the read window wide enough for two Ensure calls to
 	// overlap in it — which is the only way to show the mutex is doing
@@ -58,7 +61,7 @@ type fakeTunnel struct {
 
 func newFakeTunnel(t *testing.T, config string) *fakeTunnel {
 	t.Helper()
-	f := &fakeTunnel{ver: 5, verBump: 1}
+	f := &fakeTunnel{ver: 5, verBump: 1, source: "cloudflare"}
 	if err := json.Unmarshal([]byte(config), &f.doc); err != nil {
 		t.Fatalf("fixture is not a config object: %v", err)
 	}
@@ -90,7 +93,7 @@ func (f *fakeTunnel) handle(w http.ResponseWriter, r *http.Request) {
 			"result": map[string]any{
 				"tunnel_id": testTunnelID,
 				"version":   f.ver,
-				"source":    "cloudflare",
+				"source":    f.source,
 				"config":    f.doc,
 			},
 		})
@@ -961,6 +964,87 @@ func TestTunnel_UsesTheAccountAndTunnelInThePath(t *testing.T) {
 	defer f.mu.Unlock()
 	if len(f.paths) != 1 || f.paths[0] != want {
 		t.Errorf("path wrong: %v, want %q", f.paths, want)
+	}
+}
+
+// --- is this document the one in force? -------------------------------------
+
+func TestTunnel_RefusesALocallyManagedTunnel(t *testing.T) {
+	// A locally-managed tunnel serves a YAML file on the origin machine, so the
+	// remote configuration is not what it runs. Every other guard here is about
+	// *who else wrote this document*; none of them can ask whether it is live.
+	//
+	// Left unchecked the whole sequence succeeds: the read reports "no ingress
+	// rule", the PUT is stored, the read-back finds the route, confirmRoute
+	// passes, DNS publishes — and the tunnel has never heard of the hostname.
+	f := newFakeTunnel(t, liveShape)
+	f.source = "local"
+	p := f.prov(t)
+	tgt := target(t, "interlock.zerogravity.industries", "http://interlock:8080")
+
+	st, err := p.Inspect(context.Background(), tgt)
+	if err == nil {
+		t.Fatalf("want a refusal, got %+v", st)
+	}
+	if st.Exists {
+		t.Errorf("no state should come back with the refusal, got %+v", st)
+	}
+	if spinup.IsUnavailable(err) {
+		t.Error("the provisioner is configured and working; the tunnel is the problem")
+	}
+	if !strings.Contains(err.Error(), "origin machine") {
+		t.Errorf("the refusal should say what to do instead, got %v", err)
+	}
+
+	if _, err := p.Ensure(context.Background(), tgt); err == nil {
+		t.Error("Ensure must refuse too")
+	}
+	if err := p.Teardown(context.Background(), tgt, model.ServiceResource{
+		Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID,
+	}); err == nil {
+		// Removing a route from a document that isn't in force removes nothing,
+		// and Teardown may only report success when the resource is gone.
+		t.Error("Teardown must refuse too")
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("nothing should be written to a tunnel that would not serve it, saw %d PUTs", puts)
+	}
+}
+
+func TestTunnel_RefusesATunnelThatReportsNoSource(t *testing.T) {
+	// "We could not tell" is not "it is fine" — the axis's oldest invariant.
+	f := newFakeTunnel(t, liveShape)
+	f.source = ""
+	tgt := target(t, "interlock.zerogravity.industries", "http://interlock:8080")
+
+	_, err := f.prov(t).Inspect(context.Background(), tgt)
+	if err == nil {
+		t.Fatal("an unverifiable management mode is not a verified one")
+	}
+	if !strings.Contains(err.Error(), "did not report") {
+		t.Errorf("the refusal should name what was missing, got %v", err)
+	}
+}
+
+func TestTunnel_ConversionBetweenPlanAndApplyIsCaught(t *testing.T) {
+	// Ensure re-reads inside the lock, so a tunnel converted after the plan was
+	// made is refused rather than written to on the strength of the old read.
+	f := newFakeTunnel(t, liveShape)
+	p := f.prov(t)
+	tgt := target(t, "interlock.zerogravity.industries", "http://interlock:8080")
+
+	if _, err := p.Inspect(context.Background(), tgt); err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	f.mu.Lock()
+	f.source = "local"
+	f.mu.Unlock()
+
+	if _, err := p.Ensure(context.Background(), tgt); err == nil {
+		t.Fatal("want a refusal from the fresh read")
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("saw %d PUTs", puts)
 	}
 }
 

@@ -376,7 +376,24 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `zerogravity.industries`, so an apex route belongs in front of the terminal
   rule and works there. Both are pinned in `TestHostnameTakes` with the reason on
   each row; if that matcher is ever rewritten, check the source again rather than
-  reasoning from the shape of the wildcard.
+  reasoning from the shape of the wildcard. cloudflared's own `isCatchAllRule` is
+  `(Hostname == "" || Hostname == "*") && Path == ""` — the same predicate — and
+  its validation rejects a non-last catch-all outright, so refusing that document
+  is agreeing with the thing that has to serve it.
+- **Check that the document is the one in force, not just who else wrote it.**
+  `getConfig` refuses any tunnel whose `source` is not `cloudflare`. A
+  *locally*-managed tunnel is configured by a YAML file on the origin machine, so
+  the remote configuration this endpoint returns is not what it serves — and none
+  of the four write guards can see that, because every one of them is about *who
+  else wrote this document*. Left unchecked the entire sequence succeeds: the read
+  reports "no ingress rule" from a document that is no evidence about what is
+  served, the PUT is stored, the read-back finds the route, and DNS publishes a
+  hostname the tunnel has never heard of, with nothing erroring anywhere. An
+  **absent** `source` is refused too — "we could not tell" is not "it is fine",
+  and this is the oldest invariant on the axis. PRSR-26 established that
+  `construct-server` is remotely managed by hand, once; nothing re-asserted it at
+  run time, converting a tunnel is a dashboard toggle, and PRSR-33 wires a second
+  tunnel whose mode nobody has checked.
 - **The ingress document is written back whole.** `PUT …/configurations`
   replaces it, so every key omitted is a setting the tunnel loses —
   `warp-routing`, the tunnel-wide `originRequest`, a per-rule `noTLSVerify`

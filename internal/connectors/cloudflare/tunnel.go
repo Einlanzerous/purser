@@ -475,10 +475,10 @@ func matchesEveryHostname(pattern string) bool {
 //     the dot after the star agrees here by accident; one that does not would
 //     wrongly hold an apex route back.
 //
-// Case is folded, where cloudflared compares bytes. Hostnames are
-// case-insensitive and Cloudflare stores them lowercased, and the fold errs
-// toward "this shadows" — a false shadow is a refusal an operator can see, a
-// missed one is a route that is never matched with nothing reporting it.
+// Case is folded, and that is faithful rather than merely conservative:
+// `Rule.Matches` falls back to a `punycodeHostname` built with
+// `idna.Lookup.ToASCII`, which case-folds, so a mixed-case rule hostname does
+// match a lowercase request upstream.
 func hostnameTakes(pattern, host string) bool {
 	if matchesEveryHostname(pattern) {
 		return true
@@ -560,7 +560,12 @@ func scanRoute(rules []ingressRule, host string) routeScan {
 // one step generalized.
 //
 // It answers for the read path as well as the write one (see documentShape), so
-// its refusals are worded for both.
+// its refusals are worded for both. Both refusals are cloudflared's own:
+// `isCatchAllRule` there is `(Hostname == "" || Hostname == "*") && Path == ""`,
+// the same predicate as isCatchAll below, and its validation rejects a catch-all
+// that is not last with "the rules which follow it will never be triggered".
+// Refusing such a document rather than rewriting it is agreeing with the thing
+// that has to serve it.
 func terminalIndex(rules []ingressRule) (int, error) {
 	if len(rules) == 0 {
 		return 0, fmt.Errorf("the ingress configuration is empty, so it has no terminal catch-all rule to insert before")
@@ -770,6 +775,46 @@ func jsonString(s string) json.RawMessage {
 
 // --- the API round trip ----------------------------------------------------
 
+// remotelyManaged is the `source` value meaning this tunnel serves the
+// configuration this endpoint returns. The other is "local".
+const remotelyManaged = "cloudflare"
+
+// checkTunnelSource refuses a tunnel whose ingress document is not the one in
+// force.
+//
+// A locally-managed tunnel is configured by a YAML file on the origin machine,
+// and the remote configuration this endpoint returns is not what it serves. That
+// is a gap nothing else in this file can close: docMu, the fresh read inside it,
+// the verbatim write-back and the version check are each about *who else wrote
+// this document*, and none of them can ask whether the document is live.
+//
+// Refused rather than warned about, because the failure is silent end to end —
+// the read reports "no ingress rule" from a document that is no evidence about
+// what is served, the PUT is accepted and stored, the read-back finds the route,
+// confirmRoute passes, and DNS publishes a hostname the tunnel has never heard
+// of. Nothing errors anywhere, which is the exact failure mode this whole file
+// is organised around, one layer below where the rest of it applies. It is also
+// this axis's oldest invariant: never treat unverifiable as absent.
+//
+// An absent source is refused too. "We could not tell" is not "it is fine", and
+// a wrong refusal here names what it saw and is one glance to diagnose, where
+// the alternative is a hostname that resolves to nothing for as long as nobody
+// checks.
+//
+// PRSR-26 established that construct-server is remotely managed — by hand, once.
+// Nothing re-asserts it at run time, converting a tunnel is a dashboard toggle,
+// and PRSR-33 wires a second tunnel whose mode nobody has checked yet.
+func checkTunnelSource(tunnelID, source string) error {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case remotelyManaged:
+		return nil
+	case "":
+		return fmt.Errorf("cloudflare: tunnel %s did not report whether it is locally or remotely managed, so this configuration cannot be shown to be the one it serves — refusing to read a route from it or write one into it", tunnelID)
+	default:
+		return fmt.Errorf("cloudflare: tunnel %s is configured by a file on the origin machine (source %q), not over the API — a route written here would be stored and read back correctly and never served; manage its ingress in that cloudflared config, or convert the tunnel to remote management", tunnelID, source)
+	}
+}
+
 func configPath(accountID, tunnelID string) string {
 	return fmt.Sprintf("/accounts/%s/cfd_tunnel/%s/configurations", accountID, tunnelID)
 }
@@ -784,11 +829,16 @@ func (p *TunnelProvisioner) getConfig(ctx context.Context, tunnelID string) (ing
 	var env struct {
 		Result struct {
 			Version int                        `json:"version"`
+			Source  string                     `json:"source"`
 			Config  map[string]json.RawMessage `json:"config"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return ingressDoc{}, fmt.Errorf("cloudflare: decode tunnel configuration: %w", err)
+	}
+	// Before anything is read out of it: is this the document the tunnel serves?
+	if err := checkTunnelSource(tunnelID, env.Result.Source); err != nil {
+		return ingressDoc{}, err
 	}
 	doc := ingressDoc{config: env.Result.Config, version: env.Result.Version}
 	if doc.config == nil {
