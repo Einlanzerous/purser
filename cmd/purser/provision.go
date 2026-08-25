@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 	"text/tabwriter"
 
 	"github.com/Einlanzerous/purser/internal/spinup"
@@ -68,11 +67,11 @@ func runProvisionService(args []string) {
 		Key:         *key,
 		DisplayName: *name,
 		Hostname:    *hostname,
-		Mode:        spinup.Mode(strings.TrimSpace(*mode)),
+		Mode:        spinup.Mode(*mode),
 		Upstream:    *upstream,
-		Access:      spinup.AccessShape(strings.TrimSpace(*access)),
+		Access:      spinup.AccessShape(*access),
 		LogoURL:     *logo,
-		Tunnel:      spinup.TunnelRef(strings.TrimSpace(*tunnel)),
+		Tunnel:      spinup.TunnelRef(*tunnel),
 	}
 	// Validated before the database is touched. Everything the spec can be wrong
 	// about is cheaper to catch here than after a connection, and one of them —
@@ -170,6 +169,17 @@ func printProvision(res *spinup.Result) {
 	}
 
 	fmt.Fprintf(os.Stderr, "\n%s\n", provisionOutcome(res))
+
+	// Warnings before the errors: a step that succeeded while possibly damaging
+	// something *else* is easy to skim past, because its own line in the table
+	// says the step worked. It gets one line here and is not repeated in the
+	// table's DETAIL cell — printing it twice is how a reader learns to discount
+	// the message that most needs believing when it fires.
+	for _, f := range res.Findings {
+		if f.Warning != "" {
+			fmt.Fprintf(os.Stderr, "\n! %s: %s\n", f.DisplayName, f.Warning)
+		}
+	}
 
 	// The errors go last and in full. They are the longest lines here — a
 	// refused ingress document explains itself in a sentence and a half — and

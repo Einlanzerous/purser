@@ -191,6 +191,10 @@ type StepFinding struct {
 	// ExternalID is the resource's upstream id, when it has one. Empty for a
 	// tunnel route by nature, not by omission.
 	ExternalID string
+	// Warning is trouble around a step that nonetheless succeeded — see
+	// Resource.Warning. Distinct from Err, which belongs to a step that did not
+	// do what it said.
+	Warning string
 	// Applied reports that this run changed something — upstream, the record, or
 	// both. Always false on a dry run.
 	Applied bool
@@ -237,9 +241,14 @@ func (r *Result) Changed() int {
 
 // Pending reports how many steps still want doing — the count that makes
 // "nothing to do" distinguishable from "re-run with --apply". Statuses that need
-// a human (unavailable, unknown, failed) are not counted here, and neither is
-// blocked: re-running with --apply does not fix any of them, because the reason
-// they didn't happen was never the missing flag.
+// a human (unavailable, refused, unknown, failed) are not counted here, and
+// neither is blocked: re-running with --apply does not fix any of them, because
+// the reason they didn't happen was never the missing flag.
+//
+// So a zero here is NOT the claim that the edge is as the spec asks — only that
+// the flag would add nothing. Anything reporting an overall verdict has to
+// consult the statuses too; reading this alone as success is what had the CLI
+// sign off an unavailable DNS step as a service that was up (PRSR-31).
 func (r *Result) Pending() int {
 	n := 0
 	for _, f := range r.Findings {
@@ -485,7 +494,7 @@ func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKi
 	// Inspect's description of the state this call just replaced would present
 	// the old world as the result. A provisioner that returns none leaves the
 	// line without a description, which is honest.
-	f.Detail = res.Detail
+	f.Detail, f.Warning = res.Detail, res.Warning
 
 	// The ids are merged the other way round, and deliberately. A provisioner
 	// that returns a partial Resource — an update that had nothing new to say,

@@ -415,8 +415,13 @@ func TestDNS_Inspect_LookupFailureIsNotAbsence(t *testing.T) {
 }
 
 // If the name filter is ever ignored, the first page of a large zone would read
-// as "nothing here" and Ensure would create a duplicate. A full page is refused.
-func TestDNS_Inspect_FullPageIsRefusedRatherThanRead(t *testing.T) {
+// as "nothing here" and Ensure would create a duplicate. A full page is not read.
+//
+// Named for what it is rather than "refused", which since PRSR-31 is a *status*
+// meaning something this one deliberately is not: here the answer genuinely was
+// not read, so re-running is the fix and the step is `unknown`. See
+// TestSpinup_AFullPageIsUnknownNotRefused, which pins that at the orchestrator.
+func TestDNS_Inspect_FullPageIsNotReadAsAnAnswer(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		out := make([]dnsRecord, perPage)
 		for i := range out {
@@ -430,6 +435,9 @@ func TestDNS_Inspect_FullPageIsRefusedRatherThanRead(t *testing.T) {
 	_, err := p.Inspect(context.Background(), directTarget("100.64.0.7"))
 	if err == nil || !strings.Contains(err.Error(), "full page") {
 		t.Fatalf("a full page means the filter did not narrow — want a refusal, got %v", err)
+	}
+	if spinup.IsRefused(err) {
+		t.Error("this is an answer that was not read, not a state somebody must go and fix — it must stay unknown")
 	}
 }
 

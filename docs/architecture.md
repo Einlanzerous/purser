@@ -821,12 +821,18 @@ caveat on the *claims*, not on the code. **PRSR-36** carries the probe.
 
 ### What is left
 
-- **Argosy end to end, against the live API.** PRSR-31 shipped the command and
-  the test — `spinup_argosy_test.go` runs all three real provisioners through
-  the real orchestrator against an already-up edge and asserts three no-ops with
-  zero upstream writes — but no test in this repo has ever contacted Cloudflare,
-  so the first real `provision-service` run is still an exercise nobody has
-  performed. It needs an operator's credentials; it is not blocked on code.
+- **PRSR-38 — Argosy end to end, against the live API.** PRSR-31 shipped the
+  command and the test — `spinup_argosy_test.go` runs all three real
+  provisioners through the real orchestrator against an already-up edge and
+  asserts three no-ops with zero upstream writes — but no test in this repo has
+  ever contacted Cloudflare, so the first real `provision-service` run is still
+  an exercise nobody has performed. It needs an operator's credentials, not a
+  code change. It has a key rather than this bullet for the reason this file
+  keeps repeating: the remaining half of a piece of work does not survive being
+  a note in a doc. It **blocks PRSR-34**, and carries the premises that are
+  currently true only because a fixture says so — the tunnel `version` moving by
+  exactly one per PUT, PRSR-36's two shapes, a bookmark app's live JSON, and
+  whether policy references come back as strings or objects.
 - **PRSR-33** — the `dev` tunnel ref, which resolves to a refusal today rather
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod

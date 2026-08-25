@@ -177,9 +177,13 @@ type stepDTO struct {
 	DisplayName string `json:"display_name"`
 	Status      string `json:"status"`
 	Detail      string `json:"detail,omitempty"`
-	ExternalID  string `json:"external_id,omitempty"`
-	Applied     bool   `json:"applied"`
-	Error       string `json:"error,omitempty"`
+	// Warning is trouble around a step that succeeded — see spinup.Resource.
+	// Its own field rather than a clause inside detail, so a caller can find it
+	// without pattern-matching a description.
+	Warning    string `json:"warning,omitempty"`
+	ExternalID string `json:"external_id,omitempty"`
+	Applied    bool   `json:"applied"`
+	Error      string `json:"error,omitempty"`
 }
 
 func newSpinupResponse(res *spinup.Result) spinupResponse {
@@ -208,6 +212,7 @@ func newSpinupResponse(res *spinup.Result) spinupResponse {
 			DisplayName: f.DisplayName,
 			Status:      string(f.Status),
 			Detail:      f.Detail,
+			Warning:     f.Warning,
 			ExternalID:  f.ExternalID,
 			Applied:     f.Applied,
 			Error:       f.Err,

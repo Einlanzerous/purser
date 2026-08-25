@@ -2,7 +2,9 @@ package cloudflare
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -162,10 +164,16 @@ func TestSpinup_NewHostnamePreviewsThenCreates(t *testing.T) {
 	}
 }
 
-// An answer Purser can't read is `unknown`, and --apply does not act on it.
-// Two candidate records is the realistic way to get there: acting would mean
-// changing whichever one wasn't this service's.
-func TestSpinup_AmbiguousNameIsUnknownAndNotActedOn(t *testing.T) {
+// Several records answering for one name, none of them the spec's, is
+// `refused` — not `unknown` — and --apply does not act on it either way.
+//
+// The read *succeeded*; what came back is something Purser will not act on,
+// because acting would change whichever record wasn't this service's. Nothing
+// changes until a human edits the zone, which is what the message says. As
+// `unknown` the CLI drew "could not be read … re-run", and re-running reprints
+// it for ever (PRSR-31). records()'s full-page refusal stays `unknown`, and
+// that is the distinction — see TestSpinup_AFullPageIsUnknownNotRefused.
+func TestSpinup_AmbiguousNameIsRefusedAndNotActedOn(t *testing.T) {
 	host := "argosy." + testZoneName
 	z := newZone(
 		dnsRecord{Type: "A", Name: host, Content: "10.0.0.1"},
@@ -178,11 +186,11 @@ func TestSpinup_AmbiguousNameIsUnknownAndNotActedOn(t *testing.T) {
 		t.Fatalf("a step that cannot be read is a finding, not a failed run: %v", err)
 	}
 	f := dnsFinding(t, res)
-	if f.Status != spinup.StepUnknown {
-		t.Fatalf("want unknown, got %s (%s)", f.Status, f.Err)
+	if f.Status != spinup.StepRefused {
+		t.Fatalf("want refused, got %s (%s)", f.Status, f.Err)
 	}
 	if z.writes() != 0 {
-		t.Errorf("--apply must not act on an unknown step, made %d write(s)", z.writes())
+		t.Errorf("--apply must not act on a refused step, made %d write(s)", z.writes())
 	}
 	if len(st.rows) != 0 {
 		t.Error("nothing happened, so nothing should be recorded")
@@ -207,5 +215,39 @@ func TestSpinup_TunnelledDNSIsBlockedByItsPrerequisites(t *testing.T) {
 	}
 	if z.writes() != 0 {
 		t.Errorf("a blocked step writes nothing, made %d write(s)", z.writes())
+	}
+}
+
+// The other side of the line from TestSpinup_AmbiguousNameIsRefusedAndNotActedOn,
+// and the reason the split is worth having at all: both refuse, both decline to
+// act, and they tell the operator opposite things.
+//
+// A full page means the name filter narrowed nothing, so page one of a large
+// zone would otherwise read as "nothing here". That answer was never read —
+// re-running is the whole fix — so it stays `unknown`. Reporting it `refused`
+// would send someone to the dashboard to fix a zone that is fine.
+func TestSpinup_AFullPageIsUnknownNotRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		out := make([]dnsRecord, perPage)
+		for i := range out {
+			out[i] = dnsRecord{ID: fmt.Sprint(i), Type: "A", Name: fmt.Sprintf("other%d.%s", i, testZoneName), Content: "10.0.0.1"}
+		}
+		cfOK(w, out)
+	}))
+	defer srv.Close()
+
+	st := newMemStore()
+	svc := spinup.New(st, spinup.NewRegistry(
+		newDNSWithBase(t, srv.URL, DNSConfig{APIToken: "cf_token", ZoneID: testZoneID}),
+	))
+	res, err := svc.Ensure(context.Background(), spinup.Request{Spec: directTarget("100.64.0.7").Spec, Apply: true})
+	if err != nil {
+		t.Fatalf("a step that cannot be read is a finding, not a failed run: %v", err)
+	}
+	if f := dnsFinding(t, res); f.Status != spinup.StepUnknown {
+		t.Fatalf("a truncated answer was never read, so re-running is the fix — want unknown, got %s (%s)", f.Status, f.Err)
+	}
+	if len(st.rows) != 0 {
+		t.Error("nothing happened, so nothing should be recorded")
 	}
 }

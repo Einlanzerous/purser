@@ -194,6 +194,19 @@ func (s ServiceSpec) Normalized() ServiceSpec {
 		s.Upstream = strings.ToLower(s.Upstream)
 	}
 	s.LogoURL = strings.TrimSpace(s.LogoURL)
+	// Trimmed here rather than at each caller. These three are compared against
+	// constants, so a stray space is a refusal — and it was a refusal on the
+	// HTTP path only, because the CLI trimmed them itself and this did not. One
+	// surface accepting `"direct "` and the other answering `unknown mode
+	// "direct "` is a difference nobody would guess at (PRSR-31).
+	//
+	// Not case-folded, unlike Key and Hostname. Those are identity keys, where
+	// two spellings of one value would split a service in half; these are a
+	// closed set matched against constants, and quietly accepting `"Direct"`
+	// widens what a spec may say without anyone deciding to.
+	s.Mode = Mode(strings.TrimSpace(string(s.Mode)))
+	s.Access = AccessShape(strings.TrimSpace(string(s.Access)))
+	s.Tunnel = TunnelRef(strings.TrimSpace(string(s.Tunnel)))
 	if s.DisplayName = strings.TrimSpace(s.DisplayName); s.DisplayName == "" {
 		s.DisplayName = s.Key
 	}

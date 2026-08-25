@@ -367,3 +367,37 @@ func TestTunnelSet_Resolve(t *testing.T) {
 		t.Error("an empty set must refuse rather than resolve to an empty id")
 	}
 }
+
+// Mode, Access and Tunnel are compared against constants, so a stray space is a
+// refusal — and it used to be a refusal on one surface only, because the CLI
+// trimmed them itself and Normalized did not. An automation caller posting
+// `{"mode": "direct "}` got `unknown mode "direct "` for a value the CLI
+// accepted (PRSR-31).
+func TestNormalized_TrimsTheFieldsComparedAgainstConstants(t *testing.T) {
+	spec := ServiceSpec{
+		Key: "interlock", Hostname: "interlock.zerogravity.industries",
+		Mode: " tunnelled ", Upstream: "http://interlock:8080",
+		Access: "\tgated\n", Tunnel: " prod ",
+	}
+	got, err := spec.Validate()
+	if err != nil {
+		t.Fatalf("padding is not a different spec: %v", err)
+	}
+	if got.Mode != ModeTunnelled || got.Access != AccessGated || got.Tunnel != TunnelProd {
+		t.Errorf("want the trimmed constants, got mode=%q access=%q tunnel=%q", got.Mode, got.Access, got.Tunnel)
+	}
+}
+
+// Trimmed, but not case-folded. Key and Hostname are identity keys, where two
+// spellings of one value would split a service's resources between them; these
+// three are a closed set, and quietly accepting "Direct" widens what a spec may
+// say without anybody deciding it should.
+func TestNormalized_DoesNotCaseFoldTheClosedSets(t *testing.T) {
+	spec := ServiceSpec{
+		Key: "argosy", Hostname: "argosy.zerogravity.industries",
+		Mode: "Direct", Upstream: "100.64.0.7", Access: "bookmark",
+	}
+	if _, err := spec.Validate(); err == nil {
+		t.Error(`"Direct" is not a mode; accepting it would widen the set by accident`)
+	}
+}

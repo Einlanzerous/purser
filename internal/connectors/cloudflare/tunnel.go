@@ -280,20 +280,22 @@ func (p *TunnelProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 	if err := confirmRoute(after.ingress, t.Spec.Hostname, t.Spec.Upstream); err != nil {
 		return spinup.Resource{}, err
 	}
-	if note := concurrentWriteNote(before.version, after.version, t.TunnelID); note != "" {
-		// Not an error: the route above is confirmed in place, so this step did
-		// what it said. What may have been lost is somebody *else's* route.
-		//
-		// Carried on the Detail alone, and deliberately not also logged. The
-		// orchestrator puts this string on the step's finding, which both
-		// surfaces render — so a log line here made one event read as two on the
-		// CLI, where `log` writes to stdout beside the report (PRSR-31). It is
-		// the one message whose whole value is being believed when it fires, and
-		// a warning printed twice is one a reader starts discounting. Teardown
-		// still logs its own: nothing carries a detail back from there.
-		detail += " — " + note
-	}
-	return spinup.Resource{ParentID: t.TunnelID, Detail: detail}, nil
+	// Not an error: the route above is confirmed in place, so this step did what
+	// it said. What may have been lost is somebody *else's* route on this
+	// tunnel, which is why it travels as a Warning rather than as an appendix to
+	// this resource's description.
+	//
+	// It used to be appended to Detail *and* logged here. The log line is gone
+	// because `log` and the CLI's own summary both write to stderr, so one event
+	// read as two — and this is the message whose entire value is being believed
+	// when it fires. But dropping it outright made it invisible to `purser
+	// serve`, where there is no double-print to avoid and a caller that ignores
+	// the field would leave no trace of it anywhere; the API layer logs it from
+	// the Warning field instead, the way it already logs applied-not-recorded
+	// (PRSR-31). Teardown still logs its own — nothing carries a Resource back
+	// from there.
+	note := concurrentWriteNote(before.version, after.version, t.TunnelID)
+	return spinup.Resource{ParentID: t.TunnelID, Detail: detail, Warning: note}, nil
 }
 
 // Teardown removes the hostname's ingress rule from the tunnel it was recorded

@@ -50,7 +50,10 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   in-process migrator in `internal/store/migrate.go` applies embedded SQL.
 - Config is env-only, `PURSER_`-prefixed, with a `DATABASE_URL` fallback
   (`internal/config`). No config files.
-- Logs: stdlib `log` to stdout. Health: `GET /healthz`. Port 4006.
+- Logs: stdlib `log`, which writes to **stderr** — nothing calls `SetOutput`.
+  (This line said stdout until PRSR-31, where it mattered: the CLI's own summary
+  also goes to stderr, which is what made a logged-and-detailed warning print
+  twice on the same stream.) Health: `GET /healthz`. Port 4006.
 - Release-please + GHCR image `ghcr.io/einlanzerous/purser`. Conventional
   commits.
 
@@ -541,12 +544,28 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   failure is our own arithmetic or a concurrent writer — a breakage, not
   something upstream to go and fix. Keep `unavailable` distinct from both: it is
   Purser's own missing credential, fixed here rather than there.
-- **A warning worth believing is printed once.** The tunnel's concurrent-write
-  note lands on the step's `Detail`, which both surfaces render, and is
-  deliberately *not* also logged from `Ensure` — `log` writes to stdout beside
-  the CLI's own report, so one event read as two. It is the one message whose
-  entire value is being believed when it fires. `Teardown` still logs its own,
-  because nothing carries a detail back from there.
+  **The line runs through the DNS provisioner too, and both sides of it are
+  live.** `pickCandidate` — several records answer for this name and none is the
+  spec's — is `refused`: the read succeeded, and its own message says to resolve
+  it in the dashboard. `records()`'s full-page refusal stays `unknown`: the
+  filter narrowed nothing, so the answer really was not read and a re-run is the
+  fix. Getting that backwards prints "could not be read … re-run" at somebody
+  whose zone needs editing, which is the sentence this split exists to stop.
+- **A warning is its own field, printed once per surface.** Trouble *around* a
+  step that succeeded travels as `Resource.Warning` → `StepFinding.Warning`, not
+  as a clause appended to `Detail`. The two are read by different people: Detail
+  describes this resource and a surface may truncate it, while the tunnel's
+  concurrent-write note says another service's ingress route may have been
+  dropped from the shared document — which a caller must be able to find without
+  pattern-matching a substring out of a description.
+  It is **not logged from `Ensure`**, because `log` and the CLI's own summary
+  both write to stderr and one event then read as two; it *is* logged by the API
+  layer, where there is no double-print to avoid and a caller that ignores the
+  field would leave no trace of it anywhere — the same argument `handleSpinup`
+  already makes for `applied-not-recorded`. Dropping the log outright (PRSR-31's
+  first attempt) fixed the CLI and blinded `purser serve`: a 200 with sensible
+  counts reveals nothing, and the damage is somebody *else's* outage.
+  `Teardown` still logs its own — nothing carries a `Resource` back from there.
 - **"Nothing pending" is not "the edge is up."** `Result.Pending()` counts only
   what `--apply` would act on, and deliberately excludes `unavailable`,
   `refused`, `unknown` and `blocked` — none of them is fixed by the flag. So the
@@ -563,6 +582,15 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   axis: each reports the env var it is missing, which a generic `Unavailable`
   stand-in could not, and registering them keeps the kind known so a step can
   never be quietly absent from a report.
+- **`Normalized()` trims every field a surface might pad, including the closed
+  sets.** `Mode`, `Access` and `Tunnel` are compared against constants, so a
+  stray space is a refusal — and it was a refusal on the HTTP path only, because
+  the CLI trimmed them itself and `Normalized` did not. One surface accepting
+  `"direct "` while the other answers `unknown mode "direct "` is a difference
+  nobody would guess at. Trimmed, but deliberately **not** case-folded: `Key` and
+  `Hostname` are identity keys where two spellings would split a service in half,
+  whereas these three are a closed set, and accepting `"Direct"` would widen what
+  a spec may say without anybody deciding it should.
 - **`spinup.ErrTunnelUnconfigured` exists so the HTTP surface need not match on
   a message.** `Validate` has already rejected refs that are not names, so it is
   only ever a legal ref nobody has wired (`dev`, until PRSR-33) — the caller's to
@@ -662,7 +690,11 @@ the real orchestrator against an already-up edge and asserts three no-ops with
 zero upstream writes. **What it has not done is contact Cloudflare.** No test in
 this repo ever has; the first real `provision-service` run needs an operator's
 credentials and is the exercise the epic actually asks for. Until somebody runs
-it, "Argosy end to end" is a claim about a fake.
+it, "Argosy end to end" is a claim about a fake. That half has its own key,
+**PRSR-38** — a docs bullet is exactly how this project has lost the remaining
+half of a piece of work twice — and it **blocks PRSR-34**, since `Teardown` is
+where a wrong absence-predicate starts marking rows removed for records that
+still resolve.
 
 **PRSR-33** wires the `dev` tunnel ref
 that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one

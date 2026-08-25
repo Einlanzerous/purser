@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 
@@ -51,16 +53,23 @@ func hostname(r model.ServiceResource) string { return r.Hostname + "|" + string
 type stubProv struct {
 	kind    model.ResourceKind
 	ensures int
+	// warning, when set, is returned by Ensure on a step that still succeeds.
+	warning string
+	// absent makes Inspect report nothing there, so Ensure is actually reached.
+	absent bool
 }
 
 func (p *stubProv) Kind() model.ResourceKind { return p.kind }
 func (p *stubProv) DisplayName() string      { return string(p.kind) }
 func (p *stubProv) Inspect(context.Context, spinup.Target) (spinup.State, error) {
+	if p.absent {
+		return spinup.State{}, nil
+	}
 	return spinup.State{Exists: true, Matches: true, ExternalID: "res-1", Detail: "already correct"}, nil
 }
 func (p *stubProv) Ensure(context.Context, spinup.Target) (spinup.Resource, error) {
 	p.ensures++
-	return spinup.Resource{ExternalID: "res-1", Detail: "already correct"}, nil
+	return spinup.Resource{ExternalID: "res-1", Detail: "already correct", Warning: p.warning}, nil
 }
 func (p *stubProv) Teardown(context.Context, spinup.Target, model.ServiceResource) error { return nil }
 
@@ -255,4 +264,93 @@ func TestSpinup_NoOrchestratorIs503(t *testing.T) {
 
 func contains(s, sub string) bool {
 	return len(sub) == 0 || bytes.Contains([]byte(s), []byte(sub))
+}
+
+// The finding that a step succeeded while something *else* may have broken has
+// to survive the HTTP path, and it is the one a 200 with sensible counts hides
+// completely: the tunnel's concurrent-write note means another service's ingress
+// route may have been dropped from the shared document. It reaches the caller as
+// its own field — not as a clause inside `detail`, which a caller would have to
+// pattern-match — and it is logged server-side, so a caller that ignores the
+// field still leaves a trace somewhere (PRSR-31).
+func TestSpinup_AWarningSurvivesTheHTTPPath(t *testing.T) {
+	const note = "another writer changed the shared configuration at the same time"
+	st := newMemStore()
+	dns := &stubProv{kind: model.ResourceDNSRecord, absent: true, warning: note}
+	svc := spinup.New(st, spinup.NewRegistry(
+		dns,
+		&stubProv{kind: model.ResourceAccessApp},
+		&stubProv{kind: model.ResourceTunnelRoute},
+	), spinup.WithTunnels(spinup.TunnelSet{spinup.TunnelProd: "tunnel-1"}))
+
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	srv := httptest.NewServer(New(nil, svc, nil, "").Handler())
+	defer srv.Close()
+
+	code, body := postSpinup(t, srv, map[string]any{
+		"service": "argosy", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"apply": true,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("a warning is not a failure, status %d: %v", code, body)
+	}
+	var found map[string]any
+	for _, raw := range body["findings"].([]any) {
+		if f := raw.(map[string]any); f["kind"] == string(model.ResourceDNSRecord) {
+			found = f
+		}
+	}
+	if found == nil {
+		t.Fatalf("no DNS finding: %v", body["findings"])
+	}
+	if found["warning"] != note {
+		t.Errorf("the warning must be its own field, got %v", found["warning"])
+	}
+	if found["applied"] != true {
+		t.Errorf("the step succeeded, so it is applied: %v", found["applied"])
+	}
+	if d, _ := found["detail"].(string); contains(d, "another writer") {
+		t.Errorf("the note must not also be folded into detail: %q", d)
+	}
+	if !contains(logged.String(), note) {
+		t.Errorf("a caller that ignores the field would leave no trace anywhere; server log was %q", logged.String())
+	}
+}
+
+// ...and a step with nothing to warn about carries no field at all, so the
+// presence of `warning` is itself the signal.
+func TestSpinup_NoWarningMeansNoField(t *testing.T) {
+	srv, _ := spinupServer(t)
+	_, body := postSpinup(t, srv, map[string]any{
+		"service": "argosy", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"apply": true,
+	})
+	for _, raw := range body["findings"].([]any) {
+		if _, present := raw.(map[string]any)["warning"]; present {
+			t.Errorf("warning should be omitted when empty: %v", raw)
+		}
+	}
+}
+
+// The CLI trims these itself; Normalized now does it for both surfaces, so an
+// automation caller no longer gets `unknown mode "direct "` for a value the CLI
+// accepts.
+func TestSpinup_PaddedEnumsAreAccepted(t *testing.T) {
+	srv, _ := spinupServer(t)
+	code, body := postSpinup(t, srv, map[string]any{
+		"service": "argosy", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct ", "upstream": "100.64.0.7", "access": " bookmark",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("padding is not a different spec, status %d: %v", code, body)
+	}
+	spec := body["spec"].(map[string]any)
+	if spec["mode"] != "direct" || spec["access"] != "bookmark" {
+		t.Errorf("the echoed spec should be trimmed, got %v", spec)
+	}
 }

@@ -908,3 +908,32 @@ func TestEnsure_RefusedBlocksDNSAndIsNotPending(t *testing.T) {
 		t.Error("nothing should have been recorded")
 	}
 }
+
+// A warning belongs to a step that *succeeded*, so it must not be confused with
+// Err and must not quietly become part of the description. The tunnel's is the
+// one that matters: it says another service's ingress route may have been
+// dropped from the shared document, which the step's own status cannot convey.
+func TestEnsure_CarriesAWarningFromAStepThatSucceeded(t *testing.T) {
+	route := &fakeProv{
+		kind:    model.ResourceTunnelRoute,
+		ensured: Resource{Detail: "routed to http://interlock:8080", Warning: "another writer changed the shared configuration"},
+	}
+	res, err := New(newStore(), NewRegistry(route), WithTunnels(prodTunnels())).
+		Ensure(context.Background(), Request{Spec: tunnelledSpec(), Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := wantStatus(t, res, model.ResourceTunnelRoute, StepCreate)
+	if !f.Applied {
+		t.Error("a warning is not a failure — the step did what it said")
+	}
+	if f.Warning != "another writer changed the shared configuration" {
+		t.Errorf("the warning should reach the finding, got %q", f.Warning)
+	}
+	if f.Err != "" {
+		t.Errorf("a warning is not an error, got Err=%q", f.Err)
+	}
+	if strings.Contains(f.Detail, "another writer") {
+		t.Errorf("it must not also be folded into the description: %q", f.Detail)
+	}
+}

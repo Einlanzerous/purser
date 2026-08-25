@@ -249,14 +249,27 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "spin-up failed")
 		return
 	}
-	// Logged as well as returned, unlike the per-step details. A step that
-	// changed the edge without recording it leaves Purser unable to tear down
-	// what it just created, and a caller that ignores the field would leave no
-	// trace of it anywhere (compare name_conflict above).
+	// Logged as well as returned, unlike the per-step details, because a caller
+	// that ignores these fields would otherwise leave no trace of them anywhere
+	// (compare name_conflict above). Both are things a 200 with sensible counts
+	// does not reveal:
+	//
+	//   applied-not-recorded — the edge changed and the row didn't, so Purser
+	//     cannot tear down what it just created.
+	//   warning — the step *succeeded*, and something around it may not have.
+	//     The tunnel's is the one that matters: another service's ingress route
+	//     may have been dropped from the shared document, which is somebody
+	//     else's outage and appears nowhere in this response's status or counts.
+	//
+	// The CLI does not double-log these; it prints them itself, and `log` writes
+	// to the same stderr its report does.
 	for _, f := range res.Findings {
 		if f.Status == spinup.StepAppliedNotRecorded {
 			log.Printf("api: spin-up of %s: %s changed upstream but was not recorded: %s",
 				spec.Hostname, f.Kind, f.Err)
+		}
+		if f.Warning != "" {
+			log.Printf("api: spin-up of %s: %s: %s", spec.Hostname, f.Kind, f.Warning)
 		}
 	}
 	writeJSON(w, http.StatusOK, newSpinupResponse(res))

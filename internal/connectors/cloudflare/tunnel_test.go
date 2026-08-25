@@ -924,8 +924,15 @@ func TestTunnel_EnsureNotesAConcurrentVersionJump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("this step did what it said, so it is not a failure: %v", err)
 	}
-	if !strings.Contains(res.Detail, "another writer") {
-		t.Errorf("Detail should carry the warning, got %q", res.Detail)
+	// On Warning, not Detail. Detail describes *this* resource and a surface may
+	// truncate it; this says another service's route may have been dropped from
+	// the shared document, which a caller must be able to find without picking a
+	// substring out of a description (PRSR-31).
+	if !strings.Contains(res.Warning, "another writer") {
+		t.Errorf("Warning should carry the note, got %q", res.Warning)
+	}
+	if strings.Contains(res.Detail, "another writer") {
+		t.Errorf("the note belongs on Warning alone, not also on Detail: %q", res.Detail)
 	}
 }
 
@@ -937,8 +944,8 @@ func TestTunnel_EnsureDoesNotWarnOnItsOwnWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if strings.Contains(res.Detail, "another writer") {
-		t.Errorf("a lone writer should raise nothing, got %q", res.Detail)
+	if res.Warning != "" {
+		t.Errorf("a lone writer should raise nothing, got %q", res.Warning)
 	}
 }
 

@@ -91,6 +91,18 @@ type Resource struct {
 	ExternalID string
 	ParentID   string
 	Detail     string
+	// Warning is something that went wrong *around* a step that succeeded —
+	// nothing this step did, and not a reason to call it failed.
+	//
+	// Its own field rather than a sentence appended to Detail, because the two
+	// are read by different people for different reasons. Detail describes this
+	// resource, and a surface may reasonably truncate it; a warning here says
+	// something may have happened to a resource that is not this one at all —
+	// the tunnel's concurrent-write note means another service's ingress route
+	// may have been dropped from the shared document. A caller must be able to
+	// find that without pattern-matching a substring out of a description, and a
+	// renderer must be able to give it the prominence it needs (PRSR-31).
+	Warning string
 }
 
 // ServiceProvisioner manages one kind of edge resource for a service. It is the

@@ -419,10 +419,26 @@ own line rather than a shared count:
 | `applied-not-recorded` | the edge changed and the row didn't — Purser can't tear down what it holds no id for |
 
 `refused` and `unknown` are separate on purpose. Both decline to act, but a
-failed read means "run it again", and a tunnel whose ingress document Purser
-won't write to means "go and fix that, because running it again will print this
-until you do". Putting that difference in an error string would make it a second
-field a reader has to know to consult.
+failed read means "run it again", and upstream being in a state Purser won't
+write to means "go and fix that, because running it again will print this until
+you do". Putting that difference in an error string would make it a second field
+a reader has to know to consult.
+
+The line runs through DNS as well as the tunnel, and both sides of it are live:
+several records answering for one hostname and none of them the spec's is
+`refused` — the read worked, and somebody has to edit the zone — while a lookup
+that comes back a *full page* is `unknown`, because the name filter narrowed
+nothing and that answer was never really read.
+
+Separately from the statuses, a step can carry a **warning**: something that went
+wrong *around* a step that nonetheless succeeded. There is one today, and it is
+the one worth designing for — the tunnel's ingress document is shared, so if
+another process writes it between Purser's read and its PUT, this run's route is
+fine and **another service's may have been dropped**. That is a different claim
+from anything the step's own status can make, so it is its own field rather than
+a clause inside the description, printed on its own line by the CLI and logged
+server-side by `purser serve`, where a caller reading only `status` and `counts`
+would otherwise see nothing at all.
 
 Exit is non-zero for any of the above, including `unavailable` — that follows
 `offboard` rather than `invite`. On an invite, unavailable means nothing was
@@ -618,6 +634,13 @@ construct_net/Tailscale isolation).
 - `POST /v1/spinups` — `{ "service", "hostname", "mode", "upstream", "access",
   "display_name", "logo_url", "tunnel", "apply" }` — stand up a service's edge.
   Omitting `apply` returns a plan and writes nothing.
+
+  Each entry in `findings` carries a `status` (see the table under [Standing a
+  service up](#standing-a-service-up)) and, occasionally, a `warning` — trouble
+  around a step that *succeeded*, which no status or count can express. It is
+  also written to the server log, so a caller that reads only `status` still
+  leaves a trace of it somewhere. `spec` echoes the **normalized** spec, so a
+  caller can compare what it sent against what the run actually used.
 
 The credential block (with secrets) is returned only for `copypaste` delivery;
 for `email` the secrets go to the recipient and are not echoed over HTTP.
