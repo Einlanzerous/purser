@@ -21,9 +21,10 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `Unavailable` (registered-but-unconfigured) + `ErrPending`.
 - `internal/connectors/{switchyard,cloudflare,lyceum,argosy}/` — per-service connectors.
   `cloudflare/` serves **both** axes: the Access `Connector` (person × service)
-  and `DNSProvisioner` (spin-up, PRSR-28), over one shared API client in
-  `client.go`. They have separate Config structs on purpose — see the invariant
-  below.
+  and, on the spin-up axis, `DNSProvisioner` (PRSR-28, `dns.go`) and
+  `AccessProvisioner` (PRSR-29, `access.go`) — over one shared API client in
+  `client.go`. All three have separate Config structs on purpose — see the
+  invariant below.
 - `internal/invite/` — the orchestrator (`Run`) + credential-block renderer. This
   is where idempotency lives.
 - `internal/spinup/` — the **second axis** (PRSR-27): `ServiceSpec`, the
@@ -365,6 +366,46 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   not depend on knowing every 404 the API can emit. Only 81044 is listed, and
   only codes actually observed in a response may be added — a guessed one turns
   an unrelated failure into a reported deletion.
+- **An Access application is updated by merge, never by rebuild.** Cloudflare
+  refuses `PATCH` on `/access/apps/{id}`, so an update is a full-replacement
+  `PUT`: whatever the body omits is deleted. `access.go` therefore holds the live
+  application as a **map**, not a struct — `encoding/json` drops unknown keys on
+  decode, so a struct round-trip would silently send back an object missing every
+  field nobody modelled, including ones an operator set in the dashboard. On a
+  gated app the field that goes is `policies`, and an update meaning to fix a
+  logo would delete the rule that gates the service, which then stays up, keeps
+  resolving, and admits everyone. Only spec-owned keys are written and only
+  `id`/`uid`/`aud`/`created_at`/`updated_at` are stripped.
+  **`policies` is appended to, never assigned** — that was the same bug by a
+  second route, and worse for being invisible: an app already admitting the
+  members group reports only its rotted logo as drift, so the plan says "fix a
+  logo" while the apply deletes whoever else was allowed (a service token for an
+  uptime monitor, a second group). The spec says this service is gated by the
+  members group; it does not say the group is the only thing that may reach it,
+  and the difference is somebody else's access. A policy list that cannot be
+  read — Cloudflare is documented to return bare references for apps whose
+  policies are managed separately — is left untouched and reported as a note,
+  for the same reason an unfetchable logo is.
+- **A logo has three outcomes, not two, and none of them fails the step.**
+  Cloudflare stores any `logo_url` without validating it and the launcher falls
+  back to the service's initials, so a wrong URL is indistinguishable from an
+  unset one — one of six live apps had a working icon before this axis.
+  `checkLogo` fetches it **as the sessionless public** (an Access-gated asset
+  answers `200 text/html`, which a status-only check would pass) and returns
+  `logoOK`, `logoBroken` — a definite non-image answer, so write nothing — or
+  `logoUnknown` — a transport failure or 5xx, so **change nothing**. Collapsing
+  unknown into broken clears a working icon every time a CDN blinks, and on
+  `Inspect` it is a note rather than drift, because an update here is that
+  full-replacement PUT. Never fatal either way: a gated app is a DNS
+  prerequisite, so refusing it would leave a service unpublished over an icon.
+- **The Access teardown confirms absence by reading, not by an error code.**
+  `dnsRecordNotFound` works because 81044 was observed; there is no observed
+  Access equivalent, and the rule above forbids guessing one. So a failed delete
+  re-reads the hostname: nothing there means it really is gone, something there
+  means the gate is still up and the record is wrong, and a failed re-read means
+  unverifiable — which is never absent. That is stronger than a code test, not a
+  substitute for one: it asserts what `Teardown` actually claims, and it also
+  catches a delete that failed at the transport after Cloudflare applied it.
 - **Two premises behind those are read from Cloudflare's published schema and
   have not been confirmed against the live API** (PRSR-36): that the DNS delete
   answers with a bare `{"result":{"id":…}}`, and that a "could not route" error
@@ -436,12 +477,14 @@ token. PRSR-26 closed done — the tunnel is remotely-managed (`source:
 "cloudflare"`), so the tunnel connector is an ordinary API client and no tunnel
 migration is needed.
 
-PRSR-28 landed the first of the three provisioners: `cloudflare.DNSProvisioner`
-— both record shapes, idempotent by lookup-then-write, recording
-`dns_record_id` so `Teardown` targets an id rather than re-resolving a name.
-Nothing wires it into the composition root yet; that is PRSR-31, and the DNS
-half of its "run it against a service that is already up" is already covered by
-`dns_spinup_test.go`.
+PRSR-28 and PRSR-29 landed two of the three provisioners.
+`cloudflare.DNSProvisioner` does both record shapes, idempotent by
+lookup-then-write, recording `dns_record_id` so `Teardown` targets an id rather
+than re-resolving a name. `cloudflare.AccessProvisioner` does the gated
+`self_hosted` app and the `bookmark` tile, verifies a logo before writing it,
+and merges rather than replaces on update. Neither is wired into the
+composition root yet; that is PRSR-31, and the DNS half of its "run it against a
+service that is already up" is already covered by `dns_spinup_test.go`.
 
 PRSR-27 landed the foundation: `internal/spinup` (spec, `ServiceProvisioner`,
 registry, `Ensure` orchestrator) and `service_resource` (migration 0007). It

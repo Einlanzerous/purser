@@ -19,3 +19,12 @@ func newDNSWithBase(t *testing.T, base string, cfg DNSConfig) *DNSProvisioner {
 	p.api.baseURL = base
 	return p
 }
+
+// newAccessWithBase builds an Access application provisioner pointed at a test
+// server instead of the real Cloudflare API.
+func newAccessWithBase(t *testing.T, base string, cfg AccessConfig) *AccessProvisioner {
+	t.Helper()
+	p := NewAccess(cfg)
+	p.api.baseURL = base
+	return p
+}
