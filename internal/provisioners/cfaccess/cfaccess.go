@@ -37,9 +37,11 @@
 //
 // Placard (IDEA-22) is where a working URL comes from now:
 // https://cdn.jsdelivr.net/gh/Einlanzerous/placard@main/<service>/<service>-mark-light.png
-// against a public repo. Resolving a spec's logo from Placard's /api/services
-// index is a separate piece of work; this package verifies whatever URL the spec
-// carries.
+// against a public repo. This package verifies whatever URL the spec carries; it
+// does not work out what that URL should be, so a spec author still types the
+// jsDelivr path by hand — which is the same class of thing as the rotted paths
+// this exists to catch. **PRSR-37** holds resolving it from Placard's
+// /api/services index instead.
 //
 // # Nothing here has ever contacted Cloudflare
 //
@@ -661,6 +663,14 @@ func str(m rawApp, key string) string {
 
 // ─── the API ───────────────────────────────────────────────────────────────
 
+// listPerPage is the page size requested when listing applications, and
+// maxListPages is a runaway guard — an account with more than 2,000 Access
+// applications is a different problem from the one this is solving.
+const (
+	listPerPage  = 50
+	maxListPages = 40
+)
+
 // findApp returns the application serving hostname, or nil if there is none.
 //
 // A list-and-match rather than a filtered query: Cloudflare's apps endpoint has
@@ -669,24 +679,55 @@ func str(m rawApp, key string) string {
 // hostname is a state this does not try to resolve — the first match wins and
 // the caller's plan will describe it, which is more useful than an error that
 // stops the run.
+//
+// # Why this pages, and why "not found" is the dangerous answer
+//
+// Reading only the first page would make a miss indistinguishable from an
+// absence. Ensure turns "no application for this hostname" straight into a
+// create, so an app sitting on page two would get a **second** application
+// created over the top of it — the exact opposite of the already-exists-is-
+// success rule this package is required to hold. And it is self-concealing: the
+// two applications can then drift apart, one admitting the members group and one
+// not, with nothing reporting it until a run happens to read the other page.
+//
+// Pagination is driven by `result_info.total_pages`, which is Cloudflare's
+// documented v4 list envelope — **inferred from the schema, not observed**, like
+// the rest of this package (see PRSR-36). That is also why the loop keys on
+// `total_pages` being present and greater than one rather than on "the page came
+// back full": an endpoint that ignores the page parameter would return the same
+// full page for ever, and a loop that trusted fullness would never terminate.
+// Absent result_info means one page, which is the right reading of an endpoint
+// that does not paginate.
 func (p *Provisioner) findApp(ctx context.Context, hostname string) (rawApp, error) {
-	path := fmt.Sprintf("/accounts/%s/access/apps", p.cfg.AccountID)
-	raw, _, err := p.do(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return nil, err
-	}
-	var env struct {
-		Result []rawApp `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("cfaccess: decode applications: %w", err)
-	}
-	for _, app := range env.Result {
-		if domainHost(str(app, "domain")) == hostname {
-			return app, nil
+	for page := 1; page <= maxListPages; page++ {
+		path := fmt.Sprintf("/accounts/%s/access/apps?page=%d&per_page=%d", p.cfg.AccountID, page, listPerPage)
+		raw, _, err := p.do(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var env struct {
+			Result     []rawApp `json:"result"`
+			ResultInfo struct {
+				Page       int `json:"page"`
+				TotalPages int `json:"total_pages"`
+			} `json:"result_info"`
+		}
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return nil, fmt.Errorf("cfaccess: decode applications: %w", err)
+		}
+		for _, app := range env.Result {
+			if domainHost(str(app, "domain")) == hostname {
+				return app, nil
+			}
+		}
+		if env.ResultInfo.TotalPages <= 1 || page >= env.ResultInfo.TotalPages {
+			return nil, nil
 		}
 	}
-	return nil, nil
+	// Ran out of pages to read. Reported rather than answered: "not found" here
+	// would send Ensure off to create a duplicate, which is the one outcome this
+	// whole function exists to avoid.
+	return nil, fmt.Errorf("cfaccess: gave up listing applications for %s after %d pages — refusing to report it absent on a partial read", hostname, maxListPages)
 }
 
 func (p *Provisioner) createApp(ctx context.Context, body rawApp) (rawApp, error) {

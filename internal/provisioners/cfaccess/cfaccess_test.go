@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -40,6 +41,13 @@ type cfAPI struct {
 	deleteStatus int
 	// listStatus, when non-zero, makes the list call fail.
 	listStatus int
+	// perPage, when non-zero, makes the list endpoint paginate and emit a
+	// result_info envelope. Zero keeps the old single-response behaviour, which
+	// is the shape of an endpoint that does not paginate at all.
+	perPage int
+	// listPages counts how many list requests were served, so a test can show
+	// that more than one page was actually read.
+	listPages int
 }
 
 func (f *cfAPI) server(t *testing.T) *httptest.Server {
@@ -65,7 +73,34 @@ func (f *cfAPI) server(t *testing.T) *httptest.Server {
 				})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": f.apps})
+			f.listPages++
+			if f.perPage <= 0 {
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": f.apps})
+				return
+			}
+			page := 1
+			if v := r.URL.Query().Get("page"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					page = n
+				}
+			}
+			total := (len(f.apps) + f.perPage - 1) / f.perPage
+			if total < 1 {
+				total = 1
+			}
+			start := (page - 1) * f.perPage
+			end := start + f.perPage
+			if start > len(f.apps) {
+				start = len(f.apps)
+			}
+			if end > len(f.apps) {
+				end = len(f.apps)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success":     true,
+				"result":      f.apps[start:end],
+				"result_info": map[string]any{"page": page, "total_pages": total},
+			})
 
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/access/apps"):
 			created := map[string]any{"id": "app-new"}
@@ -528,6 +563,60 @@ func TestInspect_UncheckableLogoIsANoteNotDrift(t *testing.T) {
 	}
 	if !strings.Contains(st.Detail, "could not be checked") {
 		t.Fatalf("detail should still report the failed check, got %q", st.Detail)
+	}
+}
+
+// Reading only the first page would make a miss look like an absence, and Ensure
+// turns absence straight into a create — so an application on a later page would
+// get a second one built on top of it, which is the opposite of the
+// already-exists-is-success rule.
+func TestFindApp_PaginatesRatherThanReportingAbsence(t *testing.T) {
+	api := &cfAPI{perPage: 10}
+	for i := 0; i < 25; i++ {
+		api.apps = append(api.apps, map[string]any{
+			"id": "other-" + strconv.Itoa(i), "type": "self_hosted",
+			"name": "Other", "domain": "other-" + strconv.Itoa(i) + ".zerogravity.industries",
+		})
+	}
+	// The one we are looking for sits on the third page.
+	api.apps = append(api.apps, map[string]any{
+		"id": "app-late", "type": "self_hosted", "name": "Argosy", "domain": testHost,
+		"app_launcher_visible": true,
+		"policies": []any{map[string]any{
+			"decision": "allow",
+			"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
+		}},
+	})
+	p := newProv(t, api, Config{GroupID: testGroup})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !st.Exists {
+		t.Fatal("an application on a later page must not be reported absent")
+	}
+	if st.ExternalID != "app-late" {
+		t.Fatalf("external id = %q, want the app from the later page", st.ExternalID)
+	}
+	if api.listPages < 2 {
+		t.Fatalf("only %d list request(s) were made — pagination was not exercised", api.listPages)
+	}
+}
+
+// An endpoint that sends no result_info is one that does not paginate: read it
+// once and stop, rather than looping on a page parameter it ignores.
+func TestFindApp_NoResultInfoMeansOnePage(t *testing.T) {
+	api := &cfAPI{apps: []map[string]any{{
+		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
+	}}}
+	p := newProv(t, api, Config{GroupID: testGroup})
+
+	if _, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")}); err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if api.listPages != 1 {
+		t.Fatalf("made %d list requests, want exactly 1", api.listPages)
 	}
 }
 
