@@ -1,0 +1,133 @@
+name: PR Review
+
+# Fresh-context review of every pull request (SERV-59), via the shared definition
+# in construct-server (SERV-92). Purser was merging on a human read alone, which
+# PRSR-35 filed against ahead of the PRSR-28/29/30 fan-out: three spin-up
+# connectors landing in parallel, against the one surface here where a mistake is
+# a *live infrastructure* mistake.
+#
+# Nothing is copied. The procedure (`review-prompt.md`) is fetched from
+# construct-server at run time (`prompt_repo`/`prompt_ref`, defaulting to
+# `@main`), so a local copy could only ever drift out of use. It is NOT fetched
+# at this workflow's own commit — `job_workflow_sha` would have given that and is
+# empty on this Actions version, which 404'd the fetch on argosy#211 and
+# signet#37 — so pinning `uses: ...@<tag>` means pinning `prompt_ref` to match.
+#
+# Judgement lives in `REVIEW.md`; how this repo works lives in `CLAUDE.md`;
+# generated artifacts in `.github/review-ignore`. See construct-server's
+# `docs/pr-reviewer.md`, which is the authority — not a sibling's copy of this
+# file, which is how the estate got four divergent forks the first time.
+
+on:
+  # `reopened` is here because `opened` is not guaranteed to have fired: a PR
+  # that conflicts with its base produces no `pull_request` runs at all, so a PR
+  # born conflicting never gets its unconditional review. The real fix is the
+  # shared workflow's (SERV-126) — triage reviews any PR no review has ever been
+  # posted on, whatever the action — and this is the cheap second door for the
+  # close/reopen path. Switchyard is the one adopter still missing it (ARGY-186
+  # landed after its last edit); do not take the trigger list from there.
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+
+# A called workflow cannot be granted more than its caller holds, so the ceiling
+# is set here even though the shared workflow declares the same three.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+# No `concurrency:` — the shared workflow owns it, and that key is the
+# accumulated result of three separate silent-pass incidents.
+
+jobs:
+  pr-review:
+    uses: Einlanzerous/construct-server/.github/workflows/pr-review-reusable.yml@main
+    with:
+      # Paths where a mistake widens access, loses data, leaks a secret, or
+      # compromises the runner.
+      #
+      # MEASURED, not guessed — SGNT-36 is the cautionary tale of a regex that
+      # matched a whole source tree and so carried no information. Replayed
+      # against all 37 merged PRs (#1-#37): 16 are release PRs, skipped before
+      # the tier is decided; none are docs-only; of the remaining 21, **16
+      # classify high and 5 low**. The five lows are #23 (`release-please-config.json`
+      # alone) and #14, #28, #31, #32 — the CLAUDE.md/architecture.md resyncs.
+      #
+      # ── Why `CLAUDE\.md` is NOT here, when switchyard, argosy and lyceum all
+      # list it ─────────────────────────────────────────────────────────────
+      #
+      # It is the single entry that decides whether this input means anything in
+      # this repo. Add it and the split becomes **20 high, 1 low**: purser edits
+      # CLAUDE.md on 15 of its 21 human PRs, so the tier would carry information
+      # about exactly one pull request in the repo's history. That is the SGNT-36
+      # outcome by a different route — not a regex that matches the source tree,
+      # but a repo whose prose changes on nearly every diff.
+      #
+      # It is the *sole* escalation driver on exactly four PRs, and all four are
+      # documentation resyncs (CLAUDE.md plus docs/architecture.md, no code).
+      # Every PR that changes the code an invariant protects already matches
+      # elsewhere and is read at the deeper tier regardless.
+      #
+      # Dropping it does not make those four unreviewed, which is the fact that
+      # makes this safe: `standards_files` is left at its default, that default
+      # lists `CLAUDE\.md`, and the docs-only rule refuses to skip a diff
+      # touching a standards file. So a CLAUDE.md-only PR is still reviewed — at
+      # the cheaper tier, which is the right price for prose.
+      #
+      # `REVIEW\.md` and `\.github/review-ignore` stay in on a different footing:
+      # they are the reviewer's own standard and its own scope, and an edit that
+      # widens either one silently shrinks what future reviews read.
+      #
+      # ── What actually drives escalation ───────────────────────────────────
+      #
+      # `internal/connectors?/` is the only entry that escalates a PR by itself
+      # (8 matches; sole driver on #9 and #11, the two single-connector reconcile
+      # fixes). Every other entry below is FREE on this replay — it moved no PR —
+      # and is here on the merits, which is the intent: a future PR touching only
+      # one of them will escalate, and should.
+      #
+      # Describe the line precisely, because the obvious summary is wrong. It is
+      # NOT "the Go tree is high". Deliberately absent:
+      #
+      #  1. The roster read path. `cmd/purser/roster.go` is the largest file in
+      #     `cmd/` (403 lines) and `internal/invite/roster.go` sits behind it;
+      #     both only assemble and print records. But `internal/store/roster` IS
+      #     in, and that asymmetry is the whole point: the guarantee that
+      #     `person show` cannot print a credential is enforced by the SELECT —
+      #     `store.AccountRecord` has no `secret_hash` field because the query
+      #     names neither column — so the query is the one file where breaking it
+      #     is possible. Excluding the two renderers costs nothing measurable
+      #     (#26 escalates on `internal/invite/(service|person|audit)` anyway); it
+      #     is here to say the boundary is a boundary.
+      #  2. `internal/version/` — build-identity strings. #35 created it and
+      #     escalated on `.github/workflows/` and `deploy/` regardless.
+      #  3. `Makefile`, `README.md`, `docs/`, `.golangci.yml`,
+      #     `release-please-config.json`.
+      #
+      # Two entries that need their reason stated, since neither is obvious:
+      #
+      #  - `internal/model/` is in for one line. `model.KindOrder`
+      #    (model.go:172) is the DNS-last ordering, and the PRSR-27 review's
+      #    headline finding was there: DNS published while the step gating it had
+      #    failed, leaving a service meant to be gated reachable **ungated** —
+      #    self-concealing in a way a 502 is not. Free on the replay; in on that.
+      #  - `internal/delivery/` matches zero merged PRs, and that is an artifact
+      #    of history rather than a judgement: it landed in the initial commit and
+      #    was last changed in `70bb6fd`, both direct pushes predating the PR
+      #    flow. It is the path that mails a plaintext credential block.
+      #
+      # File stems are unanchored (`internal/invite/service`, not
+      # `service\.go$`) so `_test.go` comes along, on switchyard's authz-guard
+      # lesson: deleting a guard's invocation was caught, gutting its logic was
+      # not. `internal/invite/service_test.go` is 1,012 lines and is the guard
+      # for the orchestrator above it.
+      sensitive_paths: '^(internal/connectors?/|internal/(spinup|config|delivery|api|model)/|internal/invite/(service|offboard|credential|person|audit|bundle)|internal/store/(repo|migrate|resource|roster)|migrations/|cmd/purser/(main|invite|offboard|person|audit|serve)|deploy/|\.env\.example|\.github/workflows/|REVIEW\.md|\.github/review-ignore)'
+
+      # No `docs_skip_extra`: this repo commits no generated cache. The only two
+      # generated files it tracks are release-please's, and they are excluded
+      # outright in `.github/review-ignore` rather than misfiled as documentation.
+    secrets:
+      claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      switchyard_token: ${{ secrets.SWITCHYARD_REVIEWER_TOKEN }}
