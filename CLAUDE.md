@@ -296,22 +296,34 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   hasn't set `PURSER_CF_ZONE_ID`. An unconfigured DNS provisioner reports
   `spinup.ErrUnavailable` — one step of a spin-up, not a broken connector.
 - **Don't assume every Cloudflare route sends the `{success, errors}`
-  envelope.** `do()` decodes `success` into a `*bool`: absent plus a 2xx is
-  success, and only an actual `false` is a failure. A plain bool made the zero
-  value mean failure, which would report a deletion that *happened* as one that
-  didn't — PRSR-17's lie backwards — and it survived because the DNS delete is
-  the first `DELETE` this client ever sent, and because the fake wrapped that
-  response in an envelope. **When a fake models the shape you assumed, the suite
-  asserts your model rather than the API.** PRSR-29/30 share this client: check
-  each new route's real response instead of the fake's.
-- **`notFound` requires Cloudflare's record code, and a bare 404 is not enough.**
-  `Teardown` reads `notFound` as "already gone", so treating any 404 as absence
-  risks reporting a deletion that never happened — and the next run reads the row
-  as removed, which makes it silent and permanent, where the opposite error is a
-  noisy retry on a record that was already gone. The asymmetry is the whole
-  argument; it does not depend on knowing every 404 the API can emit. Only 81044
-  is listed, and only codes actually observed in a response may be added — a
-  guessed one turns an unrelated failure into a reported deletion.
+  envelope, or sends a body at all.** `do()` decodes `success` into a `*bool`:
+  absent plus a 2xx is success, and only an actual `false` is a failure. A plain
+  bool made the zero value mean failure, which would report a deletion that
+  *happened* as one that didn't — PRSR-17's lie backwards. An **empty** body is
+  the same question one step out and has to be answered *before* the decode,
+  since `json.Unmarshal` fails on `""` and would take the error branch: a 204
+  would report as a failure through the door the `*bool` cannot cover.
+  Both survived because the DNS delete is the first `DELETE` this client ever
+  sent, and because the fake wrapped that response in an envelope — the second
+  one was still there after the first was fixed, and it is the first test with
+  the fake writing nothing. **When a fake models the shape you assumed, the
+  suite asserts your model rather than the API.** PRSR-29/30 share this client:
+  check each new route's real response instead of the fake's.
+- **Absence is spelled per-product, so each resource type owns its own
+  predicate.** `dnsRecordNotFound` lives in `dns.go`, not in the shared client,
+  and is named for what it answers about: 81044 is *DNS's* code and means
+  nothing to an Access application or a tunnel route. A general-looking
+  `notFound()` in `client.go` would be reached for by the two provisioners that
+  share the file and would answer `false` for ever — safe, but silently wrong.
+  `client.go` exposes `errorCode(err)` and stops there.
+  The code decides it and **a bare 404 is not enough**. `Teardown` reads the
+  predicate as "already gone", so treating any 404 as absence risks reporting a
+  deletion that never happened — and the next run reads the row as removed,
+  which makes it silent and permanent, where the opposite error is a noisy retry
+  on a record that was already gone. The asymmetry is the whole argument; it does
+  not depend on knowing every 404 the API can emit. Only 81044 is listed, and
+  only codes actually observed in a response may be added — a guessed one turns
+  an unrelated failure into a reported deletion.
 - **Two premises behind those are read from Cloudflare's published schema and
   have not been confirmed against the live API** (PRSR-36): that the DNS delete
   answers with a bare `{"result":{"id":…}}`, and that a "could not route" error

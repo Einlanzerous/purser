@@ -33,6 +33,47 @@ func TestDo_EnvelopelessSuccessIsNotAFailure(t *testing.T) {
 	}
 }
 
+// The same question one step further out: no body at all. json.Unmarshal fails
+// on "", so this has to be answered before the decode or a 204 reports as a
+// failure — the deletion-that-happened-read-as-one-that-didn't again, arriving
+// through the door the *bool cannot cover.
+//
+// Note what would have caught it the first time: this is
+// TestDo_EnvelopelessSuccessIsNotAFailure with the fake writing nothing. A fake
+// that models the shape you assumed makes the suite assert your model.
+func TestDo_EmptyBodyOn2xxIsSuccess(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusNoContent} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+		}))
+		c := newClient("cf_token", nil)
+		c.baseURL = srv.URL
+		if _, err := c.do(context.Background(), http.MethodDelete, "/zones/z/dns_records/r", nil); err != nil {
+			t.Errorf("status %d with an empty body is a success, got %v", status, err)
+		}
+		srv.Close()
+	}
+}
+
+// …and an empty body on a non-2xx is still a failure, and specifically not one
+// that reads as an absent record — Teardown would call that a deletion.
+func TestDo_EmptyBodyOnFailureIsNotAnAbsentRecord(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := newClient("cf_token", nil)
+	c.baseURL = srv.URL
+	_, err := c.do(context.Background(), http.MethodDelete, "/zones/z/dns_records/r", nil)
+	if err == nil {
+		t.Fatal("a 404 with an empty body is not a success")
+	}
+	if dnsRecordNotFound(err) {
+		t.Error("a bare 404 carries no record code, so it is not proof the record is gone")
+	}
+}
+
 // …but only on a 2xx. Without an envelope to judge by, the transport status is
 // the only answer there is, and it must not be ignored.
 func TestDo_EnvelopelessFailureIsStillAFailure(t *testing.T) {
@@ -105,7 +146,7 @@ func TestDo_NonJSONBodyKeepsItsText(t *testing.T) {
 	}
 	// And it must not be mistaken for an absent record: Teardown reads that as
 	// a successful deletion.
-	if notFound(err) {
+	if dnsRecordNotFound(err) {
 		t.Error("an unparseable error body is not proof the record is gone")
 	}
 }

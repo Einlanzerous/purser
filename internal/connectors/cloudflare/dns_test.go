@@ -822,14 +822,15 @@ func TestDNS_InvalidSpecIsRefusedBeforeAnyCall(t *testing.T) {
 	}
 }
 
-// notFound has to answer from structure, not prose: Teardown reads it to decide
+// dnsRecordNotFound has to answer from structure, not prose: Teardown reads it
+// to decide
 // that an already-absent record is a success, which is a claim about the world.
 //
 // The bare-404 cases are the point. A 404 is also what the API answers when the
 // *request* could not be routed, so treating it as conclusive would have a
 // teardown that never reached the zone report a deletion — silent, and not
 // fixed by re-running, because the next run reads the row as already removed.
-func TestNotFound_RequiresTheRecordCode(t *testing.T) {
+func TestDNSRecordNotFound_RequiresTheRecordCode(t *testing.T) {
 	cases := []struct {
 		name string
 		err  error
@@ -845,8 +846,8 @@ func TestNotFound_RequiresTheRecordCode(t *testing.T) {
 		{"not an api error", errors.New("boom"), false},
 	}
 	for _, tc := range cases {
-		if got := notFound(tc.err); got != tc.want {
-			t.Errorf("%s: notFound = %v, want %v", tc.name, got, tc.want)
+		if got := dnsRecordNotFound(tc.err); got != tc.want {
+			t.Errorf("%s: dnsRecordNotFound = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

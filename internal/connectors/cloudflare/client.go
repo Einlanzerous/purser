@@ -91,6 +91,19 @@ func (c *client) do(ctx context.Context, method, path string, body any) ([]byte,
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
+	// An empty body is the same question as an absent `success`, one step
+	// further out, and it has to be answered before the decode rather than after
+	// — json.Unmarshal fails on "" and would take the error branch below,
+	// reporting a 204 as a failure. That is the bug the *bool above fixes,
+	// arriving through the door the *bool cannot cover, and it lands on the same
+	// route: a delete whose response shape is still unobserved (PRSR-36). A
+	// deletion that happened, reported as one that didn't.
+	if len(bytes.TrimSpace(raw)) == 0 {
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return raw, nil
+		}
+		return nil, &apiError{Method: method, Path: path, Status: resp.StatusCode}
+	}
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, &apiError{Method: method, Path: path, Status: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
@@ -136,30 +149,20 @@ func (e *apiError) Error() string {
 	}
 }
 
-// errCodeRecordNotFound is Cloudflare's "Record does not exist." It is the only
-// code listed here on purpose: this constant decides that a teardown succeeded,
-// so a code guessed rather than observed could turn an unrelated failure into a
-// reported deletion. Add one when a real response shows it, not before.
-const errCodeRecordNotFound = 81044
-
-// notFound reports whether err is Cloudflare saying the record isn't there.
+// errorCode returns Cloudflare's own error code from err, and whether err was a
+// Cloudflare API error at all.
 //
-// The code decides it, and a bare 404 deliberately does not. A 404 is also the
-// answer when the *request* could not be routed — a zone id in a recorded
-// parent that the current token can no longer address, a base URL that moved —
-// and reading that as "already gone" is how Teardown comes to report a deletion
-// it never performed, leaving a live record recorded as removed. That is
-// `revoked-not-recorded`'s neighbour from PRSR-17, and it is worse than the
-// error it replaces: an error is retried, and a re-run reads the row as already
-// removed.
-//
-// So the two mistakes are not symmetric, and this leans the safe way. Being
-// wrong here means a genuinely-absent record reports as a failure — noisy,
-// retryable, and visible. Being wrong the other way is silent and permanent.
-func notFound(err error) bool {
+// This is as far as the *shared* client goes on the subject of "is this thing
+// already gone", deliberately. Error codes are per-product — 81044 means a DNS
+// record does not exist and says nothing about an Access application or a tunnel
+// route — so a single `notFound()` living here would be a general-looking
+// predicate that only answers for one resource type, in the one file the other
+// two provisioners were told to share. Each resource type spells its own
+// absence, from codes it has actually seen (see dnsRecordNotFound in dns.go).
+func errorCode(err error) (int, bool) {
 	var ae *apiError
 	if !errors.As(err, &ae) {
-		return false
+		return 0, false
 	}
-	return ae.Code == errCodeRecordNotFound
+	return ae.Code, true
 }

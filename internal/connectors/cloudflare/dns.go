@@ -95,6 +95,39 @@ const ttlAuto = 1
 // rather than read.
 const perPage = 100
 
+// errCodeRecordNotFound is Cloudflare's "Record does not exist." It is the only
+// code listed here on purpose: it decides that a teardown succeeded, so a code
+// guessed rather than observed could turn an unrelated failure into a reported
+// deletion. Add one when a real response shows it, not before.
+const errCodeRecordNotFound = 81044
+
+// dnsRecordNotFound reports whether err is Cloudflare saying *this DNS record*
+// isn't there.
+//
+// It lives here rather than in client.go, and it says "dnsRecord" rather than
+// "notFound", because the answer is per-product: 81044 is DNS's code and means
+// nothing to an Access application or a tunnel route. A generally-named helper
+// in the shared client would be reached for by the two provisioners that share
+// it and would answer false for ever — safe, since a teardown of something
+// already gone would merely report a retryable error, but silently wrong.
+//
+// The code decides it, and a bare 404 deliberately does not. A 404 is also the
+// answer when the *request* could not be routed — a zone id in a recorded
+// parent that the current token can no longer address, a base URL that moved —
+// and reading that as "already gone" is how Teardown comes to report a deletion
+// it never performed, leaving a live record recorded as removed. That is
+// `revoked-not-recorded`'s neighbour from PRSR-17, and it is worse than the
+// error it replaces: an error is retried, and a re-run reads the row as already
+// removed.
+//
+// So the two mistakes are not symmetric, and this leans the safe way. Being
+// wrong here means a genuinely-absent record reports as a failure — noisy,
+// retryable, and visible. Being wrong the other way is silent and permanent.
+func dnsRecordNotFound(err error) bool {
+	code, ok := errorCode(err)
+	return ok && code == errCodeRecordNotFound
+}
+
 // dnsRecord is the subset of a Cloudflare DNS record this axis reads.
 type dnsRecord struct {
 	ID       string `json:"id"`
@@ -346,7 +379,7 @@ func wrongName(got, want dnsRecord) error {
 // that nothing records — a failed step writes no row — so the id is named when
 // the cleanup itself fails, since that message is the only trace of it.
 func (p *DNSProvisioner) removeStray(ctx context.Context, stray dnsRecord, cause error) error {
-	if err := p.delete(ctx, p.zoneOf(stray), stray.ID); err != nil && !notFound(err) {
+	if err := p.delete(ctx, p.zoneOf(stray), stray.ID); err != nil && !dnsRecordNotFound(err) {
 		return fmt.Errorf("%w; the stray record %s could not be removed either (%v) — delete it by hand", cause, stray.ID, err)
 	}
 	return fmt.Errorf("%w; the stray record was removed", cause)
@@ -376,7 +409,7 @@ func (p *DNSProvisioner) Teardown(ctx context.Context, _ spinup.Target, rec mode
 
 	got, err := p.recordByID(ctx, zone, rec.ExternalID)
 	switch {
-	case notFound(err):
+	case dnsRecordNotFound(err):
 		return nil // already gone
 	case err != nil:
 		return err
@@ -387,7 +420,7 @@ func (p *DNSProvisioner) Teardown(ctx context.Context, _ spinup.Target, rec mode
 		return fmt.Errorf("cloudflare: recorded DNS record %s answers for %q, not %q — refusing to delete a record that is no longer this hostname's",
 			rec.ExternalID, got.Name, rec.Hostname)
 	}
-	if err := p.delete(ctx, zone, rec.ExternalID); err != nil && !notFound(err) {
+	if err := p.delete(ctx, zone, rec.ExternalID); err != nil && !dnsRecordNotFound(err) {
 		return err
 	}
 	return nil
