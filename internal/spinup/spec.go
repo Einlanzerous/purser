@@ -183,6 +183,29 @@ type ServiceSpec struct {
 // that column is compared exactly — so "Argosy" and "argosy" would otherwise be
 // two services holding one hostname's resources between them.
 func (s ServiceSpec) Normalized() ServiceSpec {
+	// These three come first, because the rest of this function *reads* them —
+	// and the ordering is load-bearing rather than tidy. Mode decides whether
+	// Upstream is case-folded below, so trimming Mode afterwards left `"direct "`
+	// skipping that fold: two spellings of one spec normalized to two different
+	// specs, and since validHostname assumes what Normalized produced, an
+	// upstream like "Origin.Example.Com" was then refused outright on one
+	// spelling and accepted on the other (PRSR-31).
+	//
+	// Trimmed rather than trimmed-at-each-caller: all three are compared against
+	// constants, so a stray space is a refusal — and it was a refusal on the HTTP
+	// path only, because the CLI trimmed them itself and this did not. One
+	// surface accepting `"direct "` while the other answers `unknown mode
+	// "direct "` is a difference nobody would guess at.
+	//
+	// Trimmed but deliberately NOT case-folded, unlike Key and Hostname. Those
+	// are identity keys, where two spellings of one value would split a service's
+	// resources between them; these are a closed set matched against constants,
+	// and quietly accepting `"Direct"` widens what a spec may say without anybody
+	// deciding it should.
+	s.Mode = Mode(strings.TrimSpace(string(s.Mode)))
+	s.Access = AccessShape(strings.TrimSpace(string(s.Access)))
+	s.Tunnel = TunnelRef(strings.TrimSpace(string(s.Tunnel)))
+
 	s.Key = strings.ToLower(strings.TrimSpace(s.Key))
 	// TrimRight, not TrimSuffix: "host.example.com.." is as much a trailing-dot
 	// mistake as one dot is, and leaving the second one turns an empty label
@@ -194,19 +217,6 @@ func (s ServiceSpec) Normalized() ServiceSpec {
 		s.Upstream = strings.ToLower(s.Upstream)
 	}
 	s.LogoURL = strings.TrimSpace(s.LogoURL)
-	// Trimmed here rather than at each caller. These three are compared against
-	// constants, so a stray space is a refusal — and it was a refusal on the
-	// HTTP path only, because the CLI trimmed them itself and this did not. One
-	// surface accepting `"direct "` and the other answering `unknown mode
-	// "direct "` is a difference nobody would guess at (PRSR-31).
-	//
-	// Not case-folded, unlike Key and Hostname. Those are identity keys, where
-	// two spellings of one value would split a service in half; these are a
-	// closed set matched against constants, and quietly accepting `"Direct"`
-	// widens what a spec may say without anyone deciding to.
-	s.Mode = Mode(strings.TrimSpace(string(s.Mode)))
-	s.Access = AccessShape(strings.TrimSpace(string(s.Access)))
-	s.Tunnel = TunnelRef(strings.TrimSpace(string(s.Tunnel)))
 	if s.DisplayName = strings.TrimSpace(s.DisplayName); s.DisplayName == "" {
 		s.DisplayName = s.Key
 	}

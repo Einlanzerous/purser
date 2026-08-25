@@ -568,12 +568,16 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `Teardown` still logs its own — nothing carries a `Resource` back from there.
 - **"Nothing pending" is not "the edge is up."** `Result.Pending()` counts only
   what `--apply` would act on, and deliberately excludes `unavailable`,
-  `refused`, `unknown` and `blocked` — none of them is fixed by the flag. So the
-  CLI's closing line consults `provisionExit` too (`provisionOutcome`): reading
-  a zero pending count as success reported "the edge already matches this spec"
-  over a plan whose DNS step was unavailable, i.e. a hostname that does not
-  resolve, signed off as a service that is up. Found by running the binary, not
-  by reading it — which is the argument for running it.
+  `refused`, `unknown` and `blocked` — none of them is fixed by the flag. So
+  neither `pending` nor `changed` is a verdict: an apply against an unconfigured
+  deployment reports `0` and `0`, which is identical to an edge that was already
+  correct. `Result.NeedsAttention()` is the verdict, and it lives on the result
+  rather than in a renderer so the CLI's exit code and the HTTP response cannot
+  drift about what counts as fine. Reading the pending count as success reported
+  "the edge already matches this spec" over a plan whose DNS step was
+  unavailable — a hostname that does not resolve, signed off as a service that
+  is up. Found by running the binary, not by reading it, which is the argument
+  for running it.
 - **A spec is an argument, not configuration.** `provision-service` takes flags
   and there is no spec file: config here is env-only by house convention, and a
   spec is written rarely and read carefully — the same reason a tunnelled spec
@@ -582,8 +586,13 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   axis: each reports the env var it is missing, which a generic `Unavailable`
   stand-in could not, and registering them keeps the kind known so a step can
   never be quietly absent from a report.
-- **`Normalized()` trims every field a surface might pad, including the closed
-  sets.** `Mode`, `Access` and `Tunnel` are compared against constants, so a
+- **`Normalized()` trims every field a surface might pad, and does it *first*.**
+  The order is load-bearing, not tidy: `Mode` decides whether `Upstream` is
+  case-folded, so trimming it afterwards left `"direct "` skipping that fold —
+  and since `validHostname` assumes what `Normalized` produced, an upstream like
+  `Origin.Example.Com` was then refused outright on one spelling of the spec and
+  accepted on the other. Anything added here goes above its readers.
+  `Mode`, `Access` and `Tunnel` are compared against constants, so a
   stray space is a refusal — and it was a refusal on the HTTP path only, because
   the CLI trimmed them itself and `Normalized` did not. One surface accepting
   `"direct "` while the other answers `unknown mode "direct "` is a difference

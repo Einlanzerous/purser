@@ -401,3 +401,34 @@ func TestNormalized_DoesNotCaseFoldTheClosedSets(t *testing.T) {
 		t.Error(`"Direct" is not a mode; accepting it would widen the set by accident`)
 	}
 }
+
+// The trims have to come *before* anything reads the fields they clean. A
+// direct spec lowercases its Upstream — it becomes a DNS record's value, and DNS
+// is case-insensitive — and that branch tests Mode, so trimming Mode afterwards
+// left `"direct "` skipping the fold. Two spellings of one spec then normalize
+// to two different specs, which is the thing this trimming exists to prevent,
+// one statement further out.
+func TestNormalized_TrimsBeforeAnythingReadsTheTrimmedFields(t *testing.T) {
+	padded := ServiceSpec{
+		Key: "argosy", Hostname: "argosy.zerogravity.industries",
+		Mode: "direct ", Upstream: "Origin.Example.Com", Access: "bookmark",
+	}
+	clean := padded
+	clean.Mode = ModeDirect
+
+	gotPadded, err := padded.Validate()
+	if err != nil {
+		t.Fatalf("padded: %v", err)
+	}
+	gotClean, err := clean.Validate()
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if gotPadded.Upstream != gotClean.Upstream {
+		t.Errorf("padding the mode changed how the upstream normalized: %q vs %q",
+			gotPadded.Upstream, gotClean.Upstream)
+	}
+	if gotPadded.Upstream != "origin.example.com" {
+		t.Errorf("a direct upstream is a DNS record's value and folds to lower case, got %q", gotPadded.Upstream)
+	}
+}

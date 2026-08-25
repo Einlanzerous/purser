@@ -242,18 +242,8 @@ func provisionOutcome(res *spinup.Result) string {
 // offboard's rule too, and it is what lets a plan be run in a pipeline without
 // every un-applied step reading as a fault.
 func provisionExit(res *spinup.Result) int {
-	c := res.Counts()
-	for _, st := range []spinup.StepStatus{
-		spinup.StepFailed,
-		spinup.StepAppliedNotRecorded,
-		spinup.StepUnavailable,
-		spinup.StepRefused,
-		spinup.StepUnknown,
-		spinup.StepBlocked,
-	} {
-		if c[st] > 0 {
-			return 1
-		}
+	if len(res.NeedsAttention()) > 0 {
+		return 1
 	}
 	return 0
 }

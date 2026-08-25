@@ -354,3 +354,45 @@ func TestSpinup_PaddedEnumsAreAccepted(t *testing.T) {
 		t.Errorf("the echoed spec should be trimmed, got %v", spec)
 	}
 }
+
+// `pending` and `changed` are the two fields that look like a verdict and are
+// not one. An apply against a deployment with no Cloudflare credentials answers
+// 200 with `pending: 0, changed: 0` — byte-identical to an edge that is already
+// correct — which is the misreading that shipped on the CLI and got fixed there
+// (PRSR-31). `needs_attention` is the field that tells them apart, computed from
+// the same list the CLI's exit code uses.
+func TestSpinup_NeedsAttentionSeparatesUnconfiguredFromAlreadyCorrect(t *testing.T) {
+	unconfigured := spinup.New(newMemStore(), spinup.NewRegistry(
+		spinup.NewUnavailable(model.ResourceDNSRecord, "DNS record", "set PURSER_CF_ZONE_ID"),
+		&stubProv{kind: model.ResourceAccessApp},
+		&stubProv{kind: model.ResourceTunnelRoute},
+	))
+	srv := httptest.NewServer(New(nil, unconfigured, nil, "").Handler())
+	defer srv.Close()
+
+	body := map[string]any{
+		"service": "argosy", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"apply": true,
+	}
+	code, broken := postSpinup(t, srv, body)
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %v", code, broken)
+	}
+	// The trap, stated as an assertion: these two say nothing is wrong.
+	if broken["pending"].(float64) != 0 {
+		t.Fatalf("precondition: an unavailable step is not pending, got %v", broken["pending"])
+	}
+	att, _ := broken["needs_attention"].([]any)
+	if len(att) != 1 || att[0] != string(model.ResourceDNSRecord) {
+		t.Errorf("want the DNS step named as needing attention, got %v", broken["needs_attention"])
+	}
+
+	// ...and an edge that really is correct carries no such field at all, so its
+	// presence is the whole signal.
+	good, _ := spinupServer(t)
+	_, fine := postSpinup(t, good, body)
+	if _, present := fine["needs_attention"]; present {
+		t.Errorf("an edge that matches the spec needs no attention, got %v", fine["needs_attention"])
+	}
+}

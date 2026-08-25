@@ -148,6 +148,18 @@ type spinupResponse struct {
 	Pending int `json:"pending"`
 	// Changed is how many steps this run actually changed. Always 0 on a plan.
 	Changed int `json:"changed"`
+	// NeedsAttention names the kinds in a state a person has to resolve.
+	//
+	// Present because `pending` and `changed` are the two fields that look like
+	// a verdict and are not one: an apply against an unconfigured deployment
+	// answers 200 with `pending: 0, changed: 0`, which is byte-identical to an
+	// edge that is already correct. Everything needed to tell them apart is in
+	// `counts` and each finding's `status`, but so was the CLI's — and reading
+	// the pending count as success is exactly the bug PRSR-31 shipped and then
+	// fixed on that surface. Empty means the edge is as the spec asks. It is
+	// computed from the same list the CLI's exit code uses, so the two cannot
+	// disagree about what counts as fine.
+	NeedsAttention []string `json:"needs_attention,omitempty"`
 }
 
 type spinupSpecDTO struct {
@@ -205,6 +217,9 @@ func newSpinupResponse(res *spinup.Result) spinupResponse {
 	}
 	for st, n := range res.Counts() {
 		out.Counts[string(st)] = n
+	}
+	for _, f := range res.NeedsAttention() {
+		out.NeedsAttention = append(out.NeedsAttention, string(f.Kind))
 	}
 	for _, f := range res.Findings {
 		out.Findings = append(out.Findings, stepDTO{

@@ -642,6 +642,12 @@ construct_net/Tailscale isolation).
   leaves a trace of it somewhere. `spec` echoes the **normalized** spec, so a
   caller can compare what it sent against what the run actually used.
 
+  **Read `needs_attention`, not `pending`.** `pending` counts only what `apply`
+  would act on, so an apply against a deployment that isn't configured answers
+  `pending: 0, changed: 0` — identical to an edge that was already correct.
+  `needs_attention` names the kinds a person has to resolve and is absent when
+  there are none; it is computed from the same list the CLI's exit code uses.
+
 The credential block (with secrets) is returned only for `copypaste` delivery;
 for `email` the secrets go to the recipient and are not echoed over HTTP.
 `operator_note` — the list of services that didn't provision — is returned on

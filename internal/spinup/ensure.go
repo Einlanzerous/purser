@@ -262,6 +262,33 @@ func (r *Result) Pending() int {
 	return n
 }
 
+// NeedsAttention reports the steps in a state a person has to resolve — the
+// answer to "is this service's edge as the spec asks?", which neither Pending
+// nor Changed answers.
+//
+// It exists because the two counts that *look* like a verdict are not one.
+// Pending excludes every status here on purpose (--apply fixes none of them), so
+// a plan against an unconfigured deployment reports `pending: 0, changed: 0` and
+// nothing anywhere contradicts it — which is exactly how the CLI came to print
+// "the edge already matches this spec" over a hostname that does not resolve
+// (PRSR-31).
+//
+// Living here rather than in a renderer is the point: the CLI's exit code and
+// the HTTP response answer it from the same list, so the two surfaces cannot
+// drift about what counts as fine. `blocked` is included — the step did not
+// happen, and the hostname does not work — even though what needs attention is
+// really its prerequisite.
+func (r *Result) NeedsAttention() []StepFinding {
+	var out []StepFinding
+	for _, f := range r.Findings {
+		switch f.Status {
+		case StepUnavailable, StepRefused, StepUnknown, StepBlocked, StepFailed, StepAppliedNotRecorded:
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // inPlace reports whether this step leaves its resource in place for a later
 // step to depend on. It is the predicate behind StepBlocked.
 //
