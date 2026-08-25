@@ -173,6 +173,10 @@ func inspectIngress(rules []ingressRule, t spinup.Target) spinup.State {
 
 	st.Exists = true
 	svc := rules[idx].str("service")
+	// Compared exactly. A difference the operator can see in the plan and
+	// decline is better than one quietly tolerated, and the alternative — a
+	// fuzzy match — would have to guess which differences are cosmetic on a
+	// value cloudflared parses.
 	st.Matches = svc == t.Spec.Upstream
 	if st.Matches {
 		st.Detail = fmt.Sprintf("ingress rule %d of %d on tunnel %s → %s", idx+1, len(rules), t.TunnelID, svc)
@@ -248,7 +252,7 @@ func (p *TunnelProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 		// what it said. What may have been lost is somebody *else's* route, and
 		// the only useful response is to say so loudly in both places an
 		// operator looks.
-		log.Printf("spinup: %s", note)
+		log.Printf("cloudflare: %s", note)
 		detail += " — " + note
 	}
 	return spinup.Resource{ParentID: t.TunnelID, Detail: detail}, nil
@@ -299,7 +303,7 @@ func (p *TunnelProvisioner) Teardown(ctx context.Context, t spinup.Target, rec m
 		return fmt.Errorf("cloudflare: %s is still routed on tunnel %s after the removal — another writer changed the shared configuration at the same time; re-run", host, tunnelID)
 	}
 	if note := concurrentWriteNote(before.version, after.version, tunnelID); note != "" {
-		log.Printf("spinup: %s", note)
+		log.Printf("cloudflare: %s", note)
 	}
 	return nil
 }
@@ -445,7 +449,7 @@ func planRoute(rules []ingressRule, host, service string) (next []ingressRule, c
 
 	at, err := terminalIndex(rules)
 	if err != nil {
-		return nil, false, "", fmt.Errorf("cloudflare: %w", err)
+		return nil, false, "", fmt.Errorf("cloudflare: refusing to add a route to the ingress configuration: %w", err)
 	}
 	next = make([]ingressRule, 0, len(rules)+1)
 	next = append(next, rules[:at]...)
