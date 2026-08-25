@@ -215,6 +215,47 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   failed-only retry is safe.
 - Per-service failures must not abort the whole invite.
 
+### Build identity on `/healthz` (PRSR-32)
+
+- **`/healthz` reports what was stamped into the binary, and never guesses.**
+  Switchyard's delivery reconciler polls it and records the answer as the
+  *observed* half of the estate's delivery ledger (the SWY-192 contract, rolled
+  out by SERV-128). An observation is the half that is supposed to be
+  trustworthy, so a plausible-looking version the build did not ship becomes a
+  real row indistinguishable from a real deploy. An unstamped build says `dev`
+  and an unknown commit says `null`; neither is ever inferred from `go.mod`, a
+  VCS stamp, or the image tag.
+- **Blank is not unset, so read through `version.Get()` — never the raw vars.**
+  A Docker `ARG` that is declared but never passed expands to an *empty string*,
+  and `-X ...Version=` links that empty string in **over** the `dev` default
+  rather than leaving it alone (SWY-224). `Get()` is the only thing mapping
+  blank back to `dev`/`null`, so a caller reading `version.Version` directly
+  reports `""` where it means `dev`. The vars stay exported solely because
+  `Get()`'s rule has to be exercised from sibling packages' tests. This was
+  invisible while the Dockerfile still defaulted to the placeholder `docker`;
+  emptying that default is what made the bypass reachable.
+- **The version is bare semver, everywhere it is produced.** It is compared with
+  *strict equality* against `org.opencontainers.image.version`, which
+  docker/metadata-action stamps without the `v`. Report `v0.15.0` against a
+  label of `0.15.0` and every deploy report is filed `claimed_not_confirmed`
+  for ever — a permanent red row on the one page whose job is to be believed.
+  That is why the Makefile strips the `v` off `git describe`, and why `Get()`
+  reports verbatim instead of sanitising: a prefix is a bug in the *build*, and
+  silently stripping it at the reporter hides it from the only place it shows.
+- **`VERSION` is passed only on a tag build.** On a push to main
+  `steps.meta.outputs.version` is the literal `latest` — a moving target, and
+  storing it as an identity means comparing it against the image label and
+  disagreeing for ever. `publish.yml` passes blank there instead, which maps to
+  `dev`. `GIT_SHA` goes on **both** paths: a main build has a real commit and
+  should say so, it just has no release to name. The sha is the full 40
+  characters, because the cross-service comparison is an equality test and not
+  a prefix match, and an absent one marshals to JSON `null` rather than `""` —
+  "recorded no commit" is a different claim from "built at the empty commit".
+- **The Makefile's `dev` fallback lives inside the subshell, before the pipe.**
+  `git describe ... | sed 's/^v//' || echo dev` never fires: `||` binds to the
+  *pipeline*, whose status is `sed`'s, and `sed` exits 0 on empty input. An
+  untagged checkout or a source tarball then linked a blank version.
+
 ### The spin-up axis (`internal/spinup`, PRSR-27)
 
 - **It is a second interface, not a widened first one.** Everything above is
@@ -301,6 +342,15 @@ what" from local records so nobody has to reach for psql, and `purser offboard`
 (PRSR-17), which gave Purser the revoke half it had never had — three of four
 connectors revoking, Argosy reporting `unavailable` until it has an endpoint, and
 `deprovisioned` finally a status something writes.
+
+Purser also carries the SWY-192 build-identity contract as of v0.15.0
+(PRSR-32): `/healthz` reports `version` + `sha`, so it probes as a corroborated
+deploy on the delivery matrix instead of `no_version`. Verified against the
+published images rather than only in tests — `:0.15.0` answers
+`"version":"0.15.0"` with the full 40-char sha, both matching that image's
+`org.opencontainers.image.version` / `.revision` labels exactly, and `:latest`
+answers `"version":"dev"` rather than leaking the literal `latest` its own label
+carries.
 
 **Service spin-up (epic PRSR-22) is in progress**, and its prerequisites are
 done. PRSR-11 closed both halves: the CF token carries Zone→DNS→Edit (scoped to
