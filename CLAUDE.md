@@ -20,6 +20,10 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 - `internal/connector/` — the `Connector` interface + `Registry` +
   `Unavailable` (registered-but-unconfigured) + `ErrPending`.
 - `internal/connectors/{switchyard,cloudflare,lyceum,argosy}/` — per-service connectors.
+  `cloudflare/` serves **both** axes: the Access `Connector` (person × service)
+  and `DNSProvisioner` (spin-up, PRSR-28), over one shared API client in
+  `client.go`. They have separate Config structs on purpose — see the invariant
+  below.
 - `internal/invite/` — the orchestrator (`Run`) + credential-block renderer. This
   is where idempotency lives.
 - `internal/spinup/` — the **second axis** (PRSR-27): `ServiceSpec`, the
@@ -269,13 +273,41 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 - **Never treat unverifiable as absent**, here too. A failed `Inspect` is
   `unknown`, and `--apply` does not act on an unknown step: acting on a state
   that couldn't be read creates a second copy of something, or rebuilds a shared
-  ingress document from a read that just failed.
+  ingress document from a read that just failed. The DNS provisioner extends
+  this past outright failure: **several records answering for one name, none of
+  them the spec's, is also `unknown`** — a guess there changes whichever record
+  wasn't this service's — and so is a lookup that comes back a *full page*,
+  which means the name filter narrowed nothing and page one of the zone would
+  otherwise read as "nothing here".
+- **The orange cloud is only compared when the spec asks for it.** A tunnelled
+  record must be proxied (SERV-45: an unproxied CNAME to `cfargotunnel.com`
+  reaches nothing, since the tunnel is only reachable from Cloudflare's edge), so
+  that is checked, and an update turns it on. A **direct** spec expresses no
+  opinion, so `recordMatches` ignores the flag and an update preserves it —
+  otherwise `--apply` would flip the traffic path of a service that is already
+  running, over a difference the spec never claimed. Direct records are *created*
+  DNS-only; a direct service that wants proxying is a spec field somebody adds.
+- **`DNSConfig` is not `cloudflare.Config`.** Same package, same API client, two
+  credentials sets: the zone id must stay out of the Access connector's
+  readiness check, or `--to cloudflare` goes offline for every deployment that
+  hasn't set `PURSER_CF_ZONE_ID`. An unconfigured DNS provisioner reports
+  `spinup.ErrUnavailable` — one step of a spin-up, not a broken connector.
+- **Cloudflare appends the zone to a name it doesn't recognise.** A hostname from
+  another domain becomes `svc.example.org.zerogravity.industries` with no error
+  anywhere. `ServiceSpec` can't catch it (it validates the shape of a hostname,
+  not which zone the token points at) and a Zone→DNS→Edit token can't read the
+  zone object to find out first — so the *created* record's name is checked
+  against what was asked for, and a mismatch deletes it. Cleanup runs on the
+  create path only: on an update the record predates Purser, and removing it
+  would destroy something nobody asked to have removed.
 
 ## Testing
 
 - `make test` — unit tests (fake store + fake connectors for the orchestrator;
-  httptest for the Switchyard/Cloudflare connectors; in-process SMTP for
-  delivery). DB-backed store tests skip unless `PURSER_TEST_DATABASE_URL` is set.
+  httptest for the Switchyard/Cloudflare connectors and the DNS provisioner —
+  `dns_test.go` runs a stateful fake zone, so create → read back → delete is a
+  test rather than a manual probe; in-process SMTP for delivery). DB-backed store
+  tests skip unless `PURSER_TEST_DATABASE_URL` is set.
 - `make test-db` — spins a throwaway Postgres 16 and runs everything.
 - Never point tests (or `purser migrate`) at the live shared `postgres` — use a
   throwaway container / the `_test` DB.
@@ -313,6 +345,13 @@ token. PRSR-26 closed done — the tunnel is remotely-managed (`source:
 "cloudflare"`), so the tunnel connector is an ordinary API client and no tunnel
 migration is needed.
 
+PRSR-28 landed the first of the three provisioners: `cloudflare.DNSProvisioner`
+— both record shapes, idempotent by lookup-then-write, recording
+`dns_record_id` so `Teardown` targets an id rather than re-resolving a name.
+Nothing wires it into the composition root yet; that is PRSR-31, and the DNS
+half of its "run it against a service that is already up" is already covered by
+`dns_spinup_test.go`.
+
 PRSR-27 landed the foundation: `internal/spinup` (spec, `ServiceProvisioner`,
 registry, `Ensure` orchestrator) and `service_resource` (migration 0007). It
 settled the two questions the connectors were waiting on — preview by default,
@@ -325,13 +364,14 @@ reason — twice now this project has lost the remaining half of a piece of work
 by closing the ticket that described it (see PRSR-25, below) — so don't delete
 that interface method as dead code; it is waiting on a walk, not unused.
 
-Next on that axis, and independent of each other now: **PRSR-28** (DNS record),
-**PRSR-29** (Access application — `self_hosted` + policy vs `bookmark`, and a
-`logo_url` that must be verified reachable before it is written) and **PRSR-30**
-(tunnel ingress route — insert before the terminal catch-all rule, and guard the
-shared document the way the Access connector guards the group's email list).
-Then **PRSR-31** — the `provision-service` CLI/HTTP surface and Argosy end to
-end, on the direct path, so it needs PRSR-28 and PRSR-29 but not PRSR-30.
+Next on that axis, and independent of each other: **PRSR-29** (Access
+application — `self_hosted` + policy vs `bookmark`, and a `logo_url` that must
+be verified reachable before it is written) and **PRSR-30** (tunnel ingress
+route — insert before the terminal catch-all rule, and guard the shared document
+the way the Access connector guards the group's email list). Then **PRSR-31** —
+the `provision-service` CLI/HTTP surface and Argosy end to end, on the direct
+path, so it needs PRSR-29 but not PRSR-30, and it is the first thing to wire any
+provisioner into `setup()`.
 **PRSR-33** wires the `dev` tunnel ref that PRSR-27 left resolving to a refusal.
 
 Also open: nothing runs the audit on a schedule (PRSR-18). Argosy has no delete
