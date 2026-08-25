@@ -346,6 +346,23 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   hostname that *is* served on a document broken elsewhere still reports in
   place, with the malformation named: that resource is already published, so
   withholding the line protects nobody.
+- **The catch-all is not the only thing that shadows.** cloudflared matches
+  ingress top-down, first match wins, and a rule's hostname may carry `*`
+  wildcards — `*.zerogravity.industries` in front of a holding page is a
+  *documented, deliberate* configuration, so this precondition is likelier than
+  the malformed-document one, not rarer. So the walk stops at the first rule that
+  would take the hostname (`scanRoute`/`shadows`), of which the terminal
+  catch-all is just the case where the pattern is empty. Both paths read through
+  that one helper, which is what keeps them agreeing: without it the read path
+  reports a shadowed rule as a working route, and the write path inserts a new
+  rule into the same dead region and then *confirms* it — a PUT lands, the
+  read-back passes, DNS publishes, and the hostname serves the holding page with
+  nothing erroring anywhere. **A new route is therefore inserted before the first
+  rule that shadows it**, not before the terminal rule; most-specific-first is
+  cloudflared's own idiom and the only position where the route works. And a
+  wildcard is **never adopted as ours** even when it serves exactly what the spec
+  asks: `isRoute` matches literally, because adopting it would have `Teardown`
+  delete a rule standing in front of every other hostname in the zone.
 - **The ingress document is written back whole.** `PUT …/configurations`
   replaces it, so every key omitted is a setting the tunnel loses —
   `warp-routing`, the tunnel-wide `originRequest`, a per-rule `noTLSVerify`

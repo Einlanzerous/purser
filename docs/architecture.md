@@ -667,6 +667,15 @@ the other two provisioners do not:
   on a document broken elsewhere still reports in place, with the malformation
   named.
 
+  **And the catch-all is not the only thing that shadows.** A wildcard hostname
+  rule takes everything under it, and a holding page on `*.zerogravity.industries`
+  is a deliberate configuration rather than a broken one — so the walk stops at
+  the first rule that would take the hostname, of which the terminal catch-all is
+  the empty-pattern case. A new route goes in front of that rule rather than in
+  front of the terminal one (most-specific-first, cloudflared's own idiom), and a
+  wildcard is never adopted as Purser's own route: `Teardown` would then delete a
+  rule standing in front of the whole zone.
+
 Nothing wires it into `setup()` yet: the command that would run it is PRSR-31.
 
 ### The tunnelled/direct split reaches three steps

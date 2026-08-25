@@ -166,7 +166,8 @@ func inspectIngress(rules []ingressRule, t spinup.Target) (spinup.State, error) 
 	// and the recorded row.
 	st := spinup.State{ParentID: t.TunnelID}
 	host, want := t.Spec.Hostname, t.Spec.Upstream
-	idx, dups := findRoute(rules, host)
+	scan := scanRoute(rules, host)
+	idx := scan.Idx
 	shape := documentShape(rules)
 
 	switch {
@@ -186,7 +187,7 @@ func inspectIngress(rules []ingressRule, t spinup.Target) (spinup.State, error) 
 		// which does not act and holds the DNS step behind it — and a hostname
 		// published in front of a tunnel that cannot serve it is exactly what
 		// that ordering exists to prevent.
-		return spinup.State{}, shape
+		return spinup.State{}, fmt.Errorf("cloudflare: tunnel %s: %w", t.TunnelID, shape)
 
 	case idx >= 0:
 		// Compared exactly. A difference the operator can see in the plan and
@@ -200,12 +201,21 @@ func inspectIngress(rules []ingressRule, t spinup.Target) (spinup.State, error) 
 		st.Detail = fmt.Sprintf("no ingress rule for %s on tunnel %s (%d rules)", host, t.TunnelID, len(rules))
 	}
 
-	if dups > 0 {
+	if scan.Behind > 0 {
+		// There *is* a rule for the hostname; cloudflared never reaches it. The
+		// plain "no ingress rule" line would be true about what is served and
+		// misleading about what is written, and the operator needs the second
+		// one to understand why a create is being proposed for a hostname they
+		// can see in the dashboard.
+		st.Detail += fmt.Sprintf(" — %d rule(s) for it sit behind rule %d of %d (%s), which takes this hostname first, so they are never matched",
+			scan.Behind, scan.ShadowedBy+1, len(rules), shadowLabel(rules[scan.ShadowedBy]))
+	}
+	if scan.Dups > 0 {
 		// Reported rather than repaired. cloudflared matches the first rule, so
 		// the route works and the duplicates are inert — but they are somebody's
 		// hand edit, and silently deleting rules this provisioner did not write
 		// is not a thing a re-run can undo.
-		st.Detail += fmt.Sprintf(" (%d further rule(s) carry this hostname; cloudflared matches the first)", dups)
+		st.Detail += fmt.Sprintf(" (%d further rule(s) carry this hostname; cloudflared matches the first)", scan.Dups)
 	}
 	if shape != nil {
 		st.Detail += fmt.Sprintf(" — this hostname is served, but the tunnel's configuration is malformed elsewhere and no route can be written into it: %v", shape)
@@ -245,7 +255,7 @@ func (p *TunnelProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 		// plan and here. Nothing to write, and saying so is the honest Detail.
 		return spinup.Resource{ParentID: t.TunnelID, Detail: detail}, nil
 	}
-	if _, err := terminalIndex(next); err != nil {
+	if err := assertWritable(next, t.Spec.Hostname); err != nil {
 		// Belt and braces on our own arithmetic: the document we are about to
 		// send must still end in the rule that matches everything. A rule after
 		// it never matches and nothing errors, so this is the one class of bug
@@ -319,7 +329,7 @@ func (p *TunnelProvisioner) Teardown(ctx context.Context, t spinup.Target, rec m
 	}
 	// Teardown reports success only when the resource is actually gone, so the
 	// read-back is the claim, not the PUT's 200.
-	// withoutRoute rather than findRoute: the removal took every rule carrying
+	// withoutRoute rather than scanRoute: the removal took every rule carrying
 	// the hostname, including any behind a catch-all, so the check that it is
 	// gone has to look at the same set rather than only the reachable one.
 	if _, left := withoutRoute(after.ingress, host); left > 0 {
@@ -385,40 +395,123 @@ func isCatchAll(r ingressRule) bool {
 	return r.str("hostname") == "" && r.str("path") == ""
 }
 
-// isRoute reports whether a rule is *the* route for a hostname: same host, and
-// no path. A path-scoped rule for the same hostname is a narrower route someone
-// wrote deliberately, so it is neither matched nor touched here.
+// isRoute reports whether a rule is *the* route for a hostname: same host,
+// literally, and no path. A path-scoped rule for the same hostname is a narrower
+// route someone wrote deliberately, so it is neither matched nor touched here.
+//
+// Literal, and deliberately not a wildcard match. A rule reading
+// `*.zerogravity.industries` may well be serving this hostname, but it is not
+// *ours*: adopting it would have Teardown delete a rule standing in front of
+// every other hostname in the zone.
 func isRoute(r ingressRule, host string) bool {
 	return r.str("path") == "" && strings.EqualFold(r.str("hostname"), host)
 }
 
-// findRoute returns the index of the rule that decides what the hostname does,
-// and how many *further* rules also carry it. cloudflared matches the first, so
-// the rest are reported rather than silently rewritten.
+// shadows reports whether cloudflared would match this rule for host before
+// reaching anything later in the list.
 //
-// The walk stops at the first catch-all, because that is where cloudflared's
-// stops. A rule behind one is not this hostname's route: it is never matched, so
-// treating it as one would have the read path report a working service for a
-// route that serves nothing — the same silent failure as appending after the
-// terminal rule, one step to the left. Every caller wants the reachable answer:
-// Inspect decides a step's status from it, planRoute decides whether a write is
-// needed, and confirmRoute checks that a write actually landed somewhere live.
-func findRoute(rules []ingressRule, host string) (idx, dups int) {
-	idx = -1
+// cloudflared matches ingress top-down, first match wins, and a rule's hostname
+// may carry `*` wildcards — `*.zerogravity.industries` in front of a holding
+// page is a documented, deliberate configuration, not a malformed document. So
+// the terminal catch-all is not the only thing that ends the walk, it is just
+// the case where the pattern is empty and matches everything.
+//
+// A rule carrying a path is narrower than the hostname: it takes some requests
+// and leaves the rest, so it does not shadow the route.
+func shadows(r ingressRule, host string) bool {
+	if r.str("path") != "" {
+		return false
+	}
+	pattern := r.str("hostname")
+	if pattern == "" {
+		return true // the catch-all, and any rule shaped like it
+	}
+	return globMatch(strings.ToLower(pattern), strings.ToLower(host))
+}
+
+// globMatch reports whether s matches a pattern whose only metacharacter is `*`,
+// standing for any run of characters — cloudflared's hostname matching.
+//
+// Iterative with backtracking rather than a compiled regexp: it cannot blow up
+// on a pattern like `*.*.*`, and it needs no escaping of the dots that every
+// hostname is full of.
+func globMatch(pattern, s string) bool {
+	var p, i, star, resume int
+	star = -1
+	for i < len(s) {
+		switch {
+		case p < len(pattern) && pattern[p] == s[i]:
+			p, i = p+1, i+1
+		case p < len(pattern) && pattern[p] == '*':
+			star, resume = p, i
+			p++
+		case star >= 0:
+			resume++
+			p, i = star+1, resume
+		default:
+			return false
+		}
+	}
+	for p < len(pattern) && pattern[p] == '*' {
+		p++
+	}
+	return p == len(pattern)
+}
+
+// routeScan is what one walk of the ingress list found for a hostname. It is a
+// struct rather than a pile of return values because every caller wants a
+// different subset and all of them must agree about where the walk stopped.
+type routeScan struct {
+	// Idx is the rule cloudflared would match for the hostname, or -1. It is
+	// always ahead of ShadowedBy, by construction.
+	Idx int
+	// Dups is how many further *reachable* rules also carry the hostname.
+	Dups int
+	// ShadowedBy is the rule that ended the walk — the terminal catch-all, or a
+	// wildcard that takes the hostname first — or -1 if the list ran out without
+	// one, which only a malformed document does.
+	//
+	// It is also the insert position: a new route goes in front of the first
+	// rule that would otherwise take its traffic, which for an ordinary document
+	// is the terminal rule and stays so.
+	ShadowedBy int
+	// Behind is how many rules for the hostname sit past that shadow. They are
+	// never matched, and saying so is the whole point of counting them.
+	Behind int
+}
+
+// scanRoute walks the ingress list the way cloudflared does: top-down, stopping
+// at the first rule that would take the hostname.
+//
+// The stop is the fix for two findings of the same shape (PRSR-30 review). A
+// rule behind a catch-all or a wildcard is not this hostname's route — it is
+// never matched — so treating it as one has the read path report a working
+// service for a route that serves nothing, and the write path insert a new rule
+// into the same dead region and then confirm it.
+func scanRoute(rules []ingressRule, host string) routeScan {
+	scan := routeScan{Idx: -1, ShadowedBy: -1}
 	for i, r := range rules {
-		if isCatchAll(r) {
+		if isRoute(r, host) {
+			if scan.Idx < 0 {
+				scan.Idx = i
+			} else {
+				scan.Dups++
+			}
+			continue
+		}
+		if shadows(r, host) {
+			scan.ShadowedBy = i
 			break
 		}
-		if !isRoute(r, host) {
-			continue
-		}
-		if idx < 0 {
-			idx = i
-			continue
-		}
-		dups++
 	}
-	return idx, dups
+	if scan.ShadowedBy >= 0 {
+		for _, r := range rules[scan.ShadowedBy+1:] {
+			if isRoute(r, host) {
+				scan.Behind++
+			}
+		}
+	}
+	return scan
 }
 
 // terminalIndex returns the index the catch-all rule sits at, refusing any
@@ -464,8 +557,29 @@ func documentShape(rules []ingressRule) error {
 	if len(rules) == 0 {
 		return nil
 	}
+	return terminalIndexErr(rules)
+}
+
+// terminalIndexErr is terminalIndex's refusal without its index.
+func terminalIndexErr(rules []ingressRule) error {
+	_, err := terminalIndex(rules)
+	return err
+}
+
+// assertWritable is the check on the document this run just built, made before
+// it is sent: the catch-all is still last, and the hostname's own rule is the
+// one cloudflared would actually match.
+//
+// Belt and braces on our own arithmetic, and worth the two lines because this is
+// the one class of bug here that cannot be found by watching it fail — a rule in
+// a region cloudflared never reaches is not an error anywhere, it is a hostname
+// that quietly does not work.
+func assertWritable(rules []ingressRule, host string) error {
 	if _, err := terminalIndex(rules); err != nil {
-		return fmt.Errorf("cloudflare: %w", err)
+		return err
+	}
+	if scanRoute(rules, host).Idx < 0 {
+		return fmt.Errorf("the rule for %s would sit behind one that takes the hostname first, so it would never be matched", host)
 	}
 	return nil
 }
@@ -477,7 +591,8 @@ func documentShape(rules []ingressRule) error {
 // terminal rule" is the assertion this ticket is about and it should be
 // checkable without a server.
 func planRoute(rules []ingressRule, host, service string) (next []ingressRule, changed bool, detail string, err error) {
-	if idx, _ := findRoute(rules, host); idx >= 0 {
+	scan := scanRoute(rules, host)
+	if idx := scan.Idx; idx >= 0 {
 		was := rules[idx].str("service")
 		if was == service {
 			return rules, false, fmt.Sprintf("%s already routed to %s", host, service), nil
@@ -504,16 +619,39 @@ func planRoute(rules []ingressRule, host, service string) (next []ingressRule, c
 			fmt.Sprintf("%s routed to %s, with a terminal %s rule (the tunnel had no ingress configuration)", host, service, catchAllService), nil
 	}
 
-	at, err := terminalIndex(rules)
-	if err != nil {
-		return nil, false, "", fmt.Errorf("cloudflare: refusing to add a route to the ingress configuration: %w", err)
+	if err := documentShape(rules); err != nil {
+		return nil, false, "", fmt.Errorf("refusing to add a route to the ingress configuration: %w", err)
 	}
+	// Inserted in front of the first rule that would otherwise take this
+	// hostname, which for an ordinary document *is* the terminal catch-all — the
+	// original requirement, generalized rather than replaced. Where a wildcard
+	// sits in front (a holding page, a default backend), the new route goes
+	// ahead of that instead: most-specific-first is cloudflared's own idiom, and
+	// it is the only position where the route works at all. Nothing is
+	// reordered; a narrower rule is put in front of a broader one.
+	at := scan.ShadowedBy
 	next = make([]ingressRule, 0, len(rules)+1)
 	next = append(next, rules[:at]...)
 	next = append(next, rule)
 	next = append(next, rules[at:]...)
-	return next, true,
-		fmt.Sprintf("%s routed to %s, inserted before the terminal %s rule (%d rules now)", host, service, rules[at].str("service"), len(next)), nil
+	detail = fmt.Sprintf("%s routed to %s, inserted before rule %d of %d (%s) (%d rules now)",
+		host, service, at+1, len(rules), shadowLabel(rules[at]), len(next))
+	if scan.Behind > 0 {
+		// Left in place: a rule Purser did not write is not one it deletes, and
+		// it was already dead before this run. Said out loud so the operator can
+		// remove it if it was meant to be the route.
+		detail += fmt.Sprintf(" — %d existing rule(s) for this hostname sit behind that and stay unmatched", scan.Behind)
+	}
+	return next, true, detail, nil
+}
+
+// shadowLabel names a rule for a human: its hostname pattern, or what the
+// hostname-less terminal rule serves.
+func shadowLabel(r ingressRule) string {
+	if h := r.str("hostname"); h != "" {
+		return h
+	}
+	return "the terminal " + r.str("service") + " rule"
 }
 
 // withoutRoute drops every rule that is the hostname's own route, and reports
@@ -542,7 +680,7 @@ func withoutRoute(rules []ingressRule, host string) ([]ingressRule, int) {
 // terminal rule works exactly like a rule that was never written — no error, no
 // symptom, no route — so it has to be *checked*, not assumed.
 func confirmRoute(rules []ingressRule, host, service string) error {
-	idx, _ := findRoute(rules, host)
+	idx := scanRoute(rules, host).Idx
 	if idx < 0 {
 		return fmt.Errorf("cloudflare: the ingress configuration was written but %s is not in it — another writer changed the shared document at the same time; re-run, and check the other services on this tunnel", host)
 	}

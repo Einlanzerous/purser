@@ -420,6 +420,134 @@ func TestTunnel_InspectReportsAReachableRouteOnAMalformedDocument(t *testing.T) 
 	}
 }
 
+// --- shadowing: a wildcard stops the walk too --------------------------------
+
+// wildcardFirst is a legitimate, documented configuration — a holding page in
+// front of the whole zone — not a malformed document. Its catch-all *is* last,
+// so documentShape has nothing to say about it.
+const wildcardFirst = `{"ingress":[
+	{"hostname":"*.zerogravity.industries","service":"http://holding-page:80"},
+	{"service":"http_status:404"}
+]}`
+
+// wildcardShadowing is the same, with a rule for wiki stranded behind it.
+const wildcardShadowing = `{"ingress":[
+	{"hostname":"*.zerogravity.industries","service":"http://holding-page:80"},
+	{"hostname":"wiki.zerogravity.industries","service":"http://wiki:3000"},
+	{"service":"http_status:404"}
+]}`
+
+func TestTunnel_InspectDoesNotReportAShadowedRuleAsARoute(t *testing.T) {
+	// cloudflared matches top-down, first match wins, and a hostname may carry
+	// wildcards — so the catch-all is not the only thing that ends the walk.
+	// Reporting rule 2 as in place gives the orchestrator ok/adopt, both
+	// inPlace(), and DNS publishes a hostname that serves the holding page.
+	f := newFakeTunnel(t, wildcardShadowing)
+	tgt := target(t, "wiki.zerogravity.industries", "http://wiki:3000")
+
+	st, err := f.prov(t).Inspect(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if st.Exists || st.Matches {
+		t.Fatalf("a rule behind a wildcard is not a working route, got %+v", st)
+	}
+	// The plain "no ingress rule" line would be true about what is served and
+	// misleading about what is written.
+	if !strings.Contains(st.Detail, "never matched") || !strings.Contains(st.Detail, "*.zerogravity.industries") {
+		t.Errorf("Detail should name the shadow and the stranded rule, got %q", st.Detail)
+	}
+}
+
+func TestTunnel_EnsureInsertsAheadOfAShadowingWildcard(t *testing.T) {
+	// The worse half: here Purser is the one creating the dead rule. Inserting
+	// before the *terminal* rule puts the new route behind the wildcard, and
+	// confirmRoute — reading through the same helper — then reports success.
+	f := newFakeTunnel(t, wildcardFirst)
+	tgt := target(t, "interlock.zerogravity.industries", "http://interlock:8080")
+
+	res, err := f.prov(t).Ensure(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	want := []string{
+		"interlock.zerogravity.industries=http://interlock:8080",
+		"*.zerogravity.industries=http://holding-page:80",
+		"*=http_status:404",
+	}
+	if got := f.hostnames(t); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("the new route must go in front of the rule that would take it.\n got: %v\nwant: %v", got, want)
+	}
+	if !strings.Contains(res.Detail, "*.zerogravity.industries") {
+		t.Errorf("Detail should name what it was inserted before, got %q", res.Detail)
+	}
+}
+
+func TestTunnel_EnsureLeavesAStrandedRuleAloneAndSaysSo(t *testing.T) {
+	f := newFakeTunnel(t, wildcardShadowing)
+	tgt := target(t, "wiki.zerogravity.industries", "http://wiki:3000")
+
+	res, err := f.prov(t).Ensure(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	rules := f.ingress(t)
+	if len(rules) != 4 || rules[0].str("hostname") != "wiki.zerogravity.industries" {
+		t.Fatalf("the working route must go first, got %v", f.hostnames(t))
+	}
+	// A rule Purser did not write is not one it deletes — it was already dead
+	// before this run — but leaving it silently would be the same trap again.
+	if !strings.Contains(res.Detail, "stay unmatched") {
+		t.Errorf("the stranded rule should be reported, got %q", res.Detail)
+	}
+}
+
+func TestTunnel_AWildcardIsNeverAdoptedAsOurOwnRoute(t *testing.T) {
+	// Even when the wildcard happens to serve exactly what the spec asks for.
+	// Adopting it would have Teardown delete a rule standing in front of every
+	// other hostname in the zone.
+	f := newFakeTunnel(t, `{"ingress":[
+		{"hostname":"*.zerogravity.industries","service":"http://interlock:8080"},
+		{"service":"http_status:404"}
+	]}`)
+	tgt := target(t, "interlock.zerogravity.industries", "http://interlock:8080")
+
+	st, err := f.prov(t).Inspect(context.Background(), tgt)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if st.Exists {
+		t.Fatalf("a wildcard is somebody else's rule, got %+v", st)
+	}
+	if _, err := f.prov(t).Ensure(context.Background(), tgt); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got := f.ingress(t); len(got) != 3 || got[0].str("hostname") != "interlock.zerogravity.industries" {
+		t.Errorf("want our own literal rule in front, got %v", f.hostnames(t))
+	}
+}
+
+func TestGlobMatch(t *testing.T) {
+	cases := []struct {
+		pattern, s string
+		want       bool
+	}{
+		{"*.zerogravity.industries", "wiki.zerogravity.industries", true},
+		{"*.zerogravity.industries", "zerogravity.industries", false},
+		{"*", "anything.at.all", true},
+		{"wiki.*", "wiki.zerogravity.industries", true},
+		{"*.example.com", "wiki.zerogravity.industries", false},
+		{"wiki.zerogravity.industries", "wiki.zerogravity.industries", true},
+		{"lyceum.zerogravity.industries", "wiki.zerogravity.industries", false},
+		{"*.*.industries", "wiki.zerogravity.industries", true},
+	}
+	for _, tc := range cases {
+		if got := globMatch(tc.pattern, tc.s); got != tc.want {
+			t.Errorf("globMatch(%q, %q) = %v, want %v", tc.pattern, tc.s, got, tc.want)
+		}
+	}
+}
+
 func TestTunnel_PreviewAndApplyAgreeOnEveryDocument(t *testing.T) {
 	// PRSR-27's property: a plan is the first half of the apply, not a guess at
 	// it. The failure this pins is a preview that promises `create` against a
@@ -440,6 +568,9 @@ func TestTunnel_PreviewAndApplyAgreeOnEveryDocument(t *testing.T) {
 		{"dead tail, dead rule", deadTail, "wiki.zerogravity.industries", "http://wiki:3000"},
 		{"dead tail, live rule", deadTail, "lyceum.zerogravity.industries", "http://lyceum:8083"},
 		{"no catch-all", `{"ingress":[{"hostname":"a.example.com","service":"http://a:1"}]}`, "interlock.zerogravity.industries", "http://interlock:8080"},
+		{"wildcard first, absent", wildcardFirst, "interlock.zerogravity.industries", "http://interlock:8080"},
+		{"wildcard first, shadowed rule", wildcardShadowing, "wiki.zerogravity.industries", "http://wiki:3000"},
+		{"wildcard first, live rule", wildcardShadowing, "lyceum.zerogravity.industries", "http://lyceum:8083"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
