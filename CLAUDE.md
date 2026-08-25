@@ -279,19 +279,40 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   wasn't this service's — and so is a lookup that comes back a *full page*,
   which means the name filter narrowed nothing and page one of the zone would
   otherwise read as "nothing here".
-- **The orange cloud is only compared when the spec asks for it.** A tunnelled
-  record must be proxied (SERV-45: an unproxied CNAME to `cfargotunnel.com`
-  reaches nothing, since the tunnel is only reachable from Cloudflare's edge), so
-  that is checked, and an update turns it on. A **direct** spec expresses no
-  opinion, so `recordMatches` ignores the flag and an update preserves it —
-  otherwise `--apply` would flip the traffic path of a service that is already
-  running, over a difference the spec never claimed. Direct records are *created*
-  DNS-only; a direct service that wants proxying is a spec field somebody adds.
+- **A direct spec pins the record's value and nothing else.** A tunnelled record
+  must be proxied (SERV-45: an unproxied CNAME to `cfargotunnel.com` reaches
+  nothing, since the tunnel is only reachable from Cloudflare's edge), so that is
+  checked and an update turns it on, and its TTL is pinned to automatic because a
+  proxied record requires it. A **direct** spec expresses neither, so
+  `recordMatches` ignores both and an update carries the *existing* values
+  across. `ttlAuto` and unproxied are **create-time defaults only** — applying
+  them on an update would flip the traffic path of a running service and
+  overwrite a TTL a human set, and since neither field is compared or printed,
+  the plan the operator approved would not have mentioned either. A direct
+  service that wants proxying is a spec field somebody adds.
 - **`DNSConfig` is not `cloudflare.Config`.** Same package, same API client, two
   credentials sets: the zone id must stay out of the Access connector's
   readiness check, or `--to cloudflare` goes offline for every deployment that
   hasn't set `PURSER_CF_ZONE_ID`. An unconfigured DNS provisioner reports
   `spinup.ErrUnavailable` — one step of a spin-up, not a broken connector.
+- **Not every Cloudflare route sends the `{success, errors}` envelope.**
+  `DELETE /zones/{zone}/dns_records/{id}` answers with a bare
+  `{"result":{"id":…}}`, so `do()` decodes `success` into a `*bool`: absent plus
+  a 2xx is success, and only an actual `false` is a failure. A plain bool read
+  that delete as failed — reporting a deletion that *happened* as one that
+  didn't, which is PRSR-17's lie backwards, and it survived because that was the
+  first `DELETE` this client had ever sent. When a fake models the shape you
+  assumed, the suite asserts your model rather than the API; PRSR-29/30 use this
+  same client, so check the route's real response before trusting the envelope.
+- **`notFound` requires Cloudflare's record code, and a bare 404 is not enough.**
+  A 404 is also how the API answers a request it could not *route* — a recorded
+  `parent_id` the current token can no longer address, a base URL that moved —
+  and `Teardown` reads `notFound` as "already gone". Treating any 404 as absence
+  therefore reports a deletion that never happened, and the next run reads the
+  row as removed, so it is silent and permanent; the opposite error is a noisy,
+  retryable failure on a record that was already gone. Only 81044 is listed, and
+  only codes actually observed in a response may be added — a guessed one turns
+  an unrelated failure into a reported deletion.
 - **Cloudflare appends the zone to a name it doesn't recognise.** A hostname from
   another domain becomes `svc.example.org.zerogravity.industries` with no error
   anywhere. `ServiceSpec` can't catch it (it validates the shape of a hostname,

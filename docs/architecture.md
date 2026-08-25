@@ -690,7 +690,15 @@ What it decides, and why:
   wrong.
 - **Teardown targets the recorded id** and refuses without one, confirms the id
   still names this hostname before deleting, and treats an already-absent record
-  as success.
+  as success — where "absent" means Cloudflare's record code and *not* a bare
+  404, since a 404 is also how the API answers a request it could not route, and
+  reading that as "gone" reports a deletion that never happened.
+- **The envelope is not universal.** `DELETE /zones/{zone}/dns_records/{id}`
+  answers with a bare `{"result":{"id":…}}` and no `{success, errors}` at all —
+  it is the first `DELETE` this client has ever sent — so `do()` treats an absent
+  `success` field on a 2xx as success rather than as failure. PRSR-29 and PRSR-30
+  share the client; check each new route's real response shape rather than the
+  fake's.
 
 ### What is left
 

@@ -75,7 +75,17 @@ func (c *client) do(ctx context.Context, method, path string, body any) ([]byte,
 	}
 
 	var env struct {
-		Success bool `json:"success"`
+		// A pointer, so "the field was absent" is distinguishable from
+		// "success was false".
+		//
+		// Not every v4 route answers with the envelope. `DELETE
+		// /zones/{zone}/dns_records/{id}` returns a bare {"result":{"id":…}} —
+		// no success, no errors — and a plain bool would read that as failure,
+		// reporting a deletion that happened as one that didn't. That is the
+		// PRSR-17 lie pointed backwards: `Teardown` would leave a row active for
+		// a record it had just removed. It went unnoticed until now because that
+		// delete is the first DELETE this client has ever sent.
+		Success *bool `json:"success"`
 		Errors  []struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
@@ -84,14 +94,19 @@ func (c *client) do(ctx context.Context, method, path string, body any) ([]byte,
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, &apiError{Method: method, Path: path, Status: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
-	if !env.Success {
-		e := &apiError{Method: method, Path: path, Status: resp.StatusCode}
-		if len(env.Errors) > 0 {
-			e.Code, e.Message = env.Errors[0].Code, env.Errors[0].Message
-		}
-		return nil, e
+	switch {
+	case env.Success != nil && *env.Success:
+		return raw, nil
+	case env.Success == nil && resp.StatusCode >= 200 && resp.StatusCode < 300:
+		// No envelope to judge by, so the transport status is the answer. A
+		// route that *does* send one is unaffected: it takes the branch above.
+		return raw, nil
 	}
-	return raw, nil
+	e := &apiError{Method: method, Path: path, Status: resp.StatusCode}
+	if len(env.Errors) > 0 {
+		e.Code, e.Message = env.Errors[0].Code, env.Errors[0].Message
+	}
+	return nil, e
 }
 
 // apiError is a Cloudflare request that did not succeed, carrying the transport
@@ -121,26 +136,30 @@ func (e *apiError) Error() string {
 	}
 }
 
-// Cloudflare's DNS "there is no such record" codes. A 404 alone is not enough to
-// go on — a mistyped base URL 404s too — so the code is checked as well, and
-// either one being conclusive is deliberate: both spellings mean the object is
-// not there.
-const (
-	errCodeRecordNotFound = 81044 // "Record does not exist."
-	errCodeRecordMissing  = 81045 // "Record does not exist. (81045)" on some routes
-)
+// errCodeRecordNotFound is Cloudflare's "Record does not exist." It is the only
+// code listed here on purpose: this constant decides that a teardown succeeded,
+// so a code guessed rather than observed could turn an unrelated failure into a
+// reported deletion. Add one when a real response shows it, not before.
+const errCodeRecordNotFound = 81044
 
-// notFound reports whether err is Cloudflare saying the object isn't there.
+// notFound reports whether err is Cloudflare saying the record isn't there.
 //
-// "Already gone" is success for a teardown and must never surface as a failure:
-// the person axis learned the inverse of this the hard way (a revoke that didn't
-// happen recorded as one, PRSR-17), and reporting a failure for a record that is
-// genuinely absent is the same class of lie pointed the other way — it leaves a
-// removed resource recorded as live.
+// The code decides it, and a bare 404 deliberately does not. A 404 is also the
+// answer when the *request* could not be routed — a zone id in a recorded
+// parent that the current token can no longer address, a base URL that moved —
+// and reading that as "already gone" is how Teardown comes to report a deletion
+// it never performed, leaving a live record recorded as removed. That is
+// `revoked-not-recorded`'s neighbour from PRSR-17, and it is worse than the
+// error it replaces: an error is retried, and a re-run reads the row as already
+// removed.
+//
+// So the two mistakes are not symmetric, and this leans the safe way. Being
+// wrong here means a genuinely-absent record reports as a failure — noisy,
+// retryable, and visible. Being wrong the other way is silent and permanent.
 func notFound(err error) bool {
 	var ae *apiError
 	if !errors.As(err, &ae) {
 		return false
 	}
-	return ae.Status == http.StatusNotFound || ae.Code == errCodeRecordNotFound || ae.Code == errCodeRecordMissing
+	return ae.Code == errCodeRecordNotFound
 }

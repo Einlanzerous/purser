@@ -172,7 +172,12 @@ func (z *fakeZone) remove(w http.ResponseWriter, id string) {
 		return
 	}
 	delete(z.records, id)
-	cfOK(w, map[string]string{"id": id})
+	// Deliberately NOT cfOK: Cloudflare's DNS delete is the one route in this
+	// client's reach that answers with a bare result and no {success, errors}
+	// envelope. Wrapping it here would make the suite assert this package's
+	// model of the API instead of the API, which is how the envelope bug reached
+	// review — the delete is the first DELETE this client has ever sent.
+	_ = json.NewEncoder(w).Encode(map[string]any{"result": map[string]string{"id": id}})
 }
 
 // callLog returns a copy of the recorded calls.
@@ -818,16 +823,24 @@ func TestDNS_InvalidSpecIsRefusedBeforeAnyCall(t *testing.T) {
 }
 
 // notFound has to answer from structure, not prose: Teardown reads it to decide
-// that an already-absent record is a success.
-func TestNotFound_MatchesStatusAndCode(t *testing.T) {
+// that an already-absent record is a success, which is a claim about the world.
+//
+// The bare-404 cases are the point. A 404 is also what the API answers when the
+// *request* could not be routed, so treating it as conclusive would have a
+// teardown that never reached the zone report a deletion — silent, and not
+// fixed by re-running, because the next run reads the row as already removed.
+func TestNotFound_RequiresTheRecordCode(t *testing.T) {
 	cases := []struct {
 		name string
 		err  error
 		want bool
 	}{
-		{"404 status", &apiError{Status: http.StatusNotFound}, true},
-		{"record code", &apiError{Status: http.StatusBadRequest, Code: errCodeRecordNotFound}, true},
-		{"wrapped", fmt.Errorf("wrapped: %w", &apiError{Status: http.StatusNotFound}), true},
+		{"record code", &apiError{Status: http.StatusNotFound, Code: errCodeRecordNotFound}, true},
+		{"record code without a 404", &apiError{Status: http.StatusBadRequest, Code: errCodeRecordNotFound}, true},
+		{"wrapped", fmt.Errorf("wrapped: %w", &apiError{Code: errCodeRecordNotFound}), true},
+		{"bare 404 — could be an unroutable path", &apiError{Status: http.StatusNotFound}, false},
+		{"404 from a routing error", &apiError{Status: http.StatusNotFound, Code: 7003, Message: "Could not route"}, false},
+		{"404 with a non-envelope body", &apiError{Status: http.StatusNotFound, Body: "404 page not found"}, false},
 		{"other api error", &apiError{Status: http.StatusForbidden, Code: 10000}, false},
 		{"not an api error", errors.New("boom"), false},
 	}
@@ -835,5 +848,82 @@ func TestNotFound_MatchesStatusAndCode(t *testing.T) {
 		if got := notFound(tc.err); got != tc.want {
 			t.Errorf("%s: notFound = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// A direct spec pins the record's value. An update about the value must not also
+// rewrite the TTL a human set — and nothing in the plan the operator approved
+// would have mentioned it, since neither recordMatches nor describeRecord looks
+// at TTL.
+func TestDNS_Ensure_DirectUpdateLeavesTTLAlone(t *testing.T) {
+	var patched recordBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cfOK(w, []dnsRecord{{ID: "rec1", Type: "A", Name: "argosy." + testZoneName, Content: "10.0.0.1", TTL: 300}})
+		case http.MethodPatch:
+			decodeBody(t, r, &patched)
+			cfOK(w, dnsRecord{ID: "rec1", Type: patched.Type, Name: patched.Name, Content: patched.Content, TTL: patched.TTL})
+		default:
+			t.Errorf("unexpected %s", r.Method)
+		}
+	}))
+	defer srv.Close()
+
+	p := newDNSWithBase(t, srv.URL, DNSConfig{APIToken: "cf_token", ZoneID: testZoneID})
+	if _, err := p.Ensure(context.Background(), directTarget("100.64.0.7")); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if patched.TTL != 300 {
+		t.Errorf("the existing TTL should be carried across, got %d", patched.TTL)
+	}
+}
+
+// The tunnelled path does pin the TTL: a proxied record must be on automatic.
+func TestDNS_Ensure_TunnelledUpdateSetsAutomaticTTL(t *testing.T) {
+	var patched recordBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cfOK(w, []dnsRecord{{ID: "rec1", Type: "CNAME", Name: "interlock." + testZoneName, Content: "old" + tunnelSuffix, TTL: 300}})
+		case http.MethodPatch:
+			decodeBody(t, r, &patched)
+			cfOK(w, dnsRecord{ID: "rec1", Type: patched.Type, Name: patched.Name, Content: patched.Content, Proxied: patched.Proxied, TTL: patched.TTL})
+		}
+	}))
+	defer srv.Close()
+
+	p := newDNSWithBase(t, srv.URL, DNSConfig{APIToken: "cf_token", ZoneID: testZoneID})
+	if _, err := p.Ensure(context.Background(), tunnelledTarget()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if patched.TTL != ttlAuto || !patched.Proxied {
+		t.Errorf("a proxied record must be on automatic TTL, got ttl=%d proxied=%v", patched.TTL, patched.Proxied)
+	}
+}
+
+// A 404 that is about the request rather than about the record must not read as
+// "already gone" — Teardown would report a deletion it never performed, and the
+// row would be marked removed for a record that is still live.
+func TestDNS_Teardown_UnroutableRequestIsNotAbsence(t *testing.T) {
+	var deletes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletes++
+		}
+		cfFail(w, http.StatusNotFound, 7003, "Could not route to "+r.URL.Path)
+	}))
+	defer srv.Close()
+
+	p := newDNSWithBase(t, srv.URL, DNSConfig{APIToken: "cf_token", ZoneID: testZoneID})
+	err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
+		Hostname: "argosy." + testZoneName, Kind: model.ResourceDNSRecord,
+		ExternalID: "rec1", ParentID: "a-zone-this-token-cannot-address",
+	})
+	if err == nil {
+		t.Fatal("a teardown that could not reach the zone must not report success")
+	}
+	if deletes != 0 {
+		t.Error("it should not have gone on to delete anything")
 	}
 }

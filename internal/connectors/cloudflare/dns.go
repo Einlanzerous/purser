@@ -83,9 +83,12 @@ func (p *DNSProvisioner) unavailable() error {
 // tunnelSuffix is what a cloudflared tunnel's hostname CNAME points at.
 const tunnelSuffix = ".cfargotunnel.com"
 
-// ttlAuto is Cloudflare's "automatic" TTL. Required for a proxied record, and
-// the right answer for an unproxied one too — the spec has no opinion about
-// caching, so it does not get one here either.
+// ttlAuto is Cloudflare's "automatic" TTL, and the value every record this
+// package *creates* gets: required for a proxied one, and the right default for
+// an unproxied one, since the spec has no opinion about caching.
+//
+// Which is exactly why it is a create-time default and not an update-time one —
+// see Ensure, where a direct record's existing TTL is carried across instead.
 const ttlAuto = 1
 
 // perPage bounds the name lookup. See records() for why a full page is refused
@@ -271,11 +274,16 @@ func (p *DNSProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Re
 			return spinup.Resource{}, err
 		}
 		write := want
-		if !want.Proxied {
-			// A direct spec has no opinion about proxying, so an update that is
-			// really about the record's *value* must not also switch the orange
-			// cloud off on a service that is running behind it.
-			write.Proxied = got.Proxied
+		if t.Spec.Mode == spinup.ModeDirect {
+			// A direct spec pins the record's *value* and nothing else, so an
+			// update about the value must carry the rest across rather than
+			// reset it to this file's create-time defaults. Proxying, because
+			// switching the orange cloud off changes how a running service is
+			// reached; TTL, because a human may have set 300 deliberately and
+			// ttlAuto would quietly overwrite it. Neither is compared by
+			// recordMatches or printed by describeRecord, so an operator
+			// approving the plan would never have seen either change.
+			write.Proxied, write.TTL = got.Proxied, got.TTL
 		}
 		updated, err := p.patch(ctx, got.ID, write)
 		if err != nil {
