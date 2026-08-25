@@ -21,9 +21,14 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `Unavailable` (registered-but-unconfigured) + `ErrPending`.
 - `internal/connectors/{switchyard,cloudflare,lyceum,argosy}/` — per-service connectors.
   `cloudflare/` serves **both** axes: the Access `Connector` (person × service)
-  and, on the spin-up axis, `DNSProvisioner` (PRSR-28, `dns.go`) and
-  `AccessProvisioner` (PRSR-29, `access.go`) — over one shared API client in
-  `client.go`. All three have separate Config structs on purpose — see the
+  and, on the spin-up axis, `DNSProvisioner` (PRSR-28, `dns.go`),
+  `AccessProvisioner` (PRSR-29, `access.go`) and `TunnelProvisioner` (PRSR-30,
+  `tunnel.go`) — over one shared API transport in `client.go`. Grouped by
+  **upstream, not by axis**: one API, one token, one place the read-modify-write
+  hazard is solved and the next person to meet it can see the precedent. The axes
+  stay separate where it counts — `spinup` imports neither `connector` nor this
+  package, and a `ServiceProvisioner` and a `Connector` remain two types sharing
+  no fields. All four have separate Config structs on purpose — see the
   invariant below.
 - `internal/invite/` — the orchestrator (`Run`) + credential-block renderer. This
   is where idempotency lives.
@@ -312,6 +317,101 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   run, before any step, so the ingress route and the DNS record cannot end up
   describing different tunnels. Only `prod` is wired; `dev` resolves to a
   refusal rather than falling back — which is the entire point of a named ref.
+- **The terminal catch-all rule stays last, and that is checked rather than
+  assumed.** A tunnel's ingress list ends in a rule matching everything (no
+  hostname, no path — typically `http_status:404`), which cloudflared requires. A
+  rule appended *after* it is never matched and **nothing errors**: the route
+  simply doesn't work, which is why this is asserted on the document before the
+  PUT and again on the read-back, rather than trusted. The generalisation is the
+  same bug one step out — a catch-all that isn't last has already killed every
+  rule behind it, so inserting before the final rule there would land the new
+  route in the dead tail. Both shapes are refused, not repaired: a document
+  Purser doesn't understand is not one to rewrite on a guess. Anything walking
+  ingress entries must also tolerate the missing hostname instead of tripping
+  over it.
+- **The dead tail is a *read*-path rule too, and that is the half that bites.**
+  The write path refusing a malformed document isn't enough on its own, because
+  `Inspect` is the only call a dry run makes and the status of every step is
+  decided from it. A rule behind a catch-all reported as a working route gives
+  the orchestrator `ok`/`adopt` — both `inPlace()` — so the DNS step unblocks and
+  publishes a hostname in front of a tunnel that will 404 it, which is precisely
+  the window `KindOrder` and `dependsOn` exist to close. So `findRoute` stops
+  where cloudflared stops, at the first catch-all, and a rule behind one is not
+  found. And the gate is `documentShape`, not just "is this rule dead": every
+  answer other than *reachable and already correct* is one `--apply` would write
+  from, so a document it will refuse must preview as `unknown` rather than as
+  `create` or `update` — a plan is the first half of the apply, not a guess at it
+  (PRSR-27), and a preview that promises what apply refuses is the same broken
+  promise `connector.CanDeprovision` exists to stop making on `offboard`. A
+  hostname that *is* served on a document broken elsewhere still reports in
+  place, with the malformation named: that resource is already published, so
+  withholding the line protects nobody.
+- **The catch-all is not the only thing that shadows.** cloudflared matches
+  ingress top-down, first match wins, and a rule's hostname may carry `*`
+  wildcards — `*.zerogravity.industries` in front of a holding page is a
+  *documented, deliberate* configuration, so this precondition is likelier than
+  the malformed-document one, not rarer. So the walk stops at the first rule that
+  would take the hostname (`scanRoute`/`shadows`), of which the terminal
+  catch-all is just the case where the pattern is empty. Both paths read through
+  that one helper, which is what keeps them agreeing: without it the read path
+  reports a shadowed rule as a working route, and the write path inserts a new
+  rule into the same dead region and then *confirms* it — a PUT lands, the
+  read-back passes, DNS publishes, and the hostname serves the holding page with
+  nothing erroring anywhere. **A new route is therefore inserted before the first
+  rule that shadows it**, not before the terminal rule; most-specific-first is
+  cloudflared's own idiom and the only position where the route works. And a
+  wildcard is **never adopted as ours** even when it serves exactly what the spec
+  asks: `isRoute` matches literally, because adopting it would have `Teardown`
+  delete a rule standing in front of every other hostname in the zone.
+- **`hostnameTakes` mirrors cloudflared's matcher; it does not approximate it.**
+  It was a general `*`-glob first, and a glob is wrong in two directions at once.
+  The rule, read from `Rule.Matches` in cloudflared's `ingress/rule.go` and
+  `matchHost` in `ingress/ingress.go` rather than inferred: `""` and `"*"` match
+  everything; otherwise exact equality; otherwise, **only** a leading `*.` is a
+  wildcard, and it trims the `*` alone so the suffix tested keeps its dot. So
+  `wiki.*` and `*.*.industries` are *literals* upstream and stop nothing — a glob
+  treating them as patterns reports `create` for a hostname whose real rule is
+  right below, inserts a duplicate in front of it, and calls a serving rule
+  "never matched". And `*.zerogravity.industries` does **not** take the apex
+  `zerogravity.industries`, so an apex route belongs in front of the terminal
+  rule and works there. Both are pinned in `TestHostnameTakes` with the reason on
+  each row; if that matcher is ever rewritten, check the source again rather than
+  reasoning from the shape of the wildcard. cloudflared's own `isCatchAllRule` is
+  `(Hostname == "" || Hostname == "*") && Path == ""` — the same predicate — and
+  its validation rejects a non-last catch-all outright, so refusing that document
+  is agreeing with the thing that has to serve it.
+- **Check that the document is the one in force, not just who else wrote it.**
+  `getConfig` refuses any tunnel whose `source` is not `cloudflare`. A
+  *locally*-managed tunnel is configured by a YAML file on the origin machine, so
+  the remote configuration this endpoint returns is not what it serves — and none
+  of the four write guards can see that, because every one of them is about *who
+  else wrote this document*. Left unchecked the entire sequence succeeds: the read
+  reports "no ingress rule" from a document that is no evidence about what is
+  served, the PUT is stored, the read-back finds the route, and DNS publishes a
+  hostname the tunnel has never heard of, with nothing erroring anywhere. An
+  **absent** `source` is refused too — "we could not tell" is not "it is fine",
+  and this is the oldest invariant on the axis. PRSR-26 established that
+  `construct-server` is remotely managed by hand, once; nothing re-asserted it at
+  run time, converting a tunnel is a dashboard toggle, and PRSR-33 wires a second
+  tunnel whose mode nobody has checked.
+- **The ingress document is written back whole.** `PUT …/configurations`
+  replaces it, so every key omitted is a setting the tunnel loses —
+  `warp-routing`, the tunnel-wide `originRequest`, a per-rule `noTLSVerify`
+  somebody set once by hand. Rules are held as raw JSON per key for exactly that
+  reason: a field this build doesn't model is still one it can hand back
+  byte-for-byte. Don't decode ingress into a tidy struct.
+- **The lost update is the hazard, and one guard doesn't cover it.** There is no
+  per-hostname write, so a stale read doesn't corrupt this service's route — it
+  deletes somebody else's. `TunnelProvisioner.docMu` serializes the
+  read-modify-write the way `groupMu` does for the Access group's email list, and
+  `Ensure`/`Teardown` take their **own fresh read inside that lock** rather than
+  building a write on the plan's `Inspect`, which ran outside it. The read-back
+  then confirms our own route landed — and the configuration's `version` is
+  checked to have moved by exactly one, because that is the only thing that can
+  see a *different process* writing in between: confirming our own route always
+  passes, since our write necessarily contains everything our own read did. A
+  version jump is a warning on a step that succeeded, not a failure of it; what
+  may have been lost is another service's route.
 - **Never treat unverifiable as absent**, here too. A failed `Inspect` is
   `unknown`, and `--apply` does not act on an unknown step: acting on a state
   that couldn't be read creates a second copy of something, or rebuilds a shared
@@ -498,15 +598,26 @@ reason — twice now this project has lost the remaining half of a piece of work
 by closing the ticket that described it (see PRSR-25, below) — so don't delete
 that interface method as dead code; it is waiting on a walk, not unused.
 
-Next on that axis, and independent of each other: **PRSR-29** (Access
-application — `self_hosted` + policy vs `bookmark`, and a `logo_url` that must
-be verified reachable before it is written) and **PRSR-30** (tunnel ingress
-route — insert before the terminal catch-all rule, and guard the shared document
-the way the Access connector guards the group's email list). Then **PRSR-31** —
-the `provision-service` CLI/HTTP surface and Argosy end to end, on the direct
-path, so it needs PRSR-29 but not PRSR-30, and it is the first thing to wire any
-provisioner into `setup()`.
-**PRSR-33** wires the `dev` tunnel ref that PRSR-27 left resolving to a refusal.
+PRSR-30 completes the three: `TunnelProvisioner` in `tunnel.go`, the ingress
+route. It is the step with the blast radius — one shared document per tunnel
+holding every hostname on it — so the invariants above are where the work went:
+insert before the terminal catch-all and assert it stayed last, write every key
+back verbatim, and guard the read-modify-write with a mutex, a fresh read inside
+it, a read-back, and a version check for the writer the read-back cannot see.
+The read path refuses the same documents the write path does, which review
+caught as the half that actually reaches production. It also refuses a tunnel
+that is not remotely managed, because the configuration this endpoint returns is
+then not the one being served, and every other guard in the file is about *who
+else wrote it* rather than whether it is live.
+
+With all three provisioners in, nothing yet wires any of them into `setup()`:
+that is **PRSR-31**, the `provision-service` CLI/HTTP surface, which brings
+Argosy up end to end on the direct path. **PRSR-33** wires the `dev` tunnel ref
+that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
+spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
+the `Teardown` walk, **PRSR-36** the Cloudflare response shapes still read from
+the published schema rather than observed, and **PRSR-37** resolving a service's
+logo from Placard instead of hand-writing the URL into a spec.
 
 **PRSR-36** confirms two Cloudflare response shapes that PRSR-28's fixes are
 currently reasoning about from the published schema rather than from a response

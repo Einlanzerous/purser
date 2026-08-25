@@ -135,11 +135,21 @@ const (
 	// configured. Nothing broke and nothing was done; mirrors
 	// model.TaskUnavailable.
 	StepUnavailable StepStatus = "unavailable"
-	// StepUnknown — the read failed, so the current state could not be
-	// determined. Never collapsed into "absent": acting on an unverifiable
-	// answer is how a spin-up creates a second copy of something, and on the
-	// tunnel it would mean rewriting a shared document from a read that just
-	// failed. Apply does not act on an unknown step.
+	// StepUnknown — the current state could not be determined, so nothing may
+	// be decided from it. Never collapsed into "absent": acting on an
+	// unverifiable answer is how a spin-up creates a second copy of something,
+	// and on the tunnel it would mean rewriting a shared document from a read
+	// that just failed. Apply does not act on an unknown step.
+	//
+	// Two different things reach it, and they want opposite responses from an
+	// operator. Usually the read failed, and re-running is the whole fix. But a
+	// provisioner also reports this for a read that *succeeded* and returned
+	// something it will not act on — the tunnel's ingress document is one
+	// object holding every service's routes, so a shape it cannot write into
+	// safely is refused here rather than previewed as a `create` that `--apply`
+	// then declines (PRSR-30). That one is permanent: re-running repeats it
+	// until somebody fixes what is upstream, and the Err string is where the
+	// difference is spelled out.
 	StepUnknown StepStatus = "unknown"
 	// StepFailed — the write was attempted and errored. Nothing is recorded,
 	// so a re-run reconsiders the step from scratch.

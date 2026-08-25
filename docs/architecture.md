@@ -582,8 +582,9 @@ Tracked under the **PRSR** project (graduated from SERV-33 / IDEA-14).
   user exists; whether `PURSER_SWITCHYARD_TOKEN` is still the instance bootstrap
   token is worth checking rather than asserting.
 - **PRSR-22 — service spin-up** (below). In progress: its prerequisites, its
-  foundation and the DNS provisioner (PRSR-28) have landed; Access and the
-  tunnel route have not, and no command wires any of them yet.
+  foundation and all three provisioners — DNS (PRSR-28), Access (PRSR-29) and
+  the tunnel ingress route (PRSR-30) — have landed; no command wires any of them
+  yet.
 
 ## Service spin-up (epic PRSR-22)
 
@@ -624,6 +625,75 @@ disagree:
   a different one. Specs name a ref (`prod` | `dev`); `TunnelSet` resolves it to
   an id once per run, before any step, so the ingress route and the DNS record
   cannot describe different tunnels. Only `prod` is wired.
+
+**The ingress route (PRSR-30).** `TunnelProvisioner`, in
+`internal/connectors/cloudflare/tunnel.go` — grouped with the Access connector by
+*upstream* rather than by axis, sharing the transport now in `client.go`, which
+is what PRSR-28 and PRSR-29 will reuse. PRSR-26 is what made it ordinary: the
+tunnel is remotely-managed, so `GET`/`PUT
+/accounts/{acct}/cfd_tunnel/{id}/configurations` is the whole mechanism.
+
+It is the step with the blast radius, and it has two distinct failure modes that
+the other two provisioners do not:
+
+- **The document is shared.** There is no per-hostname write — one document per
+  tunnel holds every hostname on it — so a stale read doesn't damage this
+  service's route, it deletes somebody else's. Four guards, covering different
+  windows: a mutex (`docMu`, the same shape as the Access group's `groupMu`); a
+  fresh read taken *inside* it rather than reuse of the plan's `Inspect`, which
+  ran outside; every unmodelled key written back byte-for-byte, because a PUT
+  replaces the document and what it omits the tunnel loses; and a check that the
+  configuration's `version` moved by exactly one. That last one is the only guard
+  that can see a *second process* writing in between — confirming our own route
+  always passes, since our write necessarily contains everything our own read
+  did. A version jump warns on a step that succeeded; what may have been lost is
+  another service's route.
+- **The catch-all must stay last.** cloudflared requires a terminal rule matching
+  everything. A rule appended after it never matches and **nothing errors** — the
+  route just doesn't work — so a new rule is inserted *before* it, and the
+  position is asserted on the built document and again on the read-back. A
+  document that doesn't have that shape (no catch-all, or one that isn't last and
+  has therefore already killed the rules behind it) is refused rather than
+  rewritten on a guess.
+
+  **The read path refuses the same documents**, which is the half that reaches
+  production: `Inspect` is the only call a dry run makes and every step's status
+  comes from it, so a rule behind a catch-all reported as a working route gives
+  `ok`/`adopt` — both `inPlace()` — and the DNS step then publishes a hostname in
+  front of a tunnel that will 404 it. `findRoute` therefore stops where
+  cloudflared stops, and every answer other than *reachable and already correct*
+  is gated on `documentShape`: what `--apply` will refuse must preview as
+  `unknown`, never as `create` or `update`. A hostname that is genuinely served
+  on a document broken elsewhere still reports in place, with the malformation
+  named.
+
+  **And the catch-all is not the only thing that shadows.** A wildcard hostname
+  rule takes everything under it, and a holding page on `*.zerogravity.industries`
+  is a deliberate configuration rather than a broken one — so the walk stops at
+  the first rule that would take the hostname, of which the terminal catch-all is
+  the empty-pattern case. A new route goes in front of that rule rather than in
+  front of the terminal one (most-specific-first, cloudflared's own idiom), and a
+  wildcard is never adopted as Purser's own route: `Teardown` would then delete a
+  rule standing in front of the whole zone.
+
+  `hostnameTakes` mirrors cloudflared's matcher rather than approximating it —
+  `""`/`"*"` match everything, otherwise exact, otherwise only a leading `*.` is
+  a wildcard and the suffix it tests keeps its dot. Read from `ingress/rule.go`
+  and `ingress/ingress.go`, because the general glob it replaced was wrong in
+  both directions: `wiki.*` is a literal upstream and stopped a walk it should
+  not have, and the apex question (`*.zone` does *not* take `zone`) decides
+  whether an apex route is published or dead.
+
+- **Is this the document the tunnel serves?** `getConfig` refuses any tunnel
+  whose `source` is not `cloudflare`. A locally-managed tunnel runs a YAML file
+  on the origin machine, so the remote configuration is not in force — and none
+  of the four guards above can see that, since each is about *who else wrote this
+  document*. Unchecked, the whole sequence succeeds silently and DNS publishes a
+  hostname the tunnel has never heard of. An absent `source` is refused as well.
+  PRSR-26 verified `construct-server` by hand, once; nothing re-asserted it at
+  run time, and PRSR-33 adds a tunnel whose mode nobody has checked.
+
+Nothing wires it into `setup()` yet: the command that would run it is PRSR-31.
 
 ### The tunnelled/direct split reaches three steps
 
@@ -714,12 +784,9 @@ caveat on the *claims*, not on the code. **PRSR-36** carries the probe.
   before it is written: Cloudflare stores any URL and never validates it, so a
   dead one is indistinguishable from an unset one and the launcher silently
   falls back to grey initials.
-- **PRSR-30** — the tunnel ingress route. Insert *before* the terminal catch-all
-  rule (a rule appended after it never matches, and nothing errors), and guard
-  the shared document the way the Access connector guards the group's email list.
 - **PRSR-31** — `purser provision-service` and Argosy end to end. On the direct
-  path, so it needs PRSR-29 but not PRSR-30, and it is what first *wires* a
-  provisioner into the composition root — PRSR-28 shipped the DNS one with no
+  path, so it needs PRSR-28 and PRSR-29 but not PRSR-30. It is what first
+  *wires* a provisioner into the composition root — all three shipped with no
   caller, the way PRSR-27 shipped the orchestrator. The first honest exercise is
   `Ensure` against a service that is already up, reporting no-ops; the DNS half
   of that already runs in `dns_spinup_test.go`, where an Argosy-shaped spec
