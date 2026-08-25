@@ -1,4 +1,4 @@
-package cfaccess
+package cloudflare
 
 import (
 	"context"
@@ -26,10 +26,10 @@ const (
 
 // ─── harness ───────────────────────────────────────────────────────────────
 
-// cfAPI is a fake Cloudflare Access API. It records what was sent so a test can
+// accessAPI is a fake Cloudflare Access API. It records what was sent so a test can
 // assert on the request body — which is the only way to check the PUT-replacement
 // behaviour that this package exists to get right.
-type cfAPI struct {
+type accessAPI struct {
 	apps []map[string]any
 
 	lastMethod string
@@ -50,7 +50,7 @@ type cfAPI struct {
 	listPages int
 }
 
-func (f *cfAPI) server(t *testing.T) *httptest.Server {
+func (f *accessAPI) server(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.lastMethod, f.lastPath = r.Method, r.URL.Path
@@ -111,14 +111,14 @@ func (f *cfAPI) server(t *testing.T) *httptest.Server {
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": created})
 
 		case r.Method == http.MethodPut:
-			updated := map[string]any{"id": lastSegment(r.URL.Path)}
+			updated := map[string]any{"id": lastPathSegment(r.URL.Path)}
 			for k, v := range f.lastBody {
 				updated[k] = v
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": updated})
 
 		case r.Method == http.MethodDelete:
-			f.deleted = append(f.deleted, lastSegment(r.URL.Path))
+			f.deleted = append(f.deleted, lastPathSegment(r.URL.Path))
 			if f.deleteStatus != 0 {
 				w.WriteHeader(f.deleteStatus)
 				_ = json.NewEncoder(w).Encode(map[string]any{
@@ -138,7 +138,7 @@ func (f *cfAPI) server(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func lastSegment(p string) string {
+func lastPathSegment(p string) string {
 	i := strings.LastIndex(p, "/")
 	if i < 0 {
 		return p
@@ -199,7 +199,7 @@ func bookmarkSpec(t *testing.T) spinup.ServiceSpec {
 	return spec
 }
 
-func newProv(t *testing.T, api *cfAPI, cfg Config) *Provisioner {
+func newAccessProv(t *testing.T, api *accessAPI, cfg AccessConfig) *AccessProvisioner {
 	t.Helper()
 	srv := api.server(t)
 	if cfg.APIToken == "" {
@@ -208,13 +208,13 @@ func newProv(t *testing.T, api *cfAPI, cfg Config) *Provisioner {
 	if cfg.AccountID == "" {
 		cfg.AccountID = testAccount
 	}
-	return newWithBase(t, srv.URL, cfg)
+	return newAccessWithBase(t, srv.URL, cfg)
 }
 
 // ─── availability ──────────────────────────────────────────────────────────
 
 func TestInspect_UnconfiguredIsUnavailable(t *testing.T) {
-	p := newProv(t, &cfAPI{}, Config{APIToken: " ", GroupID: testGroup})
+	p := newAccessProv(t, &accessAPI{}, AccessConfig{APIToken: " ", GroupID: testGroup})
 	p.cfg.APIToken = ""
 
 	_, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
@@ -226,7 +226,7 @@ func TestInspect_UnconfiguredIsUnavailable(t *testing.T) {
 // A gated spec needs a group id; a bookmark does not. Getting this wrong the
 // lenient way would create a self_hosted app with no policy.
 func TestAvailability_GatedNeedsGroupBookmarkDoesNot(t *testing.T) {
-	p := newProv(t, &cfAPI{}, Config{}) // no GroupID
+	p := newAccessProv(t, &accessAPI{}, AccessConfig{}) // no GroupID
 
 	if err := p.available(gatedSpec(t, "")); !spinup.IsUnavailable(err) {
 		t.Fatalf("gated spec without a group id should be unavailable, got %v", err)
@@ -240,8 +240,8 @@ func TestAvailability_GatedNeedsGroupBookmarkDoesNot(t *testing.T) {
 // error into StepUnknown, and acting on a state that could not be read is how a
 // spin-up creates a second copy of something.
 func TestInspect_ReadFailureIsAnErrorNotAbsence(t *testing.T) {
-	api := &cfAPI{listStatus: http.StatusForbidden}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	api := &accessAPI{listStatus: http.StatusForbidden}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
 	if err == nil {
@@ -258,7 +258,7 @@ func TestInspect_ReadFailureIsAnErrorNotAbsence(t *testing.T) {
 // ─── inspect ───────────────────────────────────────────────────────────────
 
 func TestInspect_NoApplication(t *testing.T) {
-	p := newProv(t, &cfAPI{}, Config{GroupID: testGroup})
+	p := newAccessProv(t, &accessAPI{}, AccessConfig{GroupID: testGroup})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
 	if err != nil {
@@ -270,7 +270,7 @@ func TestInspect_NoApplication(t *testing.T) {
 }
 
 func TestInspect_GatedMatching(t *testing.T) {
-	api := &cfAPI{apps: []map[string]any{{
+	api := &accessAPI{apps: []map[string]any{{
 		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
 		"app_launcher_visible": true,
 		"policies": []any{map[string]any{
@@ -278,7 +278,7 @@ func TestInspect_GatedMatching(t *testing.T) {
 			"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
 		}},
 	}}}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
 	if err != nil {
@@ -298,12 +298,12 @@ func TestInspect_GatedMatching(t *testing.T) {
 // The failure that matters most: an app that exists and looks right but whose
 // policy does not admit the members group is a gate in name only.
 func TestInspect_GatedWithoutMembersPolicyDoesNotMatch(t *testing.T) {
-	api := &cfAPI{apps: []map[string]any{{
+	api := &accessAPI{apps: []map[string]any{{
 		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
 		"app_launcher_visible": true,
 		"policies":             []any{},
 	}}}
-	p := newProv(t, api, Config{GroupID: testGroup, GroupName: "zerogravity-members"})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, GroupName: "zerogravity-members"})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
 	if err != nil {
@@ -320,12 +320,12 @@ func TestInspect_GatedWithoutMembersPolicyDoesNotMatch(t *testing.T) {
 // A bookmark's domain carries a scheme; a self_hosted app's does not. Matching
 // compares the host so the same hostname is recognised either way.
 func TestInspect_BookmarkDomainWithSchemeMatchesHostname(t *testing.T) {
-	api := &cfAPI{apps: []map[string]any{{
+	api := &accessAPI{apps: []map[string]any{{
 		"id": "app-b", "type": "bookmark", "name": "Argosy",
 		"domain": "https://" + testHost, "app_launcher_visible": true,
 		"policies": []any{},
 	}}}
-	p := newProv(t, api, Config{})
+	p := newAccessProv(t, api, AccessConfig{})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: bookmarkSpec(t)})
 	if err != nil {
@@ -340,7 +340,7 @@ func TestInspect_BookmarkDomainWithSchemeMatchesHostname(t *testing.T) {
 // 404s. A string comparison alone reports "ok" for an app showing grey initials.
 func TestInspect_LogoUrlMatchesButDoesNotLoad(t *testing.T) {
 	dead := logoServer(t, http.StatusNotFound, "text/plain")
-	api := &cfAPI{apps: []map[string]any{{
+	api := &accessAPI{apps: []map[string]any{{
 		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
 		"app_launcher_visible": true, "logo_url": dead.URL,
 		"policies": []any{map[string]any{
@@ -348,7 +348,7 @@ func TestInspect_LogoUrlMatchesButDoesNotLoad(t *testing.T) {
 			"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
 		}},
 	}}}
-	p := newProv(t, api, Config{GroupID: testGroup, LogoClient: dead.Client()})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: dead.Client()})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, dead.URL)})
 	if err != nil {
@@ -366,7 +366,7 @@ func TestInspect_LogoUrlMatchesButDoesNotLoad(t *testing.T) {
 // status-only check would pass it, and the launcher would show initials.
 func TestCheckLogo_HTMLLoginPageIsBroken(t *testing.T) {
 	gated := logoServer(t, http.StatusOK, "text/html; charset=utf-8")
-	p := New(Config{LogoClient: gated.Client()})
+	p := NewAccess(AccessConfig{LogoClient: gated.Client()})
 
 	verdict, err := p.checkLogo(context.Background(), gated.URL)
 	if verdict != logoBroken {
@@ -397,7 +397,7 @@ func TestCheckLogo_SeparatesBrokenFromUnknown(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := New(Config{LogoClient: tc.cl})
+			p := NewAccess(AccessConfig{LogoClient: tc.cl})
 			if got, _ := p.checkLogo(context.Background(), tc.url); got != tc.want {
 				t.Fatalf("verdict = %v, want %v", got, tc.want)
 			}
@@ -409,8 +409,8 @@ func TestCheckLogo_SeparatesBrokenFromUnknown(t *testing.T) {
 
 func TestEnsure_CreatesGatedAppWithPolicyAndLogo(t *testing.T) {
 	logo := logoServer(t, http.StatusOK, "image/png")
-	api := &cfAPI{}
-	p := newProv(t, api, Config{GroupID: testGroup, GroupName: "zerogravity-members", LogoClient: logo.Client()})
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, GroupName: "zerogravity-members", LogoClient: logo.Client()})
 
 	res, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)})
 	if err != nil {
@@ -442,8 +442,8 @@ func TestEnsure_CreatesGatedAppWithPolicyAndLogo(t *testing.T) {
 // DNS and leave the service unpublished.
 func TestEnsure_BrokenLogoIsOmittedNotFatal(t *testing.T) {
 	dead := logoServer(t, http.StatusNotFound, "text/plain")
-	api := &cfAPI{}
-	p := newProv(t, api, Config{GroupID: testGroup, LogoClient: dead.Client()})
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: dead.Client()})
 
 	res, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, dead.URL)})
 	if err != nil {
@@ -465,7 +465,7 @@ func TestEnsure_BrokenLogoIsOmittedNotFatal(t *testing.T) {
 // the very thing that gates it.
 func TestEnsure_UpdatePreservesUnmodelledFieldsAndStripsServerOwned(t *testing.T) {
 	logo := logoServer(t, http.StatusOK, "image/png")
-	api := &cfAPI{apps: []map[string]any{{
+	api := &accessAPI{apps: []map[string]any{{
 		"id": "app-1", "uid": "u-1", "aud": "aud-1",
 		"created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z",
 		"type": "self_hosted", "name": "Old Name", "domain": testHost,
@@ -474,7 +474,7 @@ func TestEnsure_UpdatePreservesUnmodelledFieldsAndStripsServerOwned(t *testing.T
 		"custom_deny_message":  "go away",
 		"policies":             []any{},
 	}}}
-	p := newProv(t, api, Config{GroupID: testGroup, LogoClient: logo.Client()})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
 
 	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)}); err != nil {
 		t.Fatalf("ensure: %v", err)
@@ -499,8 +499,8 @@ func TestEnsure_UpdatePreservesUnmodelledFieldsAndStripsServerOwned(t *testing.T
 }
 
 func TestEnsure_BookmarkGetsSchemeDomainAndNoPolicy(t *testing.T) {
-	api := &cfAPI{}
-	p := newProv(t, api, Config{})
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{})
 
 	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: bookmarkSpec(t)}); err != nil {
 		t.Fatalf("ensure: %v", err)
@@ -521,12 +521,12 @@ func TestEnsure_BookmarkGetsSchemeDomainAndNoPolicy(t *testing.T) {
 // Collapsing "could not check" into "broken" would erase a working icon every
 // time the CDN blinked.
 func TestEnsure_UncheckableLogoIsLeftAlone(t *testing.T) {
-	api := &cfAPI{apps: []map[string]any{{
+	api := &accessAPI{apps: []map[string]any{{
 		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
 		"app_launcher_visible": true, "logo_url": unreachableURL,
 		"policies": []any{},
 	}}}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	res, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, unreachableURL)})
 	if err != nil {
@@ -544,7 +544,7 @@ func TestEnsure_UncheckableLogoIsLeftAlone(t *testing.T) {
 // full-replacement PUT of the whole application, which is not something to
 // trigger on a failed fetch.
 func TestInspect_UncheckableLogoIsANoteNotDrift(t *testing.T) {
-	api := &cfAPI{apps: []map[string]any{{
+	api := &accessAPI{apps: []map[string]any{{
 		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
 		"app_launcher_visible": true, "logo_url": unreachableURL,
 		"policies": []any{map[string]any{
@@ -552,7 +552,7 @@ func TestInspect_UncheckableLogoIsANoteNotDrift(t *testing.T) {
 			"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
 		}},
 	}}}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, unreachableURL)})
 	if err != nil {
@@ -571,7 +571,7 @@ func TestInspect_UncheckableLogoIsANoteNotDrift(t *testing.T) {
 // get a second one built on top of it, which is the opposite of the
 // already-exists-is-success rule.
 func TestFindApp_PaginatesRatherThanReportingAbsence(t *testing.T) {
-	api := &cfAPI{perPage: 10}
+	api := &accessAPI{perPage: 10}
 	for i := 0; i < 25; i++ {
 		api.apps = append(api.apps, map[string]any{
 			"id": "other-" + strconv.Itoa(i), "type": "self_hosted",
@@ -587,7 +587,7 @@ func TestFindApp_PaginatesRatherThanReportingAbsence(t *testing.T) {
 			"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
 		}},
 	})
-	p := newProv(t, api, Config{GroupID: testGroup})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
 	if err != nil {
@@ -607,10 +607,10 @@ func TestFindApp_PaginatesRatherThanReportingAbsence(t *testing.T) {
 // An endpoint that sends no result_info is one that does not paginate: read it
 // once and stop, rather than looping on a page parameter it ignores.
 func TestFindApp_NoResultInfoMeansOnePage(t *testing.T) {
-	api := &cfAPI{apps: []map[string]any{{
+	api := &accessAPI{apps: []map[string]any{{
 		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
 	}}}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	if _, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")}); err != nil {
 		t.Fatalf("inspect: %v", err)
@@ -623,8 +623,8 @@ func TestFindApp_NoResultInfoMeansOnePage(t *testing.T) {
 // ─── teardown ──────────────────────────────────────────────────────────────
 
 func TestTeardown_DeletesRecordedID(t *testing.T) {
-	api := &cfAPI{}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-1"})
@@ -637,8 +637,8 @@ func TestTeardown_DeletesRecordedID(t *testing.T) {
 }
 
 func TestTeardown_RefusesWithoutARecordedID(t *testing.T) {
-	api := &cfAPI{}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{})
@@ -653,8 +653,8 @@ func TestTeardown_RefusesWithoutARecordedID(t *testing.T) {
 // Already gone is success — but only once we have checked that nothing else is
 // still serving the hostname.
 func TestTeardown_AlreadyGoneIsSuccess(t *testing.T) {
-	api := &cfAPI{deleteStatus: http.StatusNotFound}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	api := &accessAPI{deleteStatus: http.StatusNotFound}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-gone"})
@@ -667,13 +667,13 @@ func TestTeardown_AlreadyGoneIsSuccess(t *testing.T) {
 // record is wrong, not that access is gone. Reporting success there would leave
 // a gate standing while Purser recorded it removed.
 func TestTeardown_StaleRecordWithLiveAppIsAnError(t *testing.T) {
-	api := &cfAPI{
+	api := &accessAPI{
 		deleteStatus: http.StatusNotFound,
 		apps: []map[string]any{{
 			"id": "app-real", "type": "self_hosted", "name": "Argosy", "domain": testHost,
 		}},
 	}
-	p := newProv(t, api, Config{GroupID: testGroup})
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-stale"})
@@ -688,12 +688,12 @@ func TestTeardown_StaleRecordWithLiveAppIsAnError(t *testing.T) {
 // ─── interface conformance ─────────────────────────────────────────────────
 
 func TestImplementsServiceProvisioner(t *testing.T) {
-	var _ spinup.ServiceProvisioner = New(Config{})
+	var _ spinup.ServiceProvisioner = NewAccess(AccessConfig{})
 
-	if got := New(Config{}).Kind(); got != model.ResourceAccessApp {
+	if got := NewAccess(AccessConfig{}).Kind(); got != model.ResourceAccessApp {
 		t.Fatalf("kind = %q", got)
 	}
 	// The registry panics on a kind outside model.KindOrder, so this is also the
 	// check that the provisioner can actually be wired.
-	spinup.NewRegistry(New(Config{}))
+	spinup.NewRegistry(NewAccess(AccessConfig{}))
 }

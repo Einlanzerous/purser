@@ -1,11 +1,20 @@
-// Package cfaccess provisions the Cloudflare Access surface for a service on the
-// spin-up axis (PRSR-29, epic PRSR-22).
+package cloudflare
+
+// This file is the service spin-up axis's Access step (PRSR-29): the Cloudflare
+// Access application that gates — or merely advertises — a service's hostname.
 //
-// It is a spinup.ServiceProvisioner, not a connector.Connector: it is keyed on a
-// hostname rather than on a person, and it creates the thing that gates a
-// service rather than granting somebody entry to one. internal/connectors/cloudflare
-// is the other half — it adds a person's email to the Access *group* this
-// package's policies allow.
+// It is a spinup.ServiceProvisioner, not a connector.Connector, and the
+// difference is visible against its neighbour in this package. cloudflare.go
+// provisions a *person* into the shared Access group and is idempotent per
+// (person × service); this provisions a *hostname* and is idempotent per
+// (hostname, kind). The two meet at the group: the policy written here is what
+// the emails added there are admitted by.
+//
+// It shares client.go with the Access connector and the DNS provisioner, and
+// like DNSConfig it keeps its own config — an Access application needs the
+// account and the group, a DNS record needs the zone, and folding either into
+// the other's readiness check would take a working surface offline over a
+// setting it never reads.
 //
 // # Two application types, not one
 //
@@ -45,16 +54,14 @@
 //
 // # Nothing here has ever contacted Cloudflare
 //
-// Every test in this package is httptest against a hand-written fake, which is
-// true of every connector in this repo (see REVIEW.md). The request shapes come
+// Every test covering this file is httptest against a hand-written fake, which
+// is true of every connector in this repo (see REVIEW.md). The request shapes come
 // from the live audit recorded on PRSR-29 and from Cloudflare's documentation;
 // where behaviour is inferred rather than observed the comment says so. Read
 // this package as "what we believe the API accepts", and treat the first real
 // run as the test that has not been run.
-package cfaccess
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -67,10 +74,8 @@ import (
 	"github.com/Einlanzerous/purser/internal/spinup"
 )
 
-const apiBase = "https://api.cloudflare.com/client/v4"
-
-// Config configures the Access-application provisioner.
-type Config struct {
+// AccessConfig configures the Access-application provisioner.
+type AccessConfig struct {
 	// APIToken needs Account → Access: Apps and Policies → Edit. The same token
 	// the person-axis Cloudflare connector uses already carries it (SERV-36).
 	APIToken string
@@ -95,36 +100,36 @@ type Config struct {
 	LogoClient *http.Client
 }
 
-// Provisioner manages the Cloudflare Access application for a hostname.
-type Provisioner struct {
-	cfg     Config
-	http    *http.Client
-	logo    *http.Client
-	baseURL string // overridden in tests
+// AccessProvisioner manages the Cloudflare Access application for a hostname.
+type AccessProvisioner struct {
+	cfg  AccessConfig
+	api  *client
+	logo *http.Client
 }
 
-// New builds the provisioner. Like the person-axis connectors it never fails on
-// missing credentials: an unconfigured provisioner is valid and reports
+// NewAccess builds the provisioner. Like the person-axis connectors it never
+// fails on missing credentials: an unconfigured provisioner is valid and reports
 // spinup.ErrUnavailable when asked to act, so a spin-up plan says "Cloudflare is
 // not configured" instead of "no provisioner for access_app", which reads like a
 // missing build.
-func New(cfg Config) *Provisioner {
-	hc := cfg.HTTPClient
-	if hc == nil {
-		hc = &http.Client{Timeout: 15 * time.Second}
-	}
+func NewAccess(cfg AccessConfig) *AccessProvisioner {
 	lc := cfg.LogoClient
 	if lc == nil {
 		lc = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &Provisioner{cfg: cfg, http: hc, logo: lc, baseURL: apiBase}
+	return &AccessProvisioner{cfg: cfg, api: newClient(cfg.APIToken, cfg.HTTPClient), logo: lc}
 }
 
+// Compile-time proof this is the shape the orchestrator walks, matching
+// DNSProvisioner above. Without it a signature drift would surface at the
+// composition root rather than here.
+var _ spinup.ServiceProvisioner = (*AccessProvisioner)(nil)
+
 // Kind is the resource kind this provisioner owns.
-func (p *Provisioner) Kind() model.ResourceKind { return model.ResourceAccessApp }
+func (p *AccessProvisioner) Kind() model.ResourceKind { return model.ResourceAccessApp }
 
 // DisplayName is the label the plan uses for this step.
-func (p *Provisioner) DisplayName() string { return "Access application" }
+func (p *AccessProvisioner) DisplayName() string { return "Access application" }
 
 // available reports whether this provisioner can act on the given spec, from
 // config alone and contacting nothing.
@@ -137,7 +142,7 @@ func (p *Provisioner) DisplayName() string { return "Access application" }
 // app that admits nobody, or worse, depending on account defaults. Refusing up
 // front means the DNS step stays blocked and the hostname never goes live
 // half-gated.
-func (p *Provisioner) available(spec spinup.ServiceSpec) error {
+func (p *AccessProvisioner) available(spec spinup.ServiceSpec) error {
 	var missing []string
 	if p.cfg.APIToken == "" {
 		missing = append(missing, "PURSER_CF_API_TOKEN")
@@ -158,7 +163,7 @@ func (p *Provisioner) available(spec spinup.ServiceSpec) error {
 // Inspect reports the current Access application for the hostname. Read-only:
 // it lists applications and, at most, fetches the logo URL with GET. It creates,
 // updates and deletes nothing.
-func (p *Provisioner) Inspect(ctx context.Context, t spinup.Target) (spinup.State, error) {
+func (p *AccessProvisioner) Inspect(ctx context.Context, t spinup.Target) (spinup.State, error) {
 	if err := p.available(t.Spec); err != nil {
 		return spinup.State{}, err
 	}
@@ -172,17 +177,17 @@ func (p *Provisioner) Inspect(ctx context.Context, t spinup.Target) (spinup.Stat
 
 	st := spinup.State{
 		Exists:     true,
-		ExternalID: str(found, "id"),
+		ExternalID: appStr(found, "id"),
 		ParentID:   p.cfg.AccountID,
 	}
 	diffs, notes := p.diff(ctx, found, t.Spec)
 	st.Matches = len(diffs) == 0
-	st.Detail = describe(found, append(diffs, notes...))
+	st.Detail = describeApp(found, append(diffs, notes...))
 	return st, nil
 }
 
 // Ensure creates or updates the Access application so it matches the spec.
-func (p *Provisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Resource, error) {
+func (p *AccessProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Resource, error) {
 	if err := p.available(t.Spec); err != nil {
 		return spinup.Resource{}, err
 	}
@@ -194,7 +199,7 @@ func (p *Provisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Resou
 	// The current value matters: it is what an unreadable check falls back to,
 	// so a CDN blip carries the existing icon forward instead of clearing it.
 	// str tolerates a nil found, which is the create path — nothing to carry.
-	logo, logoNote := p.resolveLogo(ctx, t.Spec.LogoURL, str(found, "logo_url"))
+	logo, logoNote := p.resolveLogo(ctx, t.Spec.LogoURL, appStr(found, "logo_url"))
 
 	if found == nil {
 		created, err := p.createApp(ctx, p.desiredApp(nil, t.Spec, logo))
@@ -202,22 +207,22 @@ func (p *Provisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Resou
 			return spinup.Resource{}, err
 		}
 		return spinup.Resource{
-			ExternalID: str(created, "id"),
+			ExternalID: appStr(created, "id"),
 			ParentID:   p.cfg.AccountID,
-			Detail:     joinNote(describe(created, nil), logoNote),
+			Detail:     joinNote(describeApp(created, nil), logoNote),
 		}, nil
 	}
 
 	// Already exists: merge onto what is there and PUT the whole object back.
-	id := str(found, "id")
+	id := appStr(found, "id")
 	updated, err := p.updateApp(ctx, id, p.desiredApp(found, t.Spec, logo))
 	if err != nil {
 		return spinup.Resource{}, err
 	}
 	return spinup.Resource{
-		ExternalID: firstNonEmpty(str(updated, "id"), id),
+		ExternalID: firstNonEmpty(appStr(updated, "id"), id),
 		ParentID:   p.cfg.AccountID,
-		Detail:     joinNote(describe(updated, nil), logoNote),
+		Detail:     joinNote(describeApp(updated, nil), logoNote),
 	}, nil
 }
 
@@ -225,42 +230,59 @@ func (p *Provisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Resou
 //
 // It targets rec.ExternalID rather than looking the hostname up, because
 // deleting an Access application somebody created by hand is not recoverable by
-// re-running. A 404 against that id is the interesting case and is handled the
-// way the person axis handles it (see the `offboard` invariants): it is treated
-// as "this record is wrong", not as "there is nothing here" — so before
-// reporting success this re-reads by hostname, and refuses if some *other*
-// application is still gating it. Claiming a teardown that left a live gate in
-// place is the failure that outlives its error message.
-func (p *Provisioner) Teardown(ctx context.Context, t spinup.Target, rec model.ServiceResource) error {
+// re-running — the recorded id is the only handle Purser can prove it owns.
+//
+// # Absence is confirmed by reading, not by an error code
+//
+// The DNS provisioner decides "already gone" from Cloudflare's error code
+// (dnsRecordNotFound, 81044), and deliberately not from a bare 404, because a
+// 404 is also how the API answers a request it could not route. That reasoning
+// applies here too — but 81044 is DNS's code and there is no *observed* Access
+// equivalent, and the invariant is explicit that a guessed code turns an
+// unrelated failure into a reported deletion.
+//
+// So this does not guess one. On any failed delete it re-reads the hostname and
+// lets the answer decide:
+//
+//   - nothing serves the hostname → the application really is gone, and the
+//     delete failed because there was nothing to delete. Success.
+//   - something still serves it → whatever went wrong, the gate is still up.
+//     Refuse, and name the application that is still there.
+//   - the re-read itself failed → unverifiable, which is never absent. Say the
+//     removal could not be confirmed.
+//
+// That is stronger than a code test rather than a workaround for lacking one: it
+// asserts the thing Teardown actually claims. It also covers the case a code
+// test cannot — a delete that failed at the transport after Cloudflare had
+// already applied it.
+func (p *AccessProvisioner) Teardown(ctx context.Context, t spinup.Target, rec model.ServiceResource) error {
 	if err := p.available(t.Spec); err != nil {
 		return err
 	}
 	if rec.ExternalID == "" {
-		return fmt.Errorf("cfaccess: no recorded application id for %s — refusing to guess by hostname", t.Spec.Hostname)
+		return fmt.Errorf("cloudflare: no recorded Access application id for %s — Purser deletes only ids it recorded, since an application found by hostname may be one somebody created by hand",
+			t.Spec.Hostname)
 	}
 
 	path := fmt.Sprintf("/accounts/%s/access/apps/%s", p.cfg.AccountID, rec.ExternalID)
-	_, status, err := p.do(ctx, http.MethodDelete, path, nil)
-	if err == nil {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return err
-	}
-
-	// The recorded id is gone. Either the app was already deleted — success — or
-	// the row points at the wrong object and the real one is still live.
-	found, lookupErr := p.findApp(ctx, t.Spec.Hostname)
-	if lookupErr != nil {
-		// Unverifiable is never absent: say the delete could not be confirmed
-		// rather than reporting a removal nobody checked.
-		return fmt.Errorf("cfaccess: recorded application %s is gone, but %s could not be re-checked: %w", rec.ExternalID, t.Spec.Hostname, lookupErr)
-	}
-	if found != nil {
-		return fmt.Errorf("cfaccess: recorded application %s no longer exists, but %q is still served by application %s — the record is wrong, and removing the right one is not something this should guess at",
-			rec.ExternalID, t.Spec.Hostname, str(found, "id"))
+	if _, err := p.api.do(ctx, http.MethodDelete, path, nil); err != nil {
+		return p.confirmGone(ctx, t.Spec.Hostname, rec.ExternalID, err)
 	}
 	return nil
+}
+
+// confirmGone decides what a failed delete meant, by reading the hostname back.
+func (p *AccessProvisioner) confirmGone(ctx context.Context, hostname, recordedID string, cause error) error {
+	found, lookupErr := p.findApp(ctx, hostname)
+	switch {
+	case lookupErr != nil:
+		return fmt.Errorf("cloudflare: deleting Access application %s failed (%v), and %s could not be re-read to find out whether it is gone: %w",
+			recordedID, cause, hostname, lookupErr)
+	case found != nil:
+		return fmt.Errorf("cloudflare: deleting Access application %s failed (%v), and %q is still served by application %s — the gate is still up",
+			recordedID, cause, hostname, appStr(found, "id"))
+	}
+	return nil // nothing serves the hostname: it really is gone
 }
 
 // ─── the application object ────────────────────────────────────────────────
@@ -298,7 +320,7 @@ var serverOwned = []string{"id", "uid", "aud", "created_at", "updated_at"}
 //
 // base is nil for a create and the current object for an update. Everything not
 // named here is carried through untouched — see rawApp.
-func (p *Provisioner) desiredApp(base rawApp, spec spinup.ServiceSpec, logo string) rawApp {
+func (p *AccessProvisioner) desiredApp(base rawApp, spec spinup.ServiceSpec, logo string) rawApp {
 	out := rawApp{}
 	for k, v := range base {
 		out[k] = v
@@ -335,7 +357,7 @@ func (p *Provisioner) desiredApp(base rawApp, spec spinup.ServiceSpec, logo stri
 // (PRSR-29). Cloudflare also exposes /accounts/{a}/access/apps/{id}/policies;
 // if the inline form turns out to be rejected, that endpoint is the fallback and
 // this is the one function that would move.
-func (p *Provisioner) membersPolicy() map[string]any {
+func (p *AccessProvisioner) membersPolicy() map[string]any {
 	name := p.cfg.GroupName
 	if name == "" {
 		name = "members"
@@ -379,15 +401,15 @@ func appDomain(spec spinup.ServiceSpec) string {
 // Returned as a list of human phrases rather than a bool so the plan can say
 // *what* is wrong: "update" on its own tells an operator nothing about whether
 // they are about to fix a logo or convert a gate into a bookmark.
-func (p *Provisioner) diff(ctx context.Context, live rawApp, spec spinup.ServiceSpec) (diffs, notes []string) {
+func (p *AccessProvisioner) diff(ctx context.Context, live rawApp, spec spinup.ServiceSpec) (diffs, notes []string) {
 
-	if got, want := str(live, "type"), appType(spec.Access); got != want {
+	if got, want := appStr(live, "type"), appType(spec.Access); got != want {
 		diffs = append(diffs, fmt.Sprintf("type is %q, spec wants %q", got, want))
 	}
-	if got, want := str(live, "name"), spec.DisplayName; got != want {
+	if got, want := appStr(live, "name"), spec.DisplayName; got != want {
 		diffs = append(diffs, fmt.Sprintf("name is %q, spec wants %q", got, want))
 	}
-	if got, want := domainHost(str(live, "domain")), spec.Hostname; got != want {
+	if got, want := domainHost(appStr(live, "domain")), spec.Hostname; got != want {
 		diffs = append(diffs, fmt.Sprintf("domain resolves to %q, spec wants %q", got, want))
 	}
 	if v, ok := live["app_launcher_visible"].(bool); ok && !v {
@@ -402,7 +424,7 @@ func (p *Provisioner) diff(ctx context.Context, live rawApp, spec spinup.Service
 		diffs = append(diffs, fmt.Sprintf("no policy admits the members group (%s)", p.displayGroup()))
 	}
 
-	logoDiffs, logoNotes := p.logoDiff(ctx, str(live, "logo_url"), spec.LogoURL)
+	logoDiffs, logoNotes := p.logoDiff(ctx, appStr(live, "logo_url"), spec.LogoURL)
 	return append(diffs, logoDiffs...), append(notes, logoNotes...)
 }
 
@@ -419,7 +441,7 @@ func (p *Provisioner) diff(ctx context.Context, live rawApp, spec spinup.Service
 // would mark the step StepUpdate over a network blip, and an update here is a
 // full-replacement PUT of the whole application — not something to trigger on
 // evidence this thin.
-func (p *Provisioner) logoDiff(ctx context.Context, live, want string) (diffs, notes []string) {
+func (p *AccessProvisioner) logoDiff(ctx context.Context, live, want string) (diffs, notes []string) {
 	switch {
 	case want == "" && live == "":
 		return nil, nil
@@ -537,7 +559,7 @@ const (
 // in the *viewer's* browser, so the only check that means anything is the one
 // made as the sessionless public. An asset behind an Access gate answers with an
 // HTML login page, which is a 200 — the content-type test is what catches it.
-func (p *Provisioner) checkLogo(ctx context.Context, url string) (logoVerdict, error) {
+func (p *AccessProvisioner) checkLogo(ctx context.Context, url string) (logoVerdict, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		// Not a URL that can ever be fetched. Definite.
@@ -590,7 +612,7 @@ func (p *Provisioner) checkLogo(ctx context.Context, url string) (logoVerdict, e
 // because the spec still asks for a logo, the next Inspect keeps reporting drift
 // until the asset really is published: a visible, converging "still not right"
 // rather than a silent permanent wrong value.
-func (p *Provisioner) resolveLogo(ctx context.Context, want, current string) (string, string) {
+func (p *AccessProvisioner) resolveLogo(ctx context.Context, want, current string) (string, string) {
 	if want == "" {
 		// The spec asks for no icon. Clearing is intended, not a fallback.
 		return "", ""
@@ -612,13 +634,13 @@ func (p *Provisioner) resolveLogo(ctx context.Context, want, current string) (st
 // ─── describing what is there ──────────────────────────────────────────────
 
 // describe renders the line an operator reads in the plan.
-func describe(app rawApp, diffs []string) string {
-	kind := str(app, "type")
+func describeApp(app rawApp, diffs []string) string {
+	kind := appStr(app, "type")
 	if kind == "" {
 		kind = "application"
 	}
-	base := fmt.Sprintf("%s %q → %s", kind, str(app, "name"), str(app, "domain"))
-	if logo := str(app, "logo_url"); logo != "" {
+	base := fmt.Sprintf("%s %q → %s", kind, appStr(app, "name"), appStr(app, "domain"))
+	if logo := appStr(app, "logo_url"); logo != "" {
 		base += ", logo set"
 	} else {
 		base += ", no logo"
@@ -629,7 +651,7 @@ func describe(app rawApp, diffs []string) string {
 	return base + "; " + strings.Join(diffs, "; ")
 }
 
-func (p *Provisioner) displayGroup() string {
+func (p *AccessProvisioner) displayGroup() string {
 	if p.cfg.GroupName != "" {
 		return p.cfg.GroupName
 	}
@@ -643,17 +665,8 @@ func joinNote(detail, note string) string {
 	return detail + " — " + note
 }
 
-func firstNonEmpty(vs ...string) string {
-	for _, v := range vs {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
 // str reads a string field, tolerating absence and a non-string value.
-func str(m rawApp, key string) string {
+func appStr(m rawApp, key string) string {
 	if m == nil {
 		return ""
 	}
@@ -663,12 +676,12 @@ func str(m rawApp, key string) string {
 
 // ─── the API ───────────────────────────────────────────────────────────────
 
-// listPerPage is the page size requested when listing applications, and
-// maxListPages is a runaway guard — an account with more than 2,000 Access
+// accessAppsPerPage is the page size requested when listing applications, and
+// maxAccessAppPages is a runaway guard — an account with more than 2,000 Access
 // applications is a different problem from the one this is solving.
 const (
-	listPerPage  = 50
-	maxListPages = 40
+	accessAppsPerPage = 50
+	maxAccessAppPages = 40
 )
 
 // findApp returns the application serving hostname, or nil if there is none.
@@ -698,10 +711,10 @@ const (
 // full page for ever, and a loop that trusted fullness would never terminate.
 // Absent result_info means one page, which is the right reading of an endpoint
 // that does not paginate.
-func (p *Provisioner) findApp(ctx context.Context, hostname string) (rawApp, error) {
-	for page := 1; page <= maxListPages; page++ {
-		path := fmt.Sprintf("/accounts/%s/access/apps?page=%d&per_page=%d", p.cfg.AccountID, page, listPerPage)
-		raw, _, err := p.do(ctx, http.MethodGet, path, nil)
+func (p *AccessProvisioner) findApp(ctx context.Context, hostname string) (rawApp, error) {
+	for page := 1; page <= maxAccessAppPages; page++ {
+		path := fmt.Sprintf("/accounts/%s/access/apps?page=%d&per_page=%d", p.cfg.AccountID, page, accessAppsPerPage)
+		raw, err := p.api.do(ctx, http.MethodGet, path, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -713,10 +726,10 @@ func (p *Provisioner) findApp(ctx context.Context, hostname string) (rawApp, err
 			} `json:"result_info"`
 		}
 		if err := json.Unmarshal(raw, &env); err != nil {
-			return nil, fmt.Errorf("cfaccess: decode applications: %w", err)
+			return nil, fmt.Errorf("cloudflare: decode applications: %w", err)
 		}
 		for _, app := range env.Result {
-			if domainHost(str(app, "domain")) == hostname {
+			if domainHost(appStr(app, "domain")) == hostname {
 				return app, nil
 			}
 		}
@@ -727,12 +740,12 @@ func (p *Provisioner) findApp(ctx context.Context, hostname string) (rawApp, err
 	// Ran out of pages to read. Reported rather than answered: "not found" here
 	// would send Ensure off to create a duplicate, which is the one outcome this
 	// whole function exists to avoid.
-	return nil, fmt.Errorf("cfaccess: gave up listing applications for %s after %d pages — refusing to report it absent on a partial read", hostname, maxListPages)
+	return nil, fmt.Errorf("cloudflare: gave up listing applications for %s after %d pages — refusing to report it absent on a partial read", hostname, maxAccessAppPages)
 }
 
-func (p *Provisioner) createApp(ctx context.Context, body rawApp) (rawApp, error) {
+func (p *AccessProvisioner) createApp(ctx context.Context, body rawApp) (rawApp, error) {
 	path := fmt.Sprintf("/accounts/%s/access/apps", p.cfg.AccountID)
-	raw, _, err := p.do(ctx, http.MethodPost, path, body)
+	raw, err := p.api.do(ctx, http.MethodPost, path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -740,9 +753,9 @@ func (p *Provisioner) createApp(ctx context.Context, body rawApp) (rawApp, error
 }
 
 // updateApp replaces the application. PUT, not PATCH — see rawApp.
-func (p *Provisioner) updateApp(ctx context.Context, id string, body rawApp) (rawApp, error) {
+func (p *AccessProvisioner) updateApp(ctx context.Context, id string, body rawApp) (rawApp, error) {
 	path := fmt.Sprintf("/accounts/%s/access/apps/%s", p.cfg.AccountID, id)
-	raw, _, err := p.do(ctx, http.MethodPut, path, body)
+	raw, err := p.api.do(ctx, http.MethodPut, path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -754,59 +767,7 @@ func decodeApp(raw []byte) (rawApp, error) {
 		Result rawApp `json:"result"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("cfaccess: decode application: %w", err)
+		return nil, fmt.Errorf("cloudflare: decode application: %w", err)
 	}
 	return env.Result, nil
-}
-
-// do performs a Cloudflare API request, returning the raw body and the HTTP
-// status. The status is returned alongside the error because Teardown has to
-// tell a 404 from every other failure, and the {"success":false} envelope does
-// not carry it.
-func (p *Provisioner) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
-	var reader io.Reader
-	if body != nil {
-		buf, err := json.Marshal(body)
-		if err != nil {
-			return nil, 0, fmt.Errorf("cfaccess: marshal body: %w", err)
-		}
-		reader = bytes.NewReader(buf)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, p.baseURL+path, reader)
-	if err != nil {
-		return nil, 0, fmt.Errorf("cfaccess: new request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+p.cfg.APIToken)
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := p.http.Do(req)
-	if err != nil {
-		return nil, 0, fmt.Errorf("cfaccess: %s %s: %w", method, path, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("cfaccess: read body: %w", err)
-	}
-
-	var env struct {
-		Success bool `json:"success"`
-		Errors  []struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("cfaccess: %s %s: %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	if !env.Success {
-		if len(env.Errors) > 0 {
-			return nil, resp.StatusCode, fmt.Errorf("cfaccess: %s %s: %d %s", method, path, env.Errors[0].Code, env.Errors[0].Message)
-		}
-		return nil, resp.StatusCode, fmt.Errorf("cfaccess: %s %s: request unsuccessful (%d)", method, path, resp.StatusCode)
-	}
-	return raw, resp.StatusCode, nil
 }
