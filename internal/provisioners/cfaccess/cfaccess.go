@@ -173,9 +173,9 @@ func (p *Provisioner) Inspect(ctx context.Context, t spinup.Target) (spinup.Stat
 		ExternalID: str(found, "id"),
 		ParentID:   p.cfg.AccountID,
 	}
-	diffs := p.diff(ctx, found, t.Spec)
+	diffs, notes := p.diff(ctx, found, t.Spec)
 	st.Matches = len(diffs) == 0
-	st.Detail = describe(found, diffs)
+	st.Detail = describe(found, append(diffs, notes...))
 	return st, nil
 }
 
@@ -189,7 +189,10 @@ func (p *Provisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Resou
 		return spinup.Resource{}, err
 	}
 
-	logo, logoNote := p.resolveLogo(ctx, t.Spec.LogoURL)
+	// The current value matters: it is what an unreadable check falls back to,
+	// so a CDN blip carries the existing icon forward instead of clearing it.
+	// str tolerates a nil found, which is the create path — nothing to carry.
+	logo, logoNote := p.resolveLogo(ctx, t.Spec.LogoURL, str(found, "logo_url"))
 
 	if found == nil {
 		created, err := p.createApp(ctx, p.desiredApp(nil, t.Spec, logo))
@@ -260,19 +263,29 @@ func (p *Provisioner) Teardown(ctx context.Context, t spinup.Target, rec model.S
 
 // ─── the application object ────────────────────────────────────────────────
 
-// rawApp is an Access application as Cloudflare returned it.
+// rawApp is an Access application as Cloudflare returned it, held as a map
+// rather than as a struct.
 //
-// A map rather than a struct, and that is the single most important decision in
-// this file. Updates are **PUT — full replacement**; `PATCH` returns "Method not
-// allowed for this authentication scheme". A struct round-trip silently drops
-// every field this package does not happen to model, so the first time
-// Cloudflare adds one — or the first time an operator sets one in the dashboard
-// that we never modelled — an otherwise innocent update would erase it. On a
-// gated app the field most likely to be erased that way is `policies`, and
-// erasing those un-gates the service.
+// The reason is that changing one field means sending the **whole application
+// back**. Cloudflare rejects PATCH on this endpoint — "Method not allowed for
+// this authentication scheme" — so the only way to update is PUT, and PUT
+// replaces the application with exactly what the request body contains.
+// Anything left out of that body is deleted.
 //
-// So: read the whole object, change only the keys the spec owns, strip the
-// server-owned ones, and put it back.
+// With a struct, "left out" means "any field nobody wrote a Go field for", and
+// that set is invisible: encoding/json drops unknown keys when it decodes, so
+// decode → change the name → encode → PUT sends back an object that is missing
+// every field this package never thought about. Cloudflare then removes them.
+// That includes fields an operator set in the dashboard and fields Cloudflare
+// adds after this was written — neither of which will show up in a test.
+//
+// On a gated application the field that disappears is `policies`. An update
+// meaning only to correct a logo would delete the rule that gates the service,
+// and the service would stay up, keep resolving, and admit everyone.
+//
+// A map keeps every key the API sent, understood or not. desiredApp then
+// changes only the keys the spec owns and removes only the server-owned ones.
+// TestEnsure_UpdatePreservesUnmodelledFieldsAndStripsServerOwned is the guard.
 type rawApp map[string]any
 
 // serverOwned are the fields Cloudflare assigns and rejects (or silently
@@ -364,8 +377,7 @@ func appDomain(spec spinup.ServiceSpec) string {
 // Returned as a list of human phrases rather than a bool so the plan can say
 // *what* is wrong: "update" on its own tells an operator nothing about whether
 // they are about to fix a logo or convert a gate into a bookmark.
-func (p *Provisioner) diff(ctx context.Context, live rawApp, spec spinup.ServiceSpec) []string {
-	var diffs []string
+func (p *Provisioner) diff(ctx context.Context, live rawApp, spec spinup.ServiceSpec) (diffs, notes []string) {
 
 	if got, want := str(live, "type"), appType(spec.Access); got != want {
 		diffs = append(diffs, fmt.Sprintf("type is %q, spec wants %q", got, want))
@@ -388,31 +400,40 @@ func (p *Provisioner) diff(ctx context.Context, live rawApp, spec spinup.Service
 		diffs = append(diffs, fmt.Sprintf("no policy admits the members group (%s)", p.displayGroup()))
 	}
 
-	diffs = append(diffs, p.logoDiff(ctx, str(live, "logo_url"), spec.LogoURL)...)
-	return diffs
+	logoDiffs, logoNotes := p.logoDiff(ctx, str(live, "logo_url"), spec.LogoURL)
+	return append(diffs, logoDiffs...), append(notes, logoNotes...)
 }
 
 // logoDiff compares the live icon against the spec's, and checks that what is
-// live actually loads.
+// live actually loads. It returns drift and, separately, notes — things worth
+// printing that are not grounds for an update.
 //
-// The second half is the point. An icon that 404s renders exactly like an unset
+// The load check is the point. An icon that 404s renders exactly like an unset
 // one, so "the URL string matches the spec" is not evidence the launcher shows
 // anything. Reporting it as drift is what makes a rotted asset visible at all —
 // argosy's went unnoticed for months because nothing ever asked.
-func (p *Provisioner) logoDiff(ctx context.Context, live, want string) []string {
+//
+// A check that could not complete is a **note, not drift**. Counting it as drift
+// would mark the step StepUpdate over a network blip, and an update here is a
+// full-replacement PUT of the whole application — not something to trigger on
+// evidence this thin.
+func (p *Provisioner) logoDiff(ctx context.Context, live, want string) (diffs, notes []string) {
 	switch {
 	case want == "" && live == "":
-		return nil
+		return nil, nil
 	case want == "" && live != "":
-		return []string{fmt.Sprintf("has a logo (%s), spec sets none", live)}
+		return []string{fmt.Sprintf("has a logo (%s), spec sets none", live)}, nil
 	case live != want:
-		return []string{fmt.Sprintf("logo is %q, spec wants %q", live, want)}
+		return []string{fmt.Sprintf("logo is %q, spec wants %q", live, want)}, nil
 	}
 	// Same URL on both sides — but is it serving?
-	if err := p.verifyLogo(ctx, live); err != nil {
-		return []string{fmt.Sprintf("logo url is set correctly but does not load (%v) — the launcher is showing initials", err)}
+	switch verdict, err := p.checkLogo(ctx, live); verdict {
+	case logoBroken:
+		return []string{fmt.Sprintf("logo url is set correctly but is not a servable image (%v) — the launcher is showing initials", err)}, nil
+	case logoUnknown:
+		return nil, []string{fmt.Sprintf("logo could not be checked (%v)", err)}
 	}
-	return nil
+	return nil, nil
 }
 
 // allowsGroup reports whether any of the application's policies allows the
@@ -478,31 +499,33 @@ func domainHost(domain string) string {
 
 // ─── the logo ──────────────────────────────────────────────────────────────
 
-// resolveLogo decides what to write into logo_url, and returns a note for the
-// report when that is not what the spec asked for.
+// logoVerdict is the outcome of checking a logo URL, and the distinction it
+// draws is the whole of this section.
 //
-// **An unverifiable logo never blocks the gate.** Refusing to create an Access
-// application because a CDN is slow would hold back the DNS step (a gated app is
-// a DNS prerequisite) and leave the service unpublished over an icon — the wrong
-// trade by a wide margin. Writing a URL that does not load is also wrong, and is
-// the exact failure this ticket was filed about.
-//
-// So the third option: create the app with **no** logo and say so. The gate goes
-// in, the report carries the reason, and because the spec still wants a logo the
-// next Inspect reports drift until the asset is actually published. A visible,
-// converging "still not right" beats a silent, permanent wrong value.
-func (p *Provisioner) resolveLogo(ctx context.Context, want string) (string, string) {
-	if want == "" {
-		return "", ""
-	}
-	if err := p.verifyLogo(ctx, want); err != nil {
-		return "", fmt.Sprintf("logo omitted: %s did not verify (%v) — the app was created without one rather than with a URL that renders as grey initials", want, err)
-	}
-	return want, ""
-}
+// "We could not check it" and "we checked it and it is broken" are different
+// facts that want opposite handling, and collapsing them is how a transient CDN
+// timeout ends up **erasing a working icon**. It is the same distinction the
+// audit draws between UpstreamUnknown and UpstreamNo, and the same one the
+// orchestrator draws between StepUnknown and StepCreate: never treat
+// unverifiable as absent.
+type logoVerdict int
 
-// verifyLogo fetches the URL and reports whether it is a publicly servable
-// image.
+const (
+	// logoOK — fetched as the public would, 200, and an image.
+	logoOK logoVerdict = iota
+	// logoBroken — a definite answer that was not a servable image: 404 for a
+	// path that rotted, 403 for something not public, or a 200 that is not an
+	// image at all. This is a fact about the asset and it will not change on a
+	// retry, so acting on it is safe.
+	logoBroken
+	// logoUnknown — the check itself did not complete: DNS failure, connection
+	// refused, TLS failure, a timeout, or a 5xx from the origin. Says nothing
+	// about the asset. Acting on it would mean clearing a logo because a CDN
+	// blinked.
+	logoUnknown
+)
+
+// checkLogo fetches the URL and classifies it.
 //
 // GET rather than HEAD: HEAD is not universally implemented, and a 405 would
 // read as a broken asset. The body is read only far enough to release the
@@ -510,32 +533,78 @@ func (p *Provisioner) resolveLogo(ctx context.Context, want string) (string, str
 //
 // No credentials are sent, deliberately. The launcher renders this as an <img>
 // in the *viewer's* browser, so the only check that means anything is the one
-// made as the sessionless public. An asset behind an Access gate would answer
-// this request with an HTML login page, which the content-type test catches.
-func (p *Provisioner) verifyLogo(ctx context.Context, url string) error {
+// made as the sessionless public. An asset behind an Access gate answers with an
+// HTML login page, which is a 200 — the content-type test is what catches it.
+func (p *Provisioner) checkLogo(ctx context.Context, url string) (logoVerdict, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("not a fetchable url: %w", err)
+		// Not a URL that can ever be fetched. Definite.
+		return logoBroken, fmt.Errorf("not a fetchable url: %w", err)
 	}
 	req.Header.Set("Accept", "image/*")
 	resp, err := p.logo.Do(req)
 	if err != nil {
-		return err
+		// Transport-level: refused, timed out, TLS, DNS. Nothing was learned
+		// about the asset.
+		return logoUnknown, err
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		_ = resp.Body.Close()
 	}()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http %d", resp.StatusCode)
+	switch {
+	case resp.StatusCode >= 500:
+		// The origin is unwell, which is not the same as the asset being wrong.
+		return logoUnknown, fmt.Errorf("http %d", resp.StatusCode)
+	case resp.StatusCode != http.StatusOK:
+		return logoBroken, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	ct := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
 	if !strings.HasPrefix(ct, "image/") {
-		// The login-page case lands here: an Access-gated asset answers 200 with
-		// text/html, which would otherwise pass a status-only check.
-		return fmt.Errorf("content-type is %q, not an image", resp.Header.Get("Content-Type"))
+		return logoBroken, fmt.Errorf("content-type is %q, not an image", resp.Header.Get("Content-Type"))
 	}
-	return nil
+	return logoOK, nil
+}
+
+// resolveLogo decides what to write into logo_url, given what the spec wants and
+// what the application currently carries. The second return is a note for the
+// report when the answer is not simply "what the spec asked for".
+//
+// Three outcomes, and the middle one is the point:
+//
+//   - Verified → write it.
+//   - Broken → write nothing. The launcher falls back to the service's first
+//     two letters, which is the honest rendering of "there is no icon" and is
+//     exactly what an unset logo does anyway. Writing a URL that 404s produces
+//     the identical initials while *claiming* an icon is configured, and that
+//     claim is what let argosy's stay dead for months.
+//   - Could not check → change nothing. Keep whatever is already there, even
+//     though it is unverified, because the alternative is clearing a working
+//     icon over a network blip.
+//
+// What this never does is fail the step. A gated Access application is a DNS
+// prerequisite, so refusing to create it would hold the hostname back — leaving
+// a service unpublished over an icon is the wrong trade by a wide margin. And
+// because the spec still asks for a logo, the next Inspect keeps reporting drift
+// until the asset really is published: a visible, converging "still not right"
+// rather than a silent permanent wrong value.
+func (p *Provisioner) resolveLogo(ctx context.Context, want, current string) (string, string) {
+	if want == "" {
+		// The spec asks for no icon. Clearing is intended, not a fallback.
+		return "", ""
+	}
+	verdict, err := p.checkLogo(ctx, want)
+	switch verdict {
+	case logoOK:
+		return want, ""
+	case logoBroken:
+		return "", fmt.Sprintf("logo omitted: %s is not a servable image (%v) — the launcher shows the service's initials either way, and writing a dead url would claim an icon that isn't there", want, err)
+	default: // logoUnknown
+		if current != "" {
+			return current, fmt.Sprintf("logo left as it was: %s could not be checked (%v) — an unreachable cdn is not evidence the icon is wrong", want, err)
+		}
+		return "", fmt.Sprintf("logo not set yet: %s could not be checked (%v) — nothing was written rather than an unverified url", want, err)
+	}
 }
 
 // ─── describing what is there ──────────────────────────────────────────────

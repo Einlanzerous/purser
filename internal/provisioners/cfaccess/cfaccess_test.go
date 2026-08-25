@@ -16,6 +16,11 @@ const (
 	testAccount = "acct-1"
 	testGroup   = "grp-members"
 	testHost    = "argosy.zerogravity.industries"
+
+	// unreachableURL is https (so ServiceSpec.Validate accepts it) and points at
+	// a port nothing listens on, so a fetch fails at the transport layer. That
+	// is the "could not check" case, as distinct from a 404.
+	unreachableURL = "https://127.0.0.1:1/mark.png"
 )
 
 // ─── harness ───────────────────────────────────────────────────────────────
@@ -317,23 +322,51 @@ func TestInspect_LogoUrlMatchesButDoesNotLoad(t *testing.T) {
 	if st.Matches {
 		t.Fatal("a logo that does not load is drift, not a match")
 	}
-	if !strings.Contains(st.Detail, "does not load") {
-		t.Fatalf("detail should say the logo does not load, got %q", st.Detail)
+	if !strings.Contains(st.Detail, "not a servable image") {
+		t.Fatalf("detail should say the logo does not serve, got %q", st.Detail)
 	}
 }
 
 // An asset behind an Access gate answers 200 with an HTML login page. A
 // status-only check would pass it, and the launcher would show initials.
-func TestVerifyLogo_RejectsHTMLLoginPage(t *testing.T) {
+func TestCheckLogo_HTMLLoginPageIsBroken(t *testing.T) {
 	gated := logoServer(t, http.StatusOK, "text/html; charset=utf-8")
 	p := New(Config{LogoClient: gated.Client()})
 
-	err := p.verifyLogo(context.Background(), gated.URL)
-	if err == nil {
-		t.Fatal("an HTML body must not pass as an image")
+	verdict, err := p.checkLogo(context.Background(), gated.URL)
+	if verdict != logoBroken {
+		t.Fatalf("an HTML body must not pass as an image, got verdict %v", verdict)
 	}
 	if !strings.Contains(err.Error(), "not an image") {
 		t.Fatalf("error should name the content type, got %v", err)
+	}
+}
+
+// The distinction the whole logo section turns on: a definite bad answer is
+// actionable, a check that could not complete is not.
+func TestCheckLogo_SeparatesBrokenFromUnknown(t *testing.T) {
+	notFound := logoServer(t, http.StatusNotFound, "text/plain")
+	serverErr := logoServer(t, http.StatusBadGateway, "text/plain")
+	ok := logoServer(t, http.StatusOK, "image/png")
+
+	cases := []struct {
+		name string
+		url  string
+		cl   *http.Client
+		want logoVerdict
+	}{
+		{"200 image", ok.URL, ok.Client(), logoOK},
+		{"404 is a fact about the asset", notFound.URL, notFound.Client(), logoBroken},
+		{"5xx is the origin, not the asset", serverErr.URL, serverErr.Client(), logoUnknown},
+		{"connection refused", unreachableURL, nil, logoUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(Config{LogoClient: tc.cl})
+			if got, _ := p.checkLogo(context.Background(), tc.url); got != tc.want {
+				t.Fatalf("verdict = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -369,10 +402,10 @@ func TestEnsure_CreatesGatedAppWithPolicyAndLogo(t *testing.T) {
 	}
 }
 
-// A logo that will not load is omitted rather than written, and the report says
-// so — refusing the whole application over an icon would hold back DNS and leave
-// the service unpublished.
-func TestEnsure_UnverifiableLogoIsOmittedNotFatal(t *testing.T) {
+// A logo that is definitely broken (404) is omitted rather than written, and the
+// report says so — refusing the whole application over an icon would hold back
+// DNS and leave the service unpublished.
+func TestEnsure_BrokenLogoIsOmittedNotFatal(t *testing.T) {
 	dead := logoServer(t, http.StatusNotFound, "text/plain")
 	api := &cfAPI{}
 	p := newProv(t, api, Config{GroupID: testGroup, LogoClient: dead.Client()})
@@ -446,6 +479,55 @@ func TestEnsure_BookmarkGetsSchemeDomainAndNoPolicy(t *testing.T) {
 	policies, ok := api.lastBody["policies"].([]any)
 	if !ok || len(policies) != 0 {
 		t.Fatalf("a bookmark must be sent with an explicitly empty policy list, got %v", api.lastBody["policies"])
+	}
+}
+
+// A check that could not complete must never clear a logo that is already set.
+// Collapsing "could not check" into "broken" would erase a working icon every
+// time the CDN blinked.
+func TestEnsure_UncheckableLogoIsLeftAlone(t *testing.T) {
+	api := &cfAPI{apps: []map[string]any{{
+		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
+		"app_launcher_visible": true, "logo_url": unreachableURL,
+		"policies": []any{},
+	}}}
+	p := newProv(t, api, Config{GroupID: testGroup})
+
+	res, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, unreachableURL)})
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if got := api.lastBody["logo_url"]; got != unreachableURL {
+		t.Fatalf("logo_url = %v, want the existing value kept rather than cleared", got)
+	}
+	if !strings.Contains(res.Detail, "left as it was") {
+		t.Fatalf("the report should say the logo was left alone, got %q", res.Detail)
+	}
+}
+
+// ...and it must not count as drift either. An update here is a
+// full-replacement PUT of the whole application, which is not something to
+// trigger on a failed fetch.
+func TestInspect_UncheckableLogoIsANoteNotDrift(t *testing.T) {
+	api := &cfAPI{apps: []map[string]any{{
+		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
+		"app_launcher_visible": true, "logo_url": unreachableURL,
+		"policies": []any{map[string]any{
+			"decision": "allow",
+			"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
+		}},
+	}}}
+	p := newProv(t, api, Config{GroupID: testGroup})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, unreachableURL)})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !st.Matches {
+		t.Fatalf("a logo that could not be checked is not drift: %s", st.Detail)
+	}
+	if !strings.Contains(st.Detail, "could not be checked") {
+		t.Fatalf("detail should still report the failed check, got %q", st.Detail)
 	}
 }
 
