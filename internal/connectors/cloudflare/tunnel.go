@@ -282,10 +282,15 @@ func (p *TunnelProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 	}
 	if note := concurrentWriteNote(before.version, after.version, t.TunnelID); note != "" {
 		// Not an error: the route above is confirmed in place, so this step did
-		// what it said. What may have been lost is somebody *else's* route, and
-		// the only useful response is to say so loudly in both places an
-		// operator looks.
-		log.Printf("cloudflare: %s", note)
+		// what it said. What may have been lost is somebody *else's* route.
+		//
+		// Carried on the Detail alone, and deliberately not also logged. The
+		// orchestrator puts this string on the step's finding, which both
+		// surfaces render — so a log line here made one event read as two on the
+		// CLI, where `log` writes to stdout beside the report (PRSR-31). It is
+		// the one message whose whole value is being believed when it fires, and
+		// a warning printed twice is one a reader starts discounting. Teardown
+		// still logs its own: nothing carries a detail back from there.
 		detail += " — " + note
 	}
 	return spinup.Resource{ParentID: t.TunnelID, Detail: detail}, nil
@@ -600,7 +605,18 @@ func documentShape(rules []ingressRule) error {
 	if len(rules) == 0 {
 		return nil
 	}
-	return terminalIndexErr(rules)
+	if err := terminalIndexErr(rules); err != nil {
+		// The sentinel rides on this one predicate rather than on terminalIndex
+		// itself, because this is the site that asks it about a document we
+		// *fetched*. terminalIndex's other callers ask it about a document this
+		// run just built (assertWritable) or just read back (confirmRoute), and
+		// those failures are our own arithmetic or a concurrent writer — a
+		// breakage, not a state somebody has to go and fix upstream. Both
+		// callers of documentShape wrap with %w, so the refusal reaches the
+		// orchestrator from the read path and the write path alike (PRSR-31).
+		return fmt.Errorf("%w: %w", spinup.ErrRefused, err)
+	}
+	return nil
 }
 
 // terminalIndexErr is terminalIndex's refusal without its index.
@@ -812,9 +828,9 @@ func checkTunnelSource(tunnelID, source string) error {
 	case remotelyManaged:
 		return nil
 	case "":
-		return fmt.Errorf("cloudflare: tunnel %s did not report whether it is locally or remotely managed, so this configuration cannot be shown to be the one it serves — refusing to read a route from it or write one into it", tunnelID)
+		return fmt.Errorf("%w: cloudflare: tunnel %s did not report whether it is locally or remotely managed, so this configuration cannot be shown to be the one it serves — refusing to read a route from it or write one into it", spinup.ErrRefused, tunnelID)
 	default:
-		return fmt.Errorf("cloudflare: tunnel %s is configured by a file on the origin machine (source %q), not over the API — a route written here would be stored and read back correctly and never served; manage its ingress in that cloudflared config, or convert the tunnel to remote management", tunnelID, source)
+		return fmt.Errorf("%w: cloudflare: tunnel %s is configured by a file on the origin machine (source %q), not over the API — a route written here would be stored and read back correctly and never served; manage its ingress in that cloudflared config, or convert the tunnel to remote management", spinup.ErrRefused, tunnelID, source)
 	}
 }
 

@@ -13,8 +13,10 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 ## Layout
 
 - `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `offboard`,
-  `person add|list|show`, `audit`, `reconcile`, `migrate`, `version`).
-  Composition root: `setup()` wires store + connectors + orchestrator.
+  `provision-service`, `person add|list|show`, `audit`, `reconcile`, `migrate`,
+  `version`). Composition root: `setup()` wires store + connectors + **both**
+  orchestrators — `invite.Service` and, since PRSR-31, `spinup.Service` via
+  `spinupRegistry`/`tunnelSet`.
 - `internal/model/` — domain types (person, service, account, invite,
   provision_task, service_resource), 1:1 with the schema.
 - `internal/connector/` — the `Connector` interface + `Registry` +
@@ -523,6 +525,49 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   against what was asked for, and a mismatch deletes it. Cleanup runs on the
   create path only: on an update the record predates Purser, and removing it
   would destroy something nobody asked to have removed.
+- **A refusal is not a failed read** (PRSR-31). `StepUnknown` covers a read that
+  did not complete — re-running is the whole fix. `StepRefused` covers a read
+  that *succeeded* and came back with something no provisioner may write to: a
+  tunnel whose catch-all is not last, or one that is locally managed. Both
+  decline to act and they want opposite things from an operator, so the
+  difference is a **status**, not the `Err` string — putting it there was the
+  `TaskFailed` + `Pending bool` shape PRSR-21 removed from the person axis, where
+  every consumer bucketing by status had to remember a second field existed.
+  Provisioners signal it with `spinup.ErrRefused`, matched via
+  `spinup.IsRefused`, exactly as they already signal `ErrUnavailable`. The
+  sentinel rides on `documentShape` and `checkTunnelSource` and **not** on
+  `terminalIndex`: that helper's other callers (`assertWritable`, `confirmRoute`,
+  `Teardown`) ask it about a document *this run just built or read back*, where a
+  failure is our own arithmetic or a concurrent writer — a breakage, not
+  something upstream to go and fix. Keep `unavailable` distinct from both: it is
+  Purser's own missing credential, fixed here rather than there.
+- **A warning worth believing is printed once.** The tunnel's concurrent-write
+  note lands on the step's `Detail`, which both surfaces render, and is
+  deliberately *not* also logged from `Ensure` — `log` writes to stdout beside
+  the CLI's own report, so one event read as two. It is the one message whose
+  entire value is being believed when it fires. `Teardown` still logs its own,
+  because nothing carries a detail back from there.
+- **"Nothing pending" is not "the edge is up."** `Result.Pending()` counts only
+  what `--apply` would act on, and deliberately excludes `unavailable`,
+  `refused`, `unknown` and `blocked` — none of them is fixed by the flag. So the
+  CLI's closing line consults `provisionExit` too (`provisionOutcome`): reading
+  a zero pending count as success reported "the edge already matches this spec"
+  over a plan whose DNS step was unavailable, i.e. a hostname that does not
+  resolve, signed off as a service that is up. Found by running the binary, not
+  by reading it — which is the argument for running it.
+- **A spec is an argument, not configuration.** `provision-service` takes flags
+  and there is no spec file: config here is env-only by house convention, and a
+  spec is written rarely and read carefully — the same reason a tunnelled spec
+  must name its tunnel rather than defaulting to one. `spinupRegistry` registers
+  all three provisioners *unconditionally*, unlike `buildRegistry` on the person
+  axis: each reports the env var it is missing, which a generic `Unavailable`
+  stand-in could not, and registering them keeps the kind known so a step can
+  never be quietly absent from a report.
+- **`spinup.ErrTunnelUnconfigured` exists so the HTTP surface need not match on
+  a message.** `Validate` has already rejected refs that are not names, so it is
+  only ever a legal ref nobody has wired (`dev`, until PRSR-33) — the caller's to
+  fix, so a 400 rather than a 500. It must never fall back to prod: that would
+  have a dev spin-up rewrite the production tunnel's shared ingress document.
 
 ## Testing
 
@@ -582,9 +627,7 @@ PRSR-28 and PRSR-29 landed two of the three provisioners.
 lookup-then-write, recording `dns_record_id` so `Teardown` targets an id rather
 than re-resolving a name. `cloudflare.AccessProvisioner` does the gated
 `self_hosted` app and the `bookmark` tile, verifies a logo before writing it,
-and merges rather than replaces on update. Neither is wired into the
-composition root yet; that is PRSR-31, and the DNS half of its "run it against a
-service that is already up" is already covered by `dns_spinup_test.go`.
+and merges rather than replaces on update.
 
 PRSR-27 landed the foundation: `internal/spinup` (spec, `ServiceProvisioner`,
 registry, `Ensure` orchestrator) and `service_resource` (migration 0007). It
@@ -610,9 +653,18 @@ that is not remotely managed, because the configuration this endpoint returns is
 then not the one being served, and every other guard in the file is about *who
 else wrote it* rather than whether it is live.
 
-With all three provisioners in, nothing yet wires any of them into `setup()`:
-that is **PRSR-31**, the `provision-service` CLI/HTTP surface, which brings
-Argosy up end to end on the direct path. **PRSR-33** wires the `dev` tunnel ref
+PRSR-31 wired all three into `setup()` and gave the axis its entry points:
+`purser provision-service` (flags, plans by default, `--apply` acts) and `POST
+/v1/spinups`. It settled the two questions PRSR-30's review deferred — `refused`
+split from `unknown`, and the concurrent-write warning reported once — and it
+added `spinup_argosy_test.go`, which runs all three real provisioners through
+the real orchestrator against an already-up edge and asserts three no-ops with
+zero upstream writes. **What it has not done is contact Cloudflare.** No test in
+this repo ever has; the first real `provision-service` run needs an operator's
+credentials and is the exercise the epic actually asks for. Until somebody runs
+it, "Argosy end to end" is a claim about a fake.
+
+**PRSR-33** wires the `dev` tunnel ref
 that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
 spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
 the `Teardown` walk, **PRSR-36** the Cloudflare response shapes still read from

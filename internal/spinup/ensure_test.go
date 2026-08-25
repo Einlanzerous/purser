@@ -3,6 +3,7 @@ package spinup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -801,3 +802,109 @@ func (p *spyProv) Inspect(ctx context.Context, t Target) (State, error) {
 
 var _ ServiceProvisioner = (*spyProv)(nil)
 var _ ServiceProvisioner = (*Unavailable)(nil)
+
+// --- refused vs unknown (PRSR-31) -------------------------------------------
+
+// The split PRSR-30's review filed and PRSR-31 settled. Both states decline to
+// act; they differ in what an operator should do next, and until this the
+// difference lived in the Err string — a second field a reader has to know to
+// consult, which is the shape PRSR-21 removed from the person axis.
+func TestEnsure_RefusedIsNotUnknown(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want StepStatus
+	}{
+		{
+			// The read never completed. Re-running is the whole fix.
+			name: "a transport failure is unknown",
+			err:  errors.New("502 from the api"),
+			want: StepUnknown,
+		},
+		{
+			// The read completed and came back with a document nobody may write
+			// to. Re-running repeats it until somebody fixes it upstream.
+			name: "an unwritable upstream is refused",
+			err:  fmt.Errorf("%w: the catch-all rule is not last", ErrRefused),
+			want: StepRefused,
+		},
+		{
+			// Wrapped several layers deep, the way a provisioner actually
+			// returns it — inspectIngress wraps documentShape, which wraps the
+			// sentinel.
+			name: "refused through several wrappings",
+			err:  fmt.Errorf("cloudflare: tunnel abc: %w", fmt.Errorf("%w: no catch-all at all", ErrRefused)),
+			want: StepRefused,
+		},
+		{
+			// And unavailable still wins over both: an unconfigured provisioner
+			// is Purser's own gap, fixed here rather than upstream.
+			name: "unavailable is neither",
+			err:  fmt.Errorf("%w: set PURSER_CF_ZONE_ID", ErrUnavailable),
+			want: StepUnavailable,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			route := &fakeProv{kind: model.ResourceTunnelRoute, inspectErr: tc.err}
+			st := newStore()
+			res, err := New(st, NewRegistry(route), WithTunnels(prodTunnels())).
+				Ensure(context.Background(), Request{Spec: tunnelledSpec(), Apply: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := wantStatus(t, res, model.ResourceTunnelRoute, tc.want)
+			if f.Err == "" {
+				t.Error("every one of these must carry the reason")
+			}
+			if route.ensures != 0 {
+				t.Error("--apply acted on a step it could not decide from")
+			}
+		})
+	}
+}
+
+// A refusal reaching Ensure rather than Inspect is the document changing shape
+// between the plan and the apply. It is still refused rather than failed: the
+// operator's next move is the same, and nothing was written either way.
+func TestEnsure_RefusalOnTheWritePathIsAlsoRefused(t *testing.T) {
+	route := &fakeProv{
+		kind:      model.ResourceTunnelRoute,
+		ensureErr: fmt.Errorf("%w: the catch-all rule moved", ErrRefused),
+	}
+	res, err := New(newStore(), NewRegistry(route), WithTunnels(prodTunnels())).
+		Ensure(context.Background(), Request{Spec: tunnelledSpec(), Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceTunnelRoute, StepRefused)
+}
+
+// Refused behaves like unknown everywhere it should: it is not in place, so it
+// holds the DNS step, and it is not pending, because --apply is not what fixes
+// it.
+func TestEnsure_RefusedBlocksDNSAndIsNotPending(t *testing.T) {
+	route := &fakeProv{
+		kind:       model.ResourceTunnelRoute,
+		inspectErr: fmt.Errorf("%w: the catch-all rule is not last", ErrRefused),
+	}
+	dns := absent(model.ResourceDNSRecord, "rec-1")
+	st := newStore()
+
+	res, err := New(st, NewRegistry(route, dns), WithTunnels(prodTunnels())).
+		Ensure(context.Background(), Request{Spec: tunnelledSpec(), Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceTunnelRoute, StepRefused)
+	wantStatus(t, res, model.ResourceDNSRecord, StepBlocked)
+	if dns.ensures != 0 {
+		t.Fatal("a hostname was published in front of a tunnel that cannot serve it")
+	}
+	if res.Pending() != 0 {
+		t.Error("neither a refused step nor the step it blocks is fixed by --apply, so neither is pending")
+	}
+	if st.count() != 0 {
+		t.Error("nothing should have been recorded")
+	}
+}

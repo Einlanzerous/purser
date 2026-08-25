@@ -221,6 +221,7 @@ purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--a
 purser person list [--to svc1,svc2] [--type human|agent] [--all] [--json]   # the roster
 purser person show --email EMAIL [--json]                  # one person in full
 purser offboard --email EMAIL [--to svc1,svc2] [--apply]   # revoke access; previews by default
+purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo URL] [--apply]
 purser audit [--email EMAIL] [--to svc1,svc2]              # report drift, read-only
 purser reconcile --email EMAIL | --all [--to svc1,svc2]    # repair records
 purser migrate               # apply DB migrations and exit
@@ -356,6 +357,82 @@ the row and says so; `person show` displays it with a REVOKED date.
 > sign-in is gated by the Cloudflare Access group, so an offboard that skips
 > `cloudflare` leaves a working login behind. The CLI warns when that happens,
 > but the half-done case looks finished, which is why it is worth stating twice.
+
+### Standing a service up
+
+The other axis. `invite` puts a *person* into a service that already exists;
+`provision-service` builds the **edge that makes a service exist** — its DNS
+record, its Cloudflare Access application, and, if it is tunnelled, its ingress
+route on the tunnel. It is keyed on hostname rather than on a person, and it is
+idempotent per (hostname, kind).
+
+Like `offboard` and unlike `invite`, it **plans by default**:
+
+```
+$ purser provision-service --service argosy \
+    --hostname argosy.zerogravity.industries \
+    --mode direct --upstream 100.64.0.7 --access bookmark
+
+RESOURCE                         ACTION   DETAIL
+Cloudflare Tunnel ingress route  skipped  direct spec: traffic does not pass through a tunnel
+Access application               adopt    bookmark "argosy" → argosy.zerogravity.industries, no logo
+DNS record                       adopt    DNS only A → 100.64.0.7
+
+argosy (argosy.zerogravity.industries): 0 in place, 2 to do, 1 skipped
+
+Plan — nothing created or changed. Re-run with --apply to act on 2 steps.
+```
+
+`adopt` is the status that makes this usable on an estate that already exists.
+Argosy's edge predates Purser entirely, so the honest first exercise is running
+this against a service that is **already up**: upstream already matches the spec,
+Purser simply holds no record of it, so `--apply` writes the rows and makes *no
+upstream call at all*. A spin-up tool that can only recognise what it built
+itself is one nobody will point at production, and re-creating a live DNS record
+just to learn its id is the wrong way to get one.
+
+Every kind gets a line, including the ones this spec doesn't call for — silence
+about the tunnel should never have to be read as "the tunnel is fine".
+
+Two orderings are load-bearing rather than cosmetic:
+
+- **DNS goes last**, because it is the step that makes the hostname resolve. The
+  other two are inert until something does.
+- **...and is held back if what it depends on didn't land.** Ordering only closes
+  the window when the earlier step *succeeded*, so a `gated` service whose Access
+  step failed, was unavailable, or couldn't be read reports its DNS step as
+  `blocked` and publishes nothing. Publishing anyway would leave a service that
+  is meant to be gated reachable and **ungated** — which, unlike a 502, does not
+  announce itself. A `bookmark` app is deliberately *not* a prerequisite: it is a
+  launcher tile in front of a service with its own login, so its absence costs an
+  icon, not a gate.
+
+The statuses that need a human each say something different, and each gets its
+own line rather than a shared count:
+
+| | |
+|---|---|
+| `unavailable` | Purser isn't configured for this step — the line names the variable to set |
+| `refused` | upstream is in a state Purser won't write to; re-running repeats this until it's fixed **there** |
+| `unknown` | the state couldn't be read, so nothing was decided from it — re-run |
+| `blocked` | held back so the hostname isn't published in front of a step that didn't land |
+| `applied-not-recorded` | the edge changed and the row didn't — Purser can't tear down what it holds no id for |
+
+`refused` and `unknown` are separate on purpose. Both decline to act, but a
+failed read means "run it again", and a tunnel whose ingress document Purser
+won't write to means "go and fix that, because running it again will print this
+until you do". Putting that difference in an error string would make it a second
+field a reader has to know to consult.
+
+Exit is non-zero for any of the above, including `unavailable` — that follows
+`offboard` rather than `invite`. On an invite, unavailable means nothing was
+granted and nobody is harmed by waiting; here it means a step of the edge does
+not exist, so the hostname does not work.
+
+> **Not yet exercised against the live Cloudflare API.** Every assertion in the
+> test suite is against an httptest fake. The provisioners' behaviour is pinned,
+> and the ingress matcher is read from cloudflared's own source rather than
+> inferred — but that is not the same as having watched it run.
 
 ### Auditing and reconciling
 
@@ -538,6 +615,9 @@ construct_net/Tailscale isolation).
   (omit both `services` and `bundle` to grant the default bundle; `name` and
   `email` are required and a request without either is a `400`)
 - `GET  /v1/invites/{id}` — status
+- `POST /v1/spinups` — `{ "service", "hostname", "mode", "upstream", "access",
+  "display_name", "logo_url", "tunnel", "apply" }` — stand up a service's edge.
+  Omitting `apply` returns a plan and writes nothing.
 
 The credential block (with secrets) is returned only for `copypaste` delivery;
 for `email` the secrets go to the recipient and are not echoed over HTTP.

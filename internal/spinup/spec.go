@@ -18,6 +18,7 @@
 package spinup
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -416,12 +417,22 @@ func (s ServiceSpec) dependsOn(kind model.ResourceKind) []model.ResourceKind {
 // hasn't been told its id.
 type TunnelSet map[TunnelRef]string
 
+// ErrTunnelUnconfigured is returned when a spec names a tunnel this deployment
+// has no id for. Validate has already rejected refs that are not names at all,
+// so this is only ever a legal ref nobody has wired — `dev`, until PRSR-33.
+//
+// A sentinel rather than a bare error because it is the one refusal Ensure can
+// still raise that is the *caller's* to fix rather than an outage, and the HTTP
+// surface has to tell those apart to choose a status code. Matching on the
+// message would have made that distinction depend on the wording above.
+var ErrTunnelUnconfigured = errors.New("spinup: tunnel is not configured")
+
 // Resolve returns the tunnel id for a ref.
 func (ts TunnelSet) Resolve(ref TunnelRef) (string, error) {
 	if id := strings.TrimSpace(ts[ref]); id != "" {
 		return id, nil
 	}
-	return "", fmt.Errorf("spinup: tunnel %q is not configured (%s)", ref, configuredTunnels(ts))
+	return "", fmt.Errorf("%w: %q (%s)", ErrTunnelUnconfigured, ref, configuredTunnels(ts))
 }
 
 // configuredTunnels renders what *is* wired, so the refusal distinguishes "you

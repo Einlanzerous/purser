@@ -7,6 +7,7 @@ import (
 
 	"github.com/Einlanzerous/purser/internal/invite"
 	"github.com/Einlanzerous/purser/internal/model"
+	"github.com/Einlanzerous/purser/internal/spinup"
 )
 
 // inviteResponse is the POST /v1/invites result. The credential block (which
@@ -125,6 +126,91 @@ func newStatusResponse(inv model.Invite, tasks []model.ProvisionTask) statusResp
 			Status:    string(t.Status),
 			Attempts:  t.Attempts,
 			LastError: t.LastError,
+		})
+	}
+	return out
+}
+
+// spinupResponse is the POST /v1/spinups result: the normalized spec the run
+// worked from, one finding per resource kind, and the counts.
+//
+// The spec echoed back is the *normalized* one, not the request — hostnames are
+// lowercased and a display name defaults to the key, and a caller comparing what
+// it sent against what was recorded needs the form the run actually used.
+type spinupResponse struct {
+	Spec     spinupSpecDTO  `json:"spec"`
+	Applied  bool           `json:"applied"`
+	Findings []stepDTO      `json:"findings"`
+	Counts   map[string]int `json:"counts"`
+	// Pending is how many steps still want doing — what distinguishes "nothing
+	// to do" from "re-run with apply". Statuses needing a human are excluded,
+	// because re-running with apply does not fix any of them.
+	Pending int `json:"pending"`
+	// Changed is how many steps this run actually changed. Always 0 on a plan.
+	Changed int `json:"changed"`
+}
+
+type spinupSpecDTO struct {
+	Service     string `json:"service"`
+	DisplayName string `json:"display_name"`
+	Hostname    string `json:"hostname"`
+	Mode        string `json:"mode"`
+	Upstream    string `json:"upstream"`
+	Access      string `json:"access"`
+	LogoURL     string `json:"logo_url,omitempty"`
+	Tunnel      string `json:"tunnel,omitempty"`
+}
+
+// stepDTO is one resource kind's verdict.
+//
+// `status` carries the whole answer and there is no modifier beside it — the
+// rule PRSR-21 established on the person axis, and the reason `refused` is a
+// status of its own here rather than an `unknown` whose error text has to be
+// read to tell a transport failure from a document nobody may write to
+// (PRSR-31).
+//
+// external_id is omitted when empty rather than sent as "", because for a tunnel
+// route it is empty *by nature*: the ingress configuration is one document per
+// tunnel, so a route is identified by (tunnel, hostname) and has no id at all.
+type stepDTO struct {
+	Kind        string `json:"kind"`
+	DisplayName string `json:"display_name"`
+	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
+	ExternalID  string `json:"external_id,omitempty"`
+	Applied     bool   `json:"applied"`
+	Error       string `json:"error,omitempty"`
+}
+
+func newSpinupResponse(res *spinup.Result) spinupResponse {
+	out := spinupResponse{
+		Spec: spinupSpecDTO{
+			Service:     res.Spec.Key,
+			DisplayName: res.Spec.DisplayName,
+			Hostname:    res.Spec.Hostname,
+			Mode:        string(res.Spec.Mode),
+			Upstream:    res.Spec.Upstream,
+			Access:      string(res.Spec.Access),
+			LogoURL:     res.Spec.LogoURL,
+			Tunnel:      string(res.Spec.Tunnel),
+		},
+		Applied: res.Applied,
+		Counts:  make(map[string]int),
+		Pending: res.Pending(),
+		Changed: res.Changed(),
+	}
+	for st, n := range res.Counts() {
+		out.Counts[string(st)] = n
+	}
+	for _, f := range res.Findings {
+		out.Findings = append(out.Findings, stepDTO{
+			Kind:        string(f.Kind),
+			DisplayName: f.DisplayName,
+			Status:      string(f.Status),
+			Detail:      f.Detail,
+			ExternalID:  f.ExternalID,
+			Applied:     f.Applied,
+			Error:       f.Err,
 		})
 	}
 	return out

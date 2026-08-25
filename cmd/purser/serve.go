@@ -24,7 +24,7 @@ func runServe() {
 
 	srv := &http.Server{
 		Addr:              a.cfg.Addr,
-		Handler:           api.New(a.svc, a.store, a.cfg.APIToken).Handler(),
+		Handler:           api.New(a.svc, a.spin, a.store, a.cfg.APIToken).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
