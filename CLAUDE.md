@@ -534,6 +534,100 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   probe flipped one to `deny` and the read-back confirmed it), so a gated update
   is a real write of that policy's content, safe only because `Ensure` takes its
   own fresh read immediately before building the body.
+- **An application that serves a *path* is not that hostname's application**
+  (PRSR-41). `domainHost` strips the path on purpose, so a bookmark's
+  `https://argosy…/` compares equal to a self_hosted app's bare hostname — right
+  for "which hostname is this app about", wrong for "is this the app this spec
+  manages", and `findApp` answered the second question with the first by taking
+  the first match. Two applications serve `switchyard.zerogravity.industries`:
+  the service, and a path-scoped one on `/v1/external/github` whose only policy
+  is **`decision: bypass`** — no Access authentication at all, correct for a
+  webhook that authenticates by HMAC and safe *only* because it is confined to
+  that path. The bypass sorts first, so it won; and since `desiredApp` writes
+  `domain` from the spec, an `--apply` would have rewritten it to the bare
+  hostname, **widening an unauthenticated bypass from one path to the whole
+  service** while the real application sat untouched. The plan did describe it —
+  that was the defence being relied on — as `update`, which is not a line that
+  invites suspicion on a service you meant to update.
+  So the match is `servesWholeHost` and nothing less: exactly one whole-host app
+  is this spec's; **none** is a create, which is correct rather than merely safe
+  because Access matches the more specific path first, so a hostname-wide gate in
+  front of a narrower bypass is the shape this estate already runs (and the plan
+  names the path-scoped applications it is landing in front of, because "correct
+  because of a rule you have to know" is worth a line); **more than one** is
+  `spinup.ErrRefused` naming them, which is `pickCandidate`'s reasoning exactly
+  and `refused` rather than `unknown` because the read succeeded.
+  **It reads all three spellings of what an application fronts** — `domain`,
+  `destinations[].uri` and `self_hosted_domains`. This package already models all
+  three (the bypass carries the path in each; `desiredApp` deletes the latter two
+  by name on a bookmark conversion), so reading a subset is an enumeration gap
+  rather than a judgement call. All seven live apps agree across all three
+  (checked 2026-08-26, bypass included), which is an observation about today and
+  not a guarantee — and this predicate gates a full-replacement PUT.
+  **A path-carrying spelling disqualifies only when nothing names the host
+  whole** — asked **per field**, not over the two lists pooled. The naive "any
+  same-host path means not ours" is wrong the other way and worse: an app with
+  `domain: H` and destinations `[H, H/admin]` really does front the whole host,
+  so calling it somebody else's reports `create` and `--apply` stands up a
+  **second** whole-host application while the real one sits untouched and
+  unrecorded — the duplicate `listApps` exists to prevent. "Access prefers the
+  more specific path" does not rescue that: it only helps when the loser is
+  narrower, and there both are hostname-wide.
+  Pooling the lists inverts the answer in exactly the state the third field was
+  added for: a path-only `destinations` excused by a bare host in
+  `self_hosted_domains` reads as ours, while `destinations` — the successor field
+  — says it covers a path and nothing else. And that pair is the *only* state in
+  which reading the second list changes anything, since while the fields agree
+  `domain` alone decides; reading it in a way that does not survive the
+  disagreement is reading it for nothing.
+  **And when they disagree the answer is neither yes nor no — it is
+  `spinup.ErrRefused`.** Which spelling is true depends on the field Access
+  honours, which is what Purser does not know, and both answers are expensively
+  wrong: "not ours" reports `create` and `--apply` stands up a **duplicate**
+  whole-host application that nothing afterwards reports (the next run sees one
+  whole-host app — ours — so the two-candidate refusal never fires), while "ours"
+  writes the spec onto an application that may cover only a path and then lets
+  DNS publish in front of it. The refusal is correct *without* knowing which
+  field wins, which is what makes it an answer rather than a deferral, and
+  `findApp` checks it before counting candidates — an application nobody can
+  classify is exactly the one that might or might not belong in that count.
+  **Selection is still on `domain`, deliberately.** `appsOn` picks candidates by
+  it, so the three-field rule can disqualify an application and never discover
+  one. `domain` is the only one of the three that every application has — a
+  bookmark carries neither list — so one filter serves both shapes only by
+  reading it, and it is what Cloudflare's dashboard shows the application as
+  being about. The other two are a safety check on a candidate, not a wider net.
+  **A third answer means every consumer has to decide about it.**
+  `servesWholeHost` returns `hostWhole` / `hostPath` / `hostAmbiguous`, and the
+  two callers want opposite things from the last one. `findApp` refuses, because
+  both concrete answers are expensively wrong there. `confirmGone` must **error**,
+  and tested `== hostWhole` — so ambiguous fell through into `hostPath`'s bucket
+  ("was never this spec's") and the teardown reported success. That is the one
+  place in the file where the undecidable answer must not resolve to absent:
+  `hostPath` earns its pass because Purser *knows* the application was never this
+  spec's, while `hostAmbiguous` is the state where it knows nothing, which is
+  `Teardown`'s third documented outcome. PRSR-34's walk will read a `nil` there as
+  licence to drop the `service_resource` row, after which the remaining
+  application is tracked by nothing. So `!= hostPath`, not `== hostWhole` —
+  erroring is the safe direction here in a way it is not in `findApp`, because a
+  wrong error costs a noisy retry and a wrong `nil` costs a removal recorded over
+  a live gate.
+  **`confirmGone` asks about the id, then about the hostname**, and needs both.
+  Narrowing `findApp` broke it: "nothing serves this hostname" stopped meaning
+  "our application is gone" the moment a path-scoped remnant of *our own* app
+  could hide from a hostname-shaped re-read — a failed DELETE would then report
+  success over a live gate, which is the revoked-not-recorded lie. But an id
+  check alone is not enough either, because a 404 against a recorded
+  `external_id` is a wrong record rather than absent access: if our id is gone
+  and a *whole-host* application still serves the name, the service is still
+  gated. A remaining **path-scoped** app is neither, and is not an error — it was
+  never this spec's.
+  `desiredApp` still writes `domain` on an update. The power to widen came from
+  *which application was selected*, not from writing the field, and that is what
+  moved; base is now guaranteed whole-host, so the assignment is a no-op except
+  on a type change, where a bookmark's scheme-carrying domain genuinely differs.
+  Converting to a bookmark drops `destinations` and `self_hosted_domains`, which
+  a live bookmark does not carry.
 - **A logo has three outcomes, not two, and none of them fails the step.**
   Cloudflare stores any `logo_url` without validating it and the launcher falls
   back to the service's initials, so a wrong URL is indistinguishable from an
@@ -901,25 +995,9 @@ the "is this hostname still someone's?" question. **PRSR-39** is the zone
 pre-flight that PRSR-38's probe showed was available all along. **PRSR-36**,
 **PRSR-37** and **PRSR-40** are all closed.
 
-**PRSR-41 is open, `high`, and was found by running the binary** — the third
-time on this axis that has caught something reading could not (PRSR-31's
-outcome line, PRSR-38's fixture, and now this). `findApp` matches an application
-on hostname alone, because `domainHost` strips the path so a bookmark's URL and
-a self_hosted app's bare hostname compare equal. Two applications legitimately
-serve `switchyard.zerogravity.industries`: the service, and a **path-scoped
-`decision: bypass`** app that lets GitHub's webhook POST to
-`/v1/external/github` with no Access authentication at all, HMAC-authed instead.
-`findApp` returns the bypass one, since it sorts first. An `--apply` would then
-write `domain` back as the bare hostname — **widening an unauthenticated bypass
-from one path to the whole of Switchyard**, renaming it, making it launcher-
-visible, and leaving the real application untouched so nothing looks like it
-landed where it was aimed. Nothing has been applied; every estate run so far is
-a plan. The fix has a precedent in this repo — DNS's `pickCandidate` refuses
-when several records answer for a name and none is the spec's — and the same
-`StepRefused` answer fits, since the read succeeded and re-running will not fix
-it. **Do not `--apply` a switchyard spec until it lands**, which matters because
-PRSR-37's own headline use case ("fix switchyard's broken icon") is the command
-that triggers it.
+**PRSR-41 was found by running the binary** — the third time on this axis that
+has caught something reading could not (PRSR-31's outcome line, PRSR-38's
+fixture, and now this), and it is fixed. See the invariant above.
 
 **PRSR-36** asked for two Cloudflare response shapes that PRSR-28's fixes were
 reasoning about from the published schema rather than from a response anybody

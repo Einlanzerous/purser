@@ -1506,3 +1506,458 @@ func TestEnsure_ARottedLogoTheSpecStillAsksForIsCleared(t *testing.T) {
 		t.Errorf("the second plan should have nothing left to act on, got %q", again.Detail)
 	}
 }
+
+// ─── which application is this hostname's? (PRSR-41) ────────────────────────
+
+// bypassApp is the shape that made PRSR-41 real: an application scoped to a
+// *path* beneath the hostname, whose only policy is `decision: bypass` — no
+// Access authentication at all.
+//
+// It is a real object from the estate, not an invented adversarial case. The
+// GitHub webhook must reach switchyard.zerogravity.industries/v1/external/github
+// without an Access login, because it authenticates by HMAC instead, and that is
+// safe exactly and only because the application is confined to that path.
+func bypassApp(hostname string) map[string]any {
+	return map[string]any{
+		"id":                   "app-bypass",
+		"uid":                  "app-bypass",
+		"type":                 "self_hosted",
+		"name":                 "github webhook (bypass)",
+		"domain":               hostname + "/v1/external/github",
+		"self_hosted_domains":  []any{hostname + "/v1/external/github"},
+		"destinations":         []any{map[string]any{"type": "public", "uri": hostname + "/v1/external/github"}},
+		"app_launcher_visible": false,
+		"policies": []any{map[string]any{
+			"id":       "pol-bypass",
+			"name":     "public webhook (GitHub HMAC-authed)",
+			"decision": "bypass",
+			"reusable": false,
+			"include":  []any{map[string]any{"everyone": map[string]any{}}},
+		}},
+	}
+}
+
+// A path-scoped application is not this hostname's application, and an update
+// must never land on it.
+//
+// This is PRSR-41 in one test. domainHost strips the path — deliberately, so a
+// bookmark's URL and a self_hosted app's bare hostname compare equal — so the
+// bypass app *matched* the hostname, and findApp took the first match. It sorts
+// first here for the same reason it did live.
+//
+// What an --apply would then have done is the part that matters: desiredApp
+// writes `domain` from the spec, so the bypass application's domain would have
+// been rewritten from the webhook path to the bare hostname, widening an
+// unauthenticated bypass to the whole service — while the real application sat
+// untouched, so nothing looked like it had landed in the wrong place.
+func TestFindApp_APathScopedApplicationIsNotThisHostnamesApp(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	real := liveGatedApp("")
+	api := &accessAPI{apps: []map[string]any{bypassApp(testHost), real}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if st.ExternalID != "app-1" {
+		t.Fatalf("inspect resolved to %q, want the whole-host application app-1", st.ExternalID)
+	}
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if strings.Contains(api.lastPath, "app-bypass") {
+		t.Fatalf("the update was aimed at the path-scoped bypass application: %s %s", api.lastMethod, api.lastPath)
+	}
+	// And the update landed on the real application, which is the other half of
+	// the same claim: aiming somewhere is not the same as not aiming at the
+	// bypass, and a run that wrote to neither would pass the check above.
+	if !strings.Contains(api.lastPath, "app-1") {
+		t.Fatalf("the update should have been aimed at the whole-host application, got %s %s", api.lastMethod, api.lastPath)
+	}
+}
+
+// A hostname served only by a path-scoped application has no application of its
+// own, so the spec creates one.
+//
+// Correct rather than merely safe: Access matches the more specific path first,
+// so a hostname-wide gate in front of a narrower bypass is the shape this estate
+// already runs. Returning the bypass app here instead would be the original bug
+// with one fewer application in the account.
+func TestFindApp_OnlyAPathScopedApplicationReadsAsAbsent(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	api := &accessAPI{apps: []map[string]any{bypassApp(testHost)}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if st.Exists {
+		t.Fatalf("a path-scoped app is not this hostname's app, got Exists with id %q", st.ExternalID)
+	}
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if api.lastMethod != http.MethodPost {
+		t.Errorf("want a create, got %s %s", api.lastMethod, api.lastPath)
+	}
+	if strings.Contains(api.lastPath, "app-bypass") {
+		t.Errorf("the bypass application was written to: %s", api.lastPath)
+	}
+}
+
+// Two applications genuinely fronting the same whole hostname is refused, not
+// guessed at.
+//
+// spinup.ErrRefused rather than an ordinary error, so the orchestrator reports
+// `refused` rather than `unknown`: the read succeeded, re-running will not
+// change the answer, and what fixes it is a human editing the account. That is
+// dns.go's pickCandidate reasoning, and the refused/unknown split PRSR-31 drew
+// exists precisely so this does not print "could not be read — re-run" for ever.
+func TestFindApp_TwoWholeHostApplicationsAreRefused(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	first := liveGatedApp("")
+	second := liveGatedApp("")
+	second["id"] = "app-2"
+	second["name"] = "argosy (duplicate)"
+	api := &accessAPI{apps: []map[string]any{first, second}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	_, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)})
+	if err == nil {
+		t.Fatal("two applications on one hostname must be refused, not resolved")
+	}
+	if !spinup.IsRefused(err) {
+		t.Errorf("want a refusal the orchestrator reports as `refused`, got %v", err)
+	}
+	// Naming them is the whole use of the message: an operator has to know which
+	// objects to go and look at.
+	for _, want := range []string{"app-1", "app-2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must name the candidates; %q missing from %q", want, err)
+		}
+	}
+}
+
+func TestServesWholeHost(t *testing.T) {
+	cases := []struct {
+		domain string
+		want   hostVerdict
+		why    string
+	}{
+		{"argosy.zerogravity.industries", hostWhole, "a self_hosted app's bare hostname"},
+		{"https://argosy.zerogravity.industries", hostWhole, "a bookmark carries a full URL"},
+		{"https://argosy.zerogravity.industries/", hostWhole, "a trailing slash is the host, not a path under it"},
+		{"ARGOSY.ZeroGravity.Industries", hostWhole, "hostnames are case-insensitive"},
+		{"argosy.zerogravity.industries.", hostWhole, "a trailing dot is the same name"},
+		{"argosy.zerogravity.industries/v1/external/github", hostPath, "a path beneath the host is somebody else's object"},
+		{"https://argosy.zerogravity.industries/admin", hostPath, "a path beneath the host, spelled as a URL"},
+		{"other.zerogravity.industries", hostPath, "a different host entirely"},
+		{"", hostPath, "no domain at all"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.domain, func(t *testing.T) {
+			got := servesWholeHost(rawApp{"domain": tc.domain}, testHost)
+			if got != tc.want {
+				t.Errorf("servesWholeHost(%q) = %v, want %v — %s", tc.domain, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+// All three spellings of what an application fronts are read, and a path
+// disqualifies only when nothing names the host whole.
+//
+// A self_hosted application carries what it fronts twice, and every one on this
+// account agrees across the two — checked 2026-08-26, all seven, the path-scoped
+// bypass included. That is an observation about today, and this predicate gates a
+// full-replacement PUT: if the two ever disagree, reading `domain` alone would
+// call a path-scoped application this spec's and write to it, which is the exact
+// failure PRSR-41 is about.
+//
+// The asymmetry is why it errs this way. A false "not ours" costs a redundant
+// create that Access resolves by preferring the more specific path; a false
+// "ours" costs somebody else's application.
+func TestServesWholeHost_ReadsEverySpellingOfWhatItFronts(t *testing.T) {
+	dest := func(uris ...string) []any {
+		out := make([]any, 0, len(uris))
+		for _, u := range uris {
+			out = append(out, map[string]any{"type": "public", "uri": u})
+		}
+		return out
+	}
+	cases := []struct {
+		name string
+		app  rawApp
+		want hostVerdict
+	}{
+		{
+			"both spellings name the whole host — the ordinary live shape",
+			rawApp{"domain": testHost, "destinations": dest(testHost)},
+			hostWhole,
+		},
+		{
+			"a bare-host domain with the path only in destinations is NOT ours",
+			rawApp{"domain": testHost, "destinations": dest(testHost + "/v1/external/github")},
+			hostPath,
+		},
+		{
+			// The bypass as it actually is: the path in all three fields. Caught
+			// by `domain` alone, but worth pinning as the shape that exists.
+			"the live bypass, path in all three fields",
+			rawApp{
+				"domain":              testHost + "/v1/external/github",
+				"destinations":        dest(testHost + "/v1/external/github"),
+				"self_hosted_domains": []any{testHost + "/v1/external/github"},
+			},
+			hostPath,
+		},
+		{
+			// Fronting the whole host AND a path under it is still fronting the
+			// whole host. Calling this somebody else's makes the plan report
+			// `create`, and --apply then stands up a *second* whole-host
+			// application while the real one sits untouched and unrecorded — the
+			// duplicate listApps exists to prevent. "Access prefers the more
+			// specific path" does not rescue that: it only helps when the loser
+			// is narrower, and here both are hostname-wide.
+			"a whole-host destination alongside a path-scoped sibling is still ours",
+			rawApp{"domain": testHost, "destinations": dest(testHost, testHost+"/admin")},
+			hostWhole,
+		},
+		{
+			// The third spelling. desiredApp already deletes this field by name
+			// on a bookmark conversion and the bypass fixture carries the path
+			// in it, so reading only two of the three was an enumeration gap
+			// rather than a judgement call.
+			"a path living only in self_hosted_domains disqualifies too",
+			rawApp{"domain": testHost, "self_hosted_domains": []any{testHost + "/v1/external/github"}},
+			hostPath,
+		},
+		{
+			// The disagreement, both ways round, and the only state in which
+			// reading a second list changes any answer at all — while the fields
+			// agree, `domain` alone already decides.
+			//
+			// Neither answer is knowable here: which spelling is true depends on
+			// the field Access honours, which is what this package does not know.
+			// And both are wrong expensively — "not ours" makes the plan say
+			// `create` and --apply stands up a duplicate whole-host application
+			// that nothing afterwards reports; "ours" writes the spec onto an
+			// application that may cover only a path, and lets DNS publish in
+			// front of it. So it refuses, which is correct without knowing the
+			// answer.
+			"a path-only destinations beside a whole-host self_hosted_domains is undecidable",
+			rawApp{
+				"domain":              testHost,
+				"destinations":        dest(testHost + "/v1/external/github"),
+				"self_hosted_domains": []any{testHost},
+			},
+			hostAmbiguous,
+		},
+		{
+			"a path-only self_hosted_domains beside a whole-host destinations is undecidable",
+			rawApp{
+				"domain":              testHost,
+				"destinations":        dest(testHost),
+				"self_hosted_domains": []any{testHost + "/admin"},
+			},
+			hostAmbiguous,
+		},
+		{
+			// Within one field, a whole-host entry alongside a path-scoped
+			// sibling still passes — the rule is per field, not per entry.
+			"the within-field rule still holds for self_hosted_domains",
+			rawApp{
+				"domain":              testHost,
+				"self_hosted_domains": []any{testHost, testHost + "/admin"},
+			},
+			hostWhole,
+		},
+		{
+			"all three naming the whole host — the live shape, all seven of them",
+			rawApp{
+				"domain":              testHost,
+				"destinations":        dest(testHost),
+				"self_hosted_domains": []any{testHost},
+			},
+			hostWhole,
+		},
+		{
+			"a destination for some other host is not this predicate's business",
+			rawApp{"domain": testHost, "destinations": dest(testHost, "other.example.com/admin")},
+			hostWhole,
+		},
+		{
+			"no destinations key at all — a bookmark, and the older self_hosted shape",
+			rawApp{"domain": "https://" + testHost},
+			hostWhole,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := servesWholeHost(tc.app, testHost); got != tc.want {
+				t.Errorf("servesWholeHost = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A recorded application that somebody has since scoped to a path is still
+// there, and a failed delete must say so.
+//
+// This is the regression PRSR-41's narrowing introduced and review caught. While
+// findApp returned the first application whose domain reduced to the hostname,
+// "nothing serves this hostname" was a fair reading of nil. Once it narrowed to
+// whole-host applications, a hostname-shaped re-read stopped seeing a path-scoped
+// remnant of *our own* application — so a failed DELETE reported success while
+// the gate stood, which is the revoked-not-recorded class: silent, and surviving
+// a re-run.
+//
+// confirmGone therefore asks about the id, not the hostname.
+func TestTeardown_ARecordedAppScopedToAPathIsStillThere(t *testing.T) {
+	api := &accessAPI{
+		deleteStatus: http.StatusInternalServerError,
+		apps: []map[string]any{{
+			// Our recorded application, hand-edited to a path since we wrote it.
+			"id": "app-1", "type": "self_hosted", "name": "Argosy",
+			"domain": testHost + "/admin",
+		}},
+	}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
+
+	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+		model.ServiceResource{ExternalID: "app-1"})
+	if err == nil {
+		t.Fatal("the recorded application still exists, so the delete must not report success")
+	}
+	if !strings.Contains(err.Error(), "still there") {
+		t.Errorf("the error should say the application is still there, got %v", err)
+	}
+}
+
+// A path-scoped application that was never ours does not block a teardown.
+//
+// The counterpart to the test above, and the reason confirmGone asks about the
+// id first rather than simply widening back to "anything on this hostname". The
+// GitHub webhook's bypass is not this spec's application — that is the whole of
+// PRSR-41 — so it is not evidence our delete failed, and treating it as one
+// would turn an object nobody may touch into a permanent teardown failure.
+func TestTeardown_ABypassOnAPathDoesNotBlockIt(t *testing.T) {
+	api := &accessAPI{
+		deleteStatus: http.StatusNotFound,
+		apps:         []map[string]any{bypassApp(testHost)},
+	}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
+
+	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+		model.ServiceResource{ExternalID: "app-gone"})
+	if err != nil {
+		t.Fatalf("a path-scoped application was never this spec's, so it cannot hold up its teardown: %v", err)
+	}
+}
+
+// A create in front of an existing path-scoped application says so in the plan.
+//
+// Creating here is correct — Access matches the more specific path first — but
+// "correct because of a rule you have to know" is worth a line. Nobody knowing
+// that rule, or that these objects existed at all, is what let PRSR-41 sit
+// unnoticed in the account.
+func TestInspect_ACreateNamesThePathScopedApplicationsItLandsInFrontOf(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	api := &accessAPI{apps: []map[string]any{bypassApp(testHost)}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if st.Exists {
+		t.Fatal("a path-scoped app is not this hostname's app")
+	}
+	for _, want := range []string{"path beneath it", "app-bypass"} {
+		if !strings.Contains(st.Detail, want) {
+			t.Errorf("the plan should name what already serves a path here; %q missing from %q", want, st.Detail)
+		}
+	}
+}
+
+// An application whose own spellings disagree is refused, not resolved.
+//
+// findApp checks this before counting whole-host candidates, because an
+// application nobody can classify is exactly the one that might or might not
+// belong in that count.
+//
+// spinup.ErrRefused rather than an ordinary error for the reason pickCandidate
+// uses it: the read succeeded, re-running will not change the answer, and what
+// fixes it is a human editing the account. It also holds the DNS step, so a
+// service meant to be gated is not published in front of an application whose
+// coverage nobody could establish.
+func TestFindApp_AnApplicationThatDescribesItselfInconsistentlyIsRefused(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	app := liveGatedApp("")
+	app["id"] = "app-mixed"
+	app["destinations"] = []any{map[string]any{"type": "public", "uri": testHost + "/v1/external/github"}}
+	app["self_hosted_domains"] = []any{testHost} // disagrees with destinations
+
+	api := &accessAPI{apps: []map[string]any{app}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	_, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)})
+	if err == nil {
+		t.Fatal("an application whose spellings disagree must be refused, not guessed at")
+	}
+	if !spinup.IsRefused(err) {
+		t.Errorf("want a refusal the orchestrator reports as `refused`, got %v", err)
+	}
+	for _, want := range []string{"app-mixed", "destinations", "self_hosted_domains"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must name the application and the fields that disagree; %q missing from %q", want, err)
+		}
+	}
+}
+
+// An application whose spellings disagree cannot confirm a teardown either.
+//
+// servesWholeHost grew a third answer and both call sites had to decide what to
+// do with it. findApp refuses; confirmGone tested `== hostWhole`, so
+// hostAmbiguous fell through the equality into the same bucket as hostPath —
+// "was never this spec's, not evidence our delete failed" — and the function
+// returned nil, claiming the teardown succeeded.
+//
+// hostPath earns that pass because Purser *knows* the application was never this
+// spec's. hostAmbiguous is the state where it knows nothing, which is Teardown's
+// third documented outcome — the read completed and its answer cannot be
+// classified — and the one place in this file where the undecidable answer must
+// not resolve to "absent". PRSR-34's walk will read a nil here as licence to drop
+// the service_resource row, after which the remaining application is tracked by
+// nothing.
+//
+// Erroring is the safe direction here in a way it is not in findApp: a wrong
+// error costs a noisy retry, a wrong nil costs a removal recorded over a live
+// gate.
+func TestTeardown_AnInconsistentApplicationCannotConfirmTheGateIsDown(t *testing.T) {
+	other := liveGatedApp("")
+	other["id"] = "app-mixed"
+	other["destinations"] = []any{map[string]any{"type": "public", "uri": testHost}}
+	other["self_hosted_domains"] = []any{testHost + "/admin"} // disagrees
+
+	api := &accessAPI{
+		deleteStatus: http.StatusInternalServerError,
+		apps:         []map[string]any{other}, // the recorded id is already gone
+	}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
+
+	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+		model.ServiceResource{ExternalID: "app-recorded-and-gone"})
+	if err == nil {
+		t.Fatal("an application that may gate this hostname must not be read as nothing gating it")
+	}
+	for _, want := range []string{"app-mixed", "could not be confirmed gone", "inconsistently"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error should say what could not be established; %q missing from %q", want, err)
+		}
+	}
+}

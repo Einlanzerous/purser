@@ -215,12 +215,20 @@ func (p *AccessProvisioner) Inspect(ctx context.Context, t spinup.Target) (spinu
 	if err := p.available(t.Spec); err != nil {
 		return spinup.State{}, err
 	}
-	found, err := p.findApp(ctx, t.Spec.Hostname)
+	found, others, err := p.findApp(ctx, t.Spec.Hostname)
 	if err != nil {
 		return spinup.State{}, err
 	}
 	if found == nil {
-		return spinup.State{}, nil // Exists false: nothing here, and we could read to be sure
+		// Exists false: nothing here, and we could read to be sure.
+		//
+		// If something else answers for this hostname on a path, say so. An
+		// --apply here creates a hostname-wide application in front of an
+		// existing path-scoped one, and the entire argument that this is safe
+		// rests on Access matching the more specific path first — so the
+		// operator should be told the more specific rule is there rather than
+		// have to know. Nobody knowing is how PRSR-41 stayed invisible.
+		return spinup.State{Detail: coResidentNote(others)}, nil
 	}
 
 	st := spinup.State{
@@ -239,7 +247,7 @@ func (p *AccessProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 	if err := p.available(t.Spec); err != nil {
 		return spinup.Resource{}, err
 	}
-	found, err := p.findApp(ctx, t.Spec.Hostname)
+	found, _, err := p.findApp(ctx, t.Spec.Hostname)
 	if err != nil {
 		return spinup.Resource{}, err
 	}
@@ -319,18 +327,80 @@ func (p *AccessProvisioner) Teardown(ctx context.Context, t spinup.Target, rec m
 	return nil
 }
 
-// confirmGone decides what a failed delete meant, by reading the hostname back.
+// confirmGone decides what a failed delete meant, by re-reading the account.
+//
+// Two questions, in order, because they fail in opposite directions and only
+// asking one of them is wrong either way.
+//
+// **Is the recorded application still there?** Asked by id. This is the question
+// that broke when findApp narrowed to whole-host applications (PRSR-41): while
+// findApp returned the first application whose domain reduced to the hostname,
+// "nothing serves this hostname" was a fair reading of nil, but afterwards nil
+// means "no *whole-host* application serves it" and a path-scoped one can be
+// sitting right there. Sequence: Purser records app A for hostname H; somebody
+// scopes A to H/admin in the dashboard; a Teardown's DELETE fails on a blip; a
+// hostname-shaped re-read finds A, rejects it as not-whole-host, and reports
+// success. A still exists and still gates, and Purser has recorded a removal
+// that did not happen — the revoked-not-recorded class, silent and surviving a
+// re-run.
+//
+// **Failing that, does anything else still gate this hostname?** A 404 against a
+// recorded external_id is a wrong record, not absent access — the same rule the
+// person axis holds for Switchyard and Lyceum. If the id we hold is gone but a
+// whole-host application is still serving the name, the service is still gated
+// and reporting the teardown as done would be exactly the lie PRSR-17 exists to
+// prevent.
+//
+// A remaining **path-scoped** application is deliberately not an error. It was
+// never this spec's — that is the whole of PRSR-41 — so it is not evidence our
+// delete failed, and treating it as one would make a bypass nobody may touch
+// into a permanent teardown failure.
+//
+// listApps rather than appsOn for the first question, because "does this object
+// still exist" is not a question about a hostname: an application somebody has
+// since pointed elsewhere would not appear in a hostname-filtered list.
 func (p *AccessProvisioner) confirmGone(ctx context.Context, hostname, recordedID string, cause error) error {
-	found, lookupErr := p.findApp(ctx, hostname)
-	switch {
-	case lookupErr != nil:
-		return fmt.Errorf("cloudflare: deleting Access application %s failed (%v), and %s could not be re-read to find out whether it is gone: %w",
-			recordedID, cause, hostname, lookupErr)
-	case found != nil:
-		return fmt.Errorf("cloudflare: deleting Access application %s failed (%v), and %q is still served by application %s — the gate is still up",
-			recordedID, cause, hostname, appStr(found, "id"))
+	all, lookupErr := p.listApps(ctx)
+	if lookupErr != nil {
+		return fmt.Errorf("cloudflare: deleting Access application %s failed (%v), and the account could not be re-read to find out whether it is gone: %w",
+			recordedID, cause, lookupErr)
 	}
-	return nil // nothing serves the hostname: it really is gone
+	for _, app := range all {
+		if appStr(app, "id") == recordedID {
+			return fmt.Errorf("cloudflare: deleting Access application %s failed (%v) and it is still there, serving %q — the gate is still up",
+				recordedID, cause, appStr(app, "domain"))
+		}
+	}
+	for _, app := range all {
+		if domainHost(appStr(app, "domain")) != hostname {
+			continue
+		}
+		// `!= hostPath`, not `== hostWhole`. hostPath earns its pass because
+		// Purser *knows* that application was never this spec's; hostAmbiguous is
+		// the state where it knows nothing, and bucketing it with hostPath would
+		// have the one caller that must never treat unverifiable as absent do
+		// exactly that. Teardown's own doc block lists it as the third outcome —
+		// the read completed and its answer cannot be classified — and a `nil`
+		// here is what PRSR-34's walk will read as licence to drop the
+		// service_resource row, so the remaining application stops being tracked
+		// by anything.
+		//
+		// Erroring is the safe direction here in a way it is not in findApp: a
+		// wrong error costs a noisy retry on a teardown, and a wrong nil costs a
+		// removal recorded over a live gate.
+		switch servesWholeHost(app, hostname) {
+		case hostWhole:
+			return fmt.Errorf("cloudflare: deleting Access application %s failed (%v) and no application with that id exists, but %q is still served by application %s — the record was wrong and the gate is still up",
+				recordedID, cause, hostname, appStr(app, "id"))
+		case hostAmbiguous:
+			return fmt.Errorf("cloudflare: deleting Access application %s failed (%v) and no application with that id exists; %q could not be confirmed gone because application %s describes what it fronts inconsistently — one of `destinations` / `self_hosted_domains` names the hostname itself and the other names only a path beneath it",
+				recordedID, cause, hostname, appStr(app, "id"))
+		}
+	}
+	// The recorded application is gone and nothing else gates the hostname.
+	// This also covers the case a code test cannot: a delete that failed at the
+	// transport after Cloudflare had already applied it.
+	return nil
 }
 
 // ─── the application object ────────────────────────────────────────────────
@@ -379,6 +449,19 @@ func (p *AccessProvisioner) desiredApp(base rawApp, spec spinup.ServiceSpec, log
 
 	out["type"] = appType(spec.Access)
 	out["name"] = spec.DisplayName
+	// `domain` is written on the update path too, which PRSR-41 asked whether it
+	// should be — it was the field that carried that bug, since writing the
+	// spec's bare hostname over a path-scoped application's domain is what
+	// widened an unauthenticated bypass to a whole service.
+	//
+	// It stays, because the power to do that came from *which application was
+	// selected*, not from writing the field, and findApp is where that was fixed:
+	// base is now guaranteed to be an application already serving this hostname
+	// whole, so this assignment is a no-op in every case but one. That one is a
+	// type change — a bookmark's domain carries a scheme and a self_hosted app's
+	// does not — and omitting the key there would leave a converted application
+	// with the other shape's domain, which is a real breakage in exchange for
+	// guarding against a bug that no longer has a route in.
 	out["domain"] = appDomain(spec)
 	out["app_launcher_visible"] = true
 
@@ -434,6 +517,15 @@ func (p *AccessProvisioner) desiredApp(base rawApp, spec spinup.ServiceSpec, log
 		// keep its old gate, and there is nothing here anyone could have added
 		// deliberately.
 		out["policies"] = []any{}
+		// The two self_hosted-only spellings of what an application fronts go
+		// with it, for the same reason and by the same evidence: a live bookmark
+		// carries neither key (observed on the disposable one PRSR-40 created,
+		// and on both live bookmarks), so carrying a converted application's old
+		// `destinations` across would leave the object describing an origin a
+		// bookmark does not have — and `destinations` is the field servesWholeHost
+		// reads to decide whose application this is.
+		delete(out, "destinations")
+		delete(out, "self_hosted_domains")
 	}
 	return out
 }
@@ -514,9 +606,13 @@ func (p *AccessProvisioner) diff(ctx context.Context, live rawApp, spec spinup.S
 	if got, want := appStr(live, "name"), spec.DisplayName; got != want {
 		diffs = append(diffs, fmt.Sprintf("name is %q, spec wants %q", got, want))
 	}
-	if got, want := domainHost(appStr(live, "domain")), spec.Hostname; got != want {
-		diffs = append(diffs, fmt.Sprintf("domain resolves to %q, spec wants %q", got, want))
-	}
+	// No domain check here, deliberately. findApp only returns an application
+	// that serves this hostname whole, so `domainHost(live) != spec.Hostname` can
+	// no longer be true and the line it used to print would be source with no
+	// reachable caller (PRSR-41). The check moved rather than went away: it is
+	// now the thing that decides *which* application this is, before any of this
+	// runs, which is a stronger place for it than a drift line an operator has to
+	// notice.
 	if v, ok := live["app_launcher_visible"].(bool); ok && !v {
 		diffs = append(diffs, "hidden from the App Launcher")
 	}
@@ -989,14 +1085,109 @@ const (
 	maxAccessAppPages = 40
 )
 
-// findApp returns the application serving hostname, or nil if there is none.
+// findApp returns the application this spec manages, or nil if there is none.
 //
 // A list-and-match rather than a filtered query: Cloudflare's apps endpoint has
 // no documented exact-domain filter, and matching here means one definition of
-// "this hostname's app" shared by Inspect, Ensure and Teardown. Two apps on one
-// hostname is a state this does not try to resolve — the first match wins and
-// the caller's plan will describe it, which is more useful than an error that
-// stops the run.
+// "this hostname's app" shared by Inspect, Ensure and Teardown.
+//
+// # An application that serves a *path* is not this hostname's application
+//
+// This used to take the first application whose domain reduced to the hostname,
+// on the reasoning that "two apps on one hostname is a state this does not try
+// to resolve — the first match wins and the caller's plan will describe it,
+// which is more useful than an error that stops the run". Running the binary
+// against the estate showed what that costs (PRSR-41).
+//
+// domainHost strips the path, because it exists to make a bookmark's
+// "https://argosy…/" compare equal to a self_hosted app's bare hostname. Two
+// applications therefore matched switchyard.zerogravity.industries: the service
+// itself, and a **path-scoped** application on
+// switchyard.zerogravity.industries/v1/external/github whose single policy is
+// `decision: bypass` — no Access authentication at all, which is correct for a
+// GitHub webhook that authenticates by HMAC instead, and safe *only* because it
+// is confined to that path.
+//
+// The bypass one sorts first, so it won. And desiredApp writes `domain` from the
+// spec, so an --apply would have rewritten that application's domain to the bare
+// hostname — widening an unauthenticated bypass from one webhook path to the
+// whole of Switchyard, while leaving the real application untouched so nothing
+// looked like it had landed in the wrong place. The plan did describe it, which
+// was the defence being relied on; it described it as `update`, which is not a
+// line that invites suspicion on a service you meant to update.
+//
+// So the match is on the whole hostname and nothing less. An application whose
+// domain carries a path is somebody else's object with its own reason to exist,
+// and this axis has no business writing to it: a spec names a hostname, and what
+// it manages is the application in front of that hostname.
+//
+// The three answers, and none of them is "the first one":
+//
+//   - exactly one application serves the whole host → that is this spec's;
+//   - none does → nil, which Ensure turns into a create. Correct even when
+//     path-scoped applications exist: Access matches the more specific path
+//     first, so a hostname-wide gate in front of a narrower bypass is the shape
+//     this estate already runs, not a collision;
+//   - more than one does → spinup.ErrRefused, naming them. A guess there costs
+//     whichever application was not this service's, which is dns.go's
+//     pickCandidate reasoning exactly. Refused rather than unknown because the
+//     read succeeded: re-running will not fix it and a human editing the account
+//     will (PRSR-31).
+
+func (p *AccessProvisioner) findApp(ctx context.Context, hostname string) (rawApp, []rawApp, error) {
+	onHost, err := p.appsOn(ctx, hostname)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var whole, others, ambiguous []rawApp
+	for _, app := range onHost {
+		switch servesWholeHost(app, hostname) {
+		case hostWhole:
+			whole = append(whole, app)
+		case hostAmbiguous:
+			ambiguous = append(ambiguous, app)
+		default:
+			others = append(others, app)
+		}
+	}
+
+	// Checked before the count below, because an application nobody can classify
+	// makes that count meaningless: it is exactly the one that might or might not
+	// belong in `whole`.
+	if len(ambiguous) > 0 {
+		return nil, others, fmt.Errorf("%w: cloudflare: %s describes what it fronts inconsistently — one of `destinations` / `self_hosted_domains` names %s itself and the other names only a path beneath it — so Purser cannot tell whether it is this service's application; resolve it in the Cloudflare dashboard",
+			spinup.ErrRefused, describeApps(ambiguous), hostname)
+	}
+
+	switch len(whole) {
+	case 0:
+		return nil, others, nil
+	case 1:
+		return whole[0], others, nil
+	}
+	return nil, others, fmt.Errorf("%w: cloudflare: %d Access applications serve %s and Purser will not guess which is this service's (%s); resolve it in the Cloudflare dashboard",
+		spinup.ErrRefused, len(whole), hostname, describeApps(whole))
+}
+
+// appsOn returns every application whose domain reduces to hostname, path or no
+// path. Callers decide what to do about more than one.
+
+func (p *AccessProvisioner) appsOn(ctx context.Context, hostname string) ([]rawApp, error) {
+	all, err := p.listApps(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var found []rawApp
+	for _, app := range all {
+		if domainHost(appStr(app, "domain")) == hostname {
+			found = append(found, app)
+		}
+	}
+	return found, nil
+}
+
+// listApps returns every Access application in the account.
 //
 // # Why this pages, and why "not found" is the dangerous answer
 //
@@ -1019,7 +1210,8 @@ const (
 // full page for ever, and a loop that trusted fullness would never terminate.
 // Absent result_info means one page, which is the right reading of an endpoint
 // that does not paginate.
-func (p *AccessProvisioner) findApp(ctx context.Context, hostname string) (rawApp, error) {
+func (p *AccessProvisioner) listApps(ctx context.Context) ([]rawApp, error) {
+	var found []rawApp
 	for page := 1; page <= maxAccessAppPages; page++ {
 		path := fmt.Sprintf("/accounts/%s/access/apps?page=%d&per_page=%d", p.cfg.AccountID, page, accessAppsPerPage)
 		raw, err := p.api.do(ctx, http.MethodGet, path, nil)
@@ -1036,19 +1228,224 @@ func (p *AccessProvisioner) findApp(ctx context.Context, hostname string) (rawAp
 		if err := json.Unmarshal(raw, &env); err != nil {
 			return nil, fmt.Errorf("cloudflare: decode applications: %w", err)
 		}
-		for _, app := range env.Result {
-			if domainHost(appStr(app, "domain")) == hostname {
-				return app, nil
-			}
-		}
+		found = append(found, env.Result...)
 		if env.ResultInfo.TotalPages <= 1 || page >= env.ResultInfo.TotalPages {
-			return nil, nil
+			return found, nil
 		}
 	}
 	// Ran out of pages to read. Reported rather than answered: "not found" here
 	// would send Ensure off to create a duplicate, which is the one outcome this
 	// whole function exists to avoid.
-	return nil, fmt.Errorf("cloudflare: gave up listing applications for %s after %d pages — refusing to report it absent on a partial read", hostname, maxAccessAppPages)
+	return nil, fmt.Errorf("cloudflare: gave up listing Access applications after %d pages — refusing to report anything absent on a partial read", maxAccessAppPages)
+}
+
+// servesWholeHost reports whether app fronts the hostname itself rather than a
+// path beneath it.
+//
+// domainHost cannot answer this — it strips the path on purpose, so that a
+// bookmark's "https://argosy.zerogravity.industries" and a self_hosted app's
+// bare hostname compare equal. That is right for "which hostname is this app
+// about" and wrong for "is this app the one this spec manages", and PRSR-41 is
+// what happens when the second question is answered with the first.
+//
+// # All three spellings are read, not just `domain`
+//
+// A self_hosted application carries what it fronts three times: `domain`,
+// `destinations[].uri`, and `self_hosted_domains`. This package already knows
+// about all three — the bypass fixture built from the real estate object carries
+// the path in each, and desiredApp deletes the latter two by name when
+// converting to a bookmark — so reading only some of them is an enumeration gap
+// rather than a judgement call.
+//
+// Every self_hosted application on this account agrees across all three, checked
+// 2026-08-26: all seven, the path-scoped bypass included. That is an observation
+// about today and not a guarantee, and this predicate gates a full-replacement
+// PUT — a bare-host `domain` with the path living only in one of the other two
+// would otherwise read as this spec's application, and --apply would write the
+// spec's name, launcher visibility, logo and members policy onto it. PRSR-41's
+// outcome reached one field over.
+//
+// # A path-carrying spelling disqualifies only when nothing names the host whole
+//
+// The naive rule — any same-host path anywhere means not ours — is wrong in the
+// other direction, and wrong there is worse. An application with `domain: H` and
+// destinations `[H, H/admin]` genuinely does front the whole host; calling it
+// somebody else's makes the plan report `create`, and --apply then stands up a
+// **second** whole-host application for H while the real one sits untouched and
+// unrecorded. That is the duplicate listApps exists to prevent, and the usual
+// mitigation does not reach it: "Access prefers the more specific path" only
+// helps when the loser is narrower, and here both are hostname-wide.
+//
+// So: among the per-destination spellings that name this hostname at all, at
+// least one must name it whole. None naming it is fine — that is a bookmark, and
+// the older self_hosted shape that carried only `domain`.
+//
+// # When the two lists disagree, the answer is neither yes nor no
+//
+// One spelling naming the host whole while the other names only a path beneath
+// it is a state Purser cannot resolve, because which one is true depends on the
+// field Access honours — and that is exactly what this package does not know.
+// Both answers are wrong in that state, and one of them is expensively wrong:
+// reporting "not ours" makes the plan say `create`, and --apply then stands up a
+// **second** whole-host application for the name while the existing one sits
+// untouched and unrecorded. The next run sees one whole-host application (ours)
+// and the two-candidate refusal never fires, so nothing ever reports the pair —
+// self-concealing, and the duplicate listApps exists to prevent. Reporting
+// "ours" is the mirror: --apply writes the spec onto an application that may
+// cover only a path, the Access step succeeds, dependsOn lets DNS publish, and a
+// service meant to be gated answers ungated.
+//
+// So it is `spinup.ErrRefused`, which is this package's existing answer to "the
+// read succeeded and Purser cannot tell which object this is" — pickCandidate's
+// reasoning, and the two-whole-host branch's. Refused rather than unknown for
+// the same reason: re-running will not change it, and a human editing the
+// account will. It holds the DNS step rather than publishing, and it prints a
+// line naming the application and the two fields that disagree.
+//
+// It is correct without knowing which field Access honours, which is what makes
+// it the right answer rather than a deferral. Every state where the fields agree
+// is untouched — which is all seven live applications.
+//
+// # The question is asked per field, not over the two pooled together
+//
+// Pooling them looks equivalent and inverts the answer in exactly the state the
+// third field was added for. `destinations: [H/v1/external/github]` with
+// `self_hosted_domains: [H]` pools to "one entry names it whole", so the
+// path-only destination is excused by the bare host in the other field and the
+// application reads as this spec's — while `destinations` alone, the field
+// Cloudflare documents as the successor, says it covers a path and nothing else.
+// An --apply would then write the spec's name, launcher visibility, logo and
+// members policy onto it, the Access step would succeed, `dependsOn` would let
+// DNS publish, and a service meant to be gated would answer ungated: the
+// self-concealing direction KindOrder exists to close.
+//
+// The two fields disagreeing is unobserved — all seven live applications agree
+// across all three, bypass included. That is precisely why the pooling matters:
+// while they agree, `domain` alone already decides every case and neither list
+// does any work, so the *only* state in which reading a second list changes an
+// answer is the state where they differ. Reading it in a way that does not
+// survive the difference is reading it for nothing.
+//
+// # Selection is still on `domain`, and that is deliberate
+//
+// This predicate decides whether a *candidate* is this spec's. appsOn picks the
+// candidates, and it keys on `domain` alone — so the three-field rule can
+// disqualify an application, never discover one. An application whose `domain`
+// names another host while a destination fronts this one is not considered at
+// all.
+//
+// That is the right primary key rather than an oversight. `domain` is the only
+// one of the three every application has: a bookmark carries no `destinations`
+// and no `self_hosted_domains`, so one filter serves both shapes only if it reads
+// the field both shapes populate. And it is the field Cloudflare's own dashboard
+// shows as what the application is about, so selecting on anything else would
+// have Purser disagree with what an operator sees. The extra fields are a safety
+// check on a candidate, not a wider net.
+//
+// The scheme is stripped for the same reason domainHost strips it, and a
+// trailing slash with it: "https://argosy.zerogravity.industries/" is the whole
+// host, not a path under it. Anything left after the hostname is a path.
+func servesWholeHost(app rawApp, hostname string) hostVerdict {
+	if !isWholeHost(appStr(app, "domain"), hostname) {
+		return hostPath
+	}
+
+	// Per field, never pooled: a path in one list must not be excused by a bare
+	// host in the other, since that is the only state in which reading a second
+	// list changes any answer at all.
+	var sawWhole, sawPathOnly bool
+	for _, field := range [][]string{destinationURIs(app), selfHostedDomains(app)} {
+		named, whole := 0, 0
+		for _, uri := range field {
+			if domainHost(uri) != hostname {
+				continue // some other host is not this predicate's business
+			}
+			named++
+			if isWholeHost(uri, hostname) {
+				whole++
+			}
+		}
+		switch {
+		case named == 0: // this list says nothing about this hostname
+		case whole > 0:
+			sawWhole = true
+		default:
+			sawPathOnly = true
+		}
+	}
+
+	switch {
+	case sawWhole && sawPathOnly:
+		return hostAmbiguous
+	case sawPathOnly:
+		return hostPath
+	}
+	return hostWhole
+}
+
+// hostVerdict is what an application's own description says about whether it
+// fronts a hostname, or a path beneath it, or something this cannot decide.
+//
+// Three values for the reason logoVerdict and policyVerdict have three: the
+// undecidable case wants a different action from either answer, and collapsing
+// it into one of them is a guess wearing a boolean's clothes.
+type hostVerdict int
+
+const (
+	// hostWhole — this application fronts the hostname itself.
+	hostWhole hostVerdict = iota
+	// hostPath — it fronts a path beneath the hostname, and is not this spec's.
+	hostPath
+	// hostAmbiguous — its own spellings disagree about which of those it is.
+	hostAmbiguous
+)
+
+// destinationURIs is `destinations[].uri`, the newer spelling.
+func destinationURIs(app rawApp) []string {
+	dests, _ := app["destinations"].([]any)
+	out := make([]string, 0, len(dests))
+	for _, raw := range dests {
+		if d, ok := raw.(map[string]any); ok {
+			if uri, _ := d["uri"].(string); uri != "" {
+				out = append(out, uri)
+			}
+		}
+	}
+	return out
+}
+
+// selfHostedDomains is `self_hosted_domains`, the older one.
+func selfHostedDomains(app rawApp) []string {
+	shd, _ := app["self_hosted_domains"].([]any)
+	out := make([]string, 0, len(shd))
+	for _, raw := range shd {
+		if uri, _ := raw.(string); uri != "" {
+			out = append(out, uri)
+		}
+	}
+	return out
+}
+
+// isWholeHost reports whether a domain-or-uri names hostname with nothing after
+// it. Anything trailing — a path, a query, a fragment, a port — is not the whole
+// host, and errs toward "not this spec's".
+func isWholeHost(domain, hostname string) bool {
+	d := strings.TrimSpace(strings.ToLower(domain))
+	if i := strings.Index(d, "://"); i >= 0 {
+		d = d[i+3:]
+	}
+	d = strings.TrimRight(d, "/")
+	return strings.TrimRight(d, ".") == hostname
+}
+
+// describeApps names applications in a refusal, so an operator reading it knows
+// which objects to go and look at.
+func describeApps(apps []rawApp) string {
+	parts := make([]string, 0, len(apps))
+	for _, a := range apps {
+		parts = append(parts, fmt.Sprintf("%q (%s) → %s", appStr(a, "name"), appStr(a, "id"), appStr(a, "domain")))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (p *AccessProvisioner) createApp(ctx context.Context, body rawApp) (rawApp, error) {
@@ -1078,4 +1475,21 @@ func decodeApp(raw []byte) (rawApp, error) {
 		return nil, fmt.Errorf("cloudflare: decode application: %w", err)
 	}
 	return env.Result, nil
+}
+
+// coResidentNote describes applications that answer for this hostname on a path,
+// for a plan that is about to create the hostname-wide one.
+//
+// Empty when there are none, which is the ordinary case. It is a Detail rather
+// than a refusal because creating here is correct: Access matches the more
+// specific path first, so a gate in front of a narrower bypass is the shape this
+// estate already runs. But "correct because of a rule you have to know" is worth
+// one line in the plan — nobody knowing that rule, or that these objects existed
+// at all, is what let PRSR-41 sit unnoticed.
+func coResidentNote(others []rawApp) string {
+	if len(others) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("nothing serves this hostname itself, but %d application(s) serve a path beneath it and will keep doing so (%s) — Access matches the more specific path first",
+		len(others), describeApps(others))
 }

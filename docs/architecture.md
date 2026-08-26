@@ -953,16 +953,56 @@ an envelope is the one nobody will think to re-check.
   mode, not only under `go test`: switchyard resolves to Placard's mark against a
   stored URL that is a live 404; argosy reports the repoint with both URLs named;
   chronicle, which Placard has never heard of, reports `adopt` with a note.
-- **PRSR-41** — `findApp` matches an application on hostname alone, so a
-  switchyard spec resolves to the **path-scoped `decision: bypass`** application
-  that fronts the GitHub webhook rather than to switchyard itself, and an
-  `--apply` would rewrite its `domain` to the bare hostname — widening an
-  unauthenticated bypass from one path to the whole service. Found by running the
-  binary while verifying PRSR-37, whose headline use case is the command that
-  triggers it. Nothing has been applied. The fix has a precedent in
-  `pickCandidate`: refuse when several candidates answer for one name and none is
-  the spec's, as `StepRefused` rather than `StepUnknown`, because the read
-  succeeded.
+- ~~**PRSR-41 — `findApp` matched on hostname alone.**~~ **Fixed, 2026-08-26.**
+  Two applications serve `switchyard.zerogravity.industries`: the service, and a
+  path-scoped one on `/v1/external/github` whose only policy is `decision:
+  bypass` — no Access authentication, correct for a webhook that authenticates by
+  HMAC and safe only because it is confined to that path. `domainHost` strips the
+  path, so both matched, and `findApp` took the first — the bypass. Since
+  `desiredApp` writes `domain` from the spec, an `--apply` would have rewritten it
+  to the bare hostname, widening an unauthenticated bypass to the whole service
+  while the real application sat untouched.
+
+  `findApp` now matches on `servesWholeHost`: one whole-host application is the
+  spec's, none is a create (Access matches the more specific path first, so a
+  hostname-wide gate in front of a narrower bypass is the shape this estate
+  already runs — and the plan names the path-scoped applications it lands in
+  front of), and more than one is `spinup.ErrRefused` naming them.
+
+  The ticket's other two questions are settled here rather than left as residue.
+  **All three spellings of what an app fronts are read** — `domain`,
+  `destinations[].uri`, `self_hosted_domains` — since this package already models
+  all three and the predicate gates a full-replacement PUT. All seven live apps
+  agree across all three (checked, the bypass included). A path-carrying spelling
+  disqualifies only when *nothing* names the host whole — asked per field rather
+  than over the two lists pooled, since pooling lets a bare host in one excuse a
+  path-only entry in the other, which is the exact disagreement the third field
+  was added for. When the two lists genuinely disagree the answer is neither
+  "ours" nor "not ours" but `spinup.ErrRefused`: which spelling is true depends on
+  the field Access honours, and both guesses are expensively wrong — one stands up
+  a duplicate whole-host application nothing afterwards reports, the other lets
+  DNS publish in front of an application that may cover only a path. The naive "any same-host path" rule is wrong the other way and
+  worse: an app fronting both `H` and `H/admin` really does front `H`, and calling
+  it somebody else's would have `--apply` stand up a duplicate whole-host
+  application. Candidate *selection* remains on `domain` alone — the only field
+  every application has — so the extra spellings disqualify rather than discover. **`desiredApp` keeps writing `domain` on an
+  update**: the power to widen came from which application was selected, not from
+  writing the field, so base is now guaranteed whole-host and the assignment is a
+  no-op except on a type change, where a bookmark's scheme-carrying domain
+  genuinely differs. Converting to a bookmark drops `destinations` and
+  `self_hosted_domains`, which a live bookmark does not carry.
+
+  Review then caught that narrowing `findApp` had broken **`confirmGone`**, which
+  borrowed its answer: "nothing serves this hostname" stopped meaning "our
+  application is gone" once a path-scoped remnant of our own app could hide from a
+  hostname-shaped re-read, so a failed DELETE would report success over a live
+  gate. It now asks about the recorded id first, then falls back to the hostname —
+  both, because a 404 against a recorded `external_id` is a wrong record rather
+  than absent access. A remaining path-scoped application is neither, and does not
+  block a teardown.
+
+  Found by running the binary while verifying PRSR-37 — the third time on this
+  axis that has caught something `go test` could not. Nothing was ever applied.
 - **PRSR-33** — the `dev` tunnel ref, which resolves to a refusal today rather
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod
