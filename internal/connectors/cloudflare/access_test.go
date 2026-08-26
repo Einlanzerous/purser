@@ -269,15 +269,63 @@ func TestInspect_NoApplication(t *testing.T) {
 	}
 }
 
-func TestInspect_GatedMatching(t *testing.T) {
-	api := &accessAPI{apps: []map[string]any{{
-		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
-		"app_launcher_visible": true,
+// liveGatedApp is a gated application in the shape the live API actually
+// returns — read off the estate on 2026-08-26 (PRSR-38), reduced only in its
+// ids so the existing assertions still address "app-1".
+//
+// Eight of its keys are modelled nowhere in this package: self_hosted_domains,
+// allowed_idps, tags, auto_redirect_to_identity, session_duration,
+// enable_binding_cookie, http_only_cookie_attribute, options_preflight_bypass.
+// An update is a full-replacement PUT, so each one is a setting a struct
+// round-trip would silently delete. session_duration is the legible example —
+// dropping it does not error, it resets how long a person stays signed in.
+//
+// The policy is the estate's real one: reusable, shared across six
+// applications, admitting the members group *and* an email domain. The bare
+// decision/include pair that stood here before could not show that appending to
+// this list means handing Cloudflare back somebody else's shared policy, which
+// is the open question on PRSR-40.
+func liveGatedApp(logo string) map[string]any {
+	return map[string]any{
+		"id":                         "app-1",
+		"uid":                        "app-1",
+		"aud":                        "d3404fc362067f48ff1fd6c9a7fc9a1fd723510c2681feed15e35159649963de",
+		"type":                       "self_hosted",
+		"name":                       "Argosy",
+		"created_at":                 "2026-07-05T23:55:28Z",
+		"updated_at":                 "2026-07-20T04:32:19Z",
+		"domain":                     testHost,
+		"self_hosted_domains":        []any{testHost},
+		"app_launcher_visible":       true,
+		"logo_url":                   logo,
+		"allowed_idps":               []any{},
+		"tags":                       []any{},
+		"auto_redirect_to_identity":  false,
+		"session_duration":           "730h",
+		"enable_binding_cookie":      false,
+		"http_only_cookie_attribute": false,
+		"options_preflight_bypass":   false,
 		"policies": []any{map[string]any{
-			"decision": "allow",
-			"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
+			"id":         "e9054499-3680-40e3-a03b-96e8eff3f3e5",
+			"uid":        "e9054499-3680-40e3-a03b-96e8eff3f3e5",
+			"name":       "Standard",
+			"decision":   "allow",
+			"precedence": float64(1),
+			"reusable":   true,
+			"created_at": "2026-07-06T01:45:17Z",
+			"updated_at": "2026-07-20T16:09:05Z",
+			"exclude":    []any{},
+			"require":    []any{},
+			"include": []any{
+				map[string]any{"email_domain": map[string]any{"domain": "dodson.mozmail.com"}},
+				map[string]any{"group": map[string]any{"id": testGroup}},
+			},
 		}},
-	}}}
+	}
+}
+
+func TestInspect_GatedMatching(t *testing.T) {
+	api := &accessAPI{apps: []map[string]any{liveGatedApp("")}}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
@@ -340,14 +388,7 @@ func TestInspect_BookmarkDomainWithSchemeMatchesHostname(t *testing.T) {
 // 404s. A string comparison alone reports "ok" for an app showing grey initials.
 func TestInspect_LogoUrlMatchesButDoesNotLoad(t *testing.T) {
 	dead := logoServer(t, http.StatusNotFound, "text/plain")
-	api := &accessAPI{apps: []map[string]any{{
-		"id": "app-1", "type": "self_hosted", "name": "Argosy", "domain": testHost,
-		"app_launcher_visible": true, "logo_url": dead.URL,
-		"policies": []any{map[string]any{
-			"decision": "allow",
-			"include":  []any{map[string]any{"group": map[string]any{"id": testGroup}}},
-		}},
-	}}}
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(dead.URL)}}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: dead.Client()})
 
 	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, dead.URL)})
@@ -805,4 +846,77 @@ func TestImplementsServiceProvisioner(t *testing.T) {
 	// The registry panics on a kind outside model.KindOrder, so this is also the
 	// check that the provisioner can actually be wired.
 	spinup.NewRegistry(NewAccess(AccessConfig{}))
+}
+
+// The gated half of PRSR-38's fixture correction.
+//
+// TestEnsure_UpdatePreservesUnmodelledFieldsAndStripsServerOwned already asserts
+// the principle, but against *invented* keys — a `custom_deny_message` somebody
+// made up to stand for "a field we don't model". This runs the same assertion
+// against the key set the live API was observed to return, so the suite pins
+// what Cloudflare actually sends rather than what the author imagined it might.
+// That distinction is the whole subject of PRSR-38: a fake built from the model
+// asserts the model.
+//
+// The keys below are not decorative. `session_duration` is how long a person
+// stays signed in, and a full-replacement PUT that omits it does not error — it
+// silently resets it.
+func TestEnsure_GatedUpdateCarriesTheObservedKeySetThrough(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	api := &accessAPI{apps: []map[string]any{liveGatedApp("")}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if api.lastMethod != http.MethodPut {
+		t.Fatalf("an existing app is updated with PUT, got %s", api.lastMethod)
+	}
+
+	// Every key observed on the live application that this package models
+	// nowhere. Each is a real setting; the PUT replaces the whole object.
+	for k, want := range map[string]any{
+		"session_duration":           "730h",
+		"auto_redirect_to_identity":  false,
+		"enable_binding_cookie":      false,
+		"http_only_cookie_attribute": false,
+		"options_preflight_bypass":   false,
+	} {
+		if got, ok := api.lastBody[k]; !ok || got != want {
+			t.Errorf("%q was dropped or altered by the PUT: got %v (present=%v), want %v", k, got, ok, want)
+		}
+	}
+	for _, k := range []string{"self_hosted_domains", "allowed_idps", "tags"} {
+		if _, ok := api.lastBody[k]; !ok {
+			t.Errorf("%q was dropped by the full-replacement PUT — rawApp exists so unmodelled keys survive", k)
+		}
+	}
+	for _, k := range serverOwned {
+		if _, present := api.lastBody[k]; present {
+			t.Errorf("server-owned field %q must be stripped before PUT", k)
+		}
+	}
+
+	// The gate itself. The estate's policy is reusable and shared across six
+	// applications, so it must go back exactly as it came: this app already
+	// admits the members group, so nothing is appended, and nothing about
+	// somebody else's shared policy is rewritten. PRSR-40 carries the question
+	// of whether Cloudflare even accepts a reusable policy echoed back inline.
+	pols, ok := api.lastBody["policies"].([]any)
+	if !ok || len(pols) != 1 {
+		t.Fatalf("the app already admits the members group, so its policy list must be unchanged, got %v", api.lastBody["policies"])
+	}
+	pol, ok := pols[0].(map[string]any)
+	if !ok {
+		t.Fatalf("policy came back as %T", pols[0])
+	}
+	if pol["id"] != "e9054499-3680-40e3-a03b-96e8eff3f3e5" || pol["reusable"] != true {
+		t.Errorf("the shared reusable policy was not carried through verbatim: %v", pol)
+	}
+	if inc, ok := pol["include"].([]any); !ok || len(inc) != 2 {
+		t.Errorf("the policy's include list lost a rule — the email_domain grant is somebody's access: %v", pol["include"])
+	}
+	if got := api.lastBody["logo_url"]; got != logo.URL {
+		t.Errorf("the drift this update exists to fix was not written: logo_url = %v", got)
+	}
 }

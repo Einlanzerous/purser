@@ -834,6 +834,13 @@ an envelope is the one nobody will think to re-check.
   claim is verified against Cloudflare's own `modified_on` / `updated_at`, not
   against Purser's summary of itself.
 
+  **What that does not establish**: the exercise was adopt-only, so **no write
+  verb this axis owns has run against Cloudflare** — not the Access
+  full-replacement `PUT`, not the DNS create/update, not `putConfig`, and not
+  any `Teardown`. The premises below were settled by **raw API calls**, which
+  confirm Cloudflare and not the bodies `desiredApp`/`putConfig` build. The
+  read paths are what this run verified.
+
   Every premise that was true only because a fixture said so is now measured:
   the tunnel `version` moves by **exactly one per content-changing PUT** (and
   not at all for an identical one); the DNS delete **does** carry the

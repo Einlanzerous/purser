@@ -752,9 +752,25 @@ instead of a wire shape, and it is the argument for this ticket existing at all:
 five green tests could not see it, and one live plan could. The fixture is now
 the observed response, `tags` and `policies` included.
 
-Still true, and narrower: **`Teardown` has never been run against Cloudflare**,
-because nothing orchestrates one (PRSR-34). The delete verbs the axis owns are
-exercised only by fakes and by PRSR-38's throwaway probes.
+Still true, and **wider than "Teardown hasn't run"** — which is what this
+paragraph said first, and it read as exhaustive when it was not. **No write verb
+this axis owns has ever executed against Cloudflare.** The exercise was
+adopt-only by construction: the plan wrote nothing, `--apply` produced two rows
+and zero upstream calls, the re-run was `ok`/`ok`. So what PRSR-38 established is
+a claim about the **read** paths — `Inspect`, the matchers, the reconcile logic
+and the statuses they produce. `AccessProvisioner`'s full-replacement `PUT`, the
+DNS create/update, `TunnelProvisioner.putConfig`, and every `Teardown` are all
+still fake-only.
+PRSR-38's probes do not close that gap and must not be read as if they did: they
+were **raw API calls**, so they confirm Cloudflare's behaviour, not the bodies
+`desiredApp` and `putConfig` construct. Confirming that a PUT bumps a version is
+not confirming that the document we would PUT is one Cloudflare accepts.
+The first live execution of the Access `PUT` will most likely be a PRSR-37 logo
+fix on a **gated** app, and that body carries back the `policies` list — observed
+to be full objects with `reusable: true`, shared by six applications — plus
+`tags`, which nothing here models. Whether Cloudflare takes a reusable policy
+echoed inline rather than as a reference is **PRSR-40**, and the field that
+disappears if the answer is no is the one that gates the service.
 
 **PRSR-33** wires the `dev` tunnel ref
 that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
