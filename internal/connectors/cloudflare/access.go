@@ -52,14 +52,25 @@ package cloudflare
 // this exists to catch. **PRSR-37** holds resolving it from Placard's
 // /api/services index instead.
 //
-// # Nothing here has ever contacted Cloudflare
+// # Every test here is a fake; the write verbs themselves have run live
 //
 // Every test covering this file is httptest against a hand-written fake, which
-// is true of every connector in this repo (see REVIEW.md). The request shapes come
-// from the live audit recorded on PRSR-29 and from Cloudflare's documentation;
-// where behaviour is inferred rather than observed the comment says so. Read
-// this package as "what we believe the API accepts", and treat the first real
-// run as the test that has not been run.
+// is true of every connector in this repo (see REVIEW.md). That distinction is
+// worth keeping in view, because the two halves of it now point different ways.
+//
+// The request shapes come from the live audit recorded on PRSR-29 and from
+// Cloudflare's documentation; where behaviour is inferred rather than observed
+// the comment says so. **PRSR-40 (2026-08-26) then ran this file's write verbs
+// against the live API** — the gated create, the full-replacement update on both
+// of its branches, the logo clear, and Teardown including its confirm-by-reading
+// path — driven through this exact code rather than through curl, on a
+// disposable hostname. So "what we believe the API accepts" is no longer the
+// right way to read the writes.
+//
+// It is still the right way to read the *tests*, which is why the heading says
+// what it says: a green suite here proves this file agrees with a fake somebody
+// wrote, and PRSR-38 is the standing example of a fixture that modelled the
+// spec instead of the API and hid a live bug behind five passing tests.
 
 import (
 	"context"

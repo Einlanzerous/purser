@@ -874,13 +874,20 @@ an envelope is the one nobody will think to re-check.
   | `reusable: false` | **honoured.** The same probe flipped one to `deny` and the read-back confirmed it |
 
   So the estate's `Standard` policy cannot be edited by one service's logo fix,
-  and the field that makes that true is the `id`. Strip it — by adding `"id"` to
-  `serverOwned`, the tidy-looking edit — and the policy stops being a reference:
-  Cloudflare would mint a private copy, the app would be gated by something that
-  no longer tracks the shared group, nothing would error, and the plan would
-  still say "fix a logo". That is what
-  `TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten` guards, on the
-  append path, since the carry-through path cannot fail this way.
+  and the field that makes that true is the `id`. Strip it and the policy stops
+  being a reference: Cloudflare would mint a private copy, the app would be gated
+  by something that no longer tracks the shared group, nothing would error, and
+  the plan would still say "fix a logo".
+
+  The lever is `livePolicies`, not `serverOwned` — which already lists `id`, and
+  is applied only to the top-level application map rather than to the policy
+  objects inside it. The invitation is symmetry: a carried policy arrives with
+  server-assigned `created_at`, `updated_at` and `uid`, so the obvious tidy-up is
+  a policy-level strip modelled on `serverOwned`, with `id` swept in alongside
+  them. `TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten` guards both
+  arms and pins the pre-existing policy **by id**, because a length check alone
+  is satisfied by a body holding only `membersPolicy` — the
+  assign-instead-of-append failure that would delete the shared policy outright.
 
   Two smaller answers on the same trip: a policy created inline comes back
   `reusable: false` with a fresh id, so a gated service Purser stands up gets its

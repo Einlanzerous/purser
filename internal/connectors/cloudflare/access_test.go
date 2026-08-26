@@ -956,13 +956,20 @@ func TestEnsure_GatedUpdateCarriesTheObservedKeySetThrough(t *testing.T) {
 // fix silently editing the gate on the six applications sharing the estate's
 // `Standard` policy. It cannot happen, and the reason it cannot is the id.
 //
-// So the id is what this pins. Strip it — by adding "id" to serverOwned, say,
-// which is exactly the kind of tidying that looks right at the callsite — and
-// the policy stops being a reference and becomes an inline definition
-// Cloudflare has never seen. It would create a *second* policy rather than
-// reusing the shared one, and the application would end up gated by a private
-// copy that no longer tracks the group everyone else's does. Nothing would
-// error, and the plan would say "fix a logo".
+// So the id is what this pins. Strip it and the policy stops being a reference
+// and becomes an inline definition Cloudflare has never seen: it would create a
+// *second* policy rather than reusing the shared one, and the application would
+// end up gated by a private copy that no longer tracks the group everyone
+// else's does. Nothing would error, and the plan would say "fix a logo".
+//
+// The lever that can do that is livePolicies, and desiredApp's append through
+// it — not serverOwned, which already lists "id" and is applied only to the
+// top-level application map, never walking into the policy objects inside it.
+// The invitation is symmetry: a carried policy really does arrive carrying
+// server-assigned created_at, updated_at and uid (see liveGatedApp), so the
+// obvious tidy-up is a policy-level strip modelled on serverOwned — and "id"
+// goes into that list with them, because at the callsite it looks like exactly
+// the same kind of field.
 //
 // The non-reusable half of the same measurement is why this is not merely
 // defensive: an app-scoped (`reusable: false`) policy's body **is** honoured on
@@ -992,12 +999,22 @@ func TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten(t *testing.T) {
 		name     string
 		policies []any
 		wantLen  int
+		// wantID is the pre-existing policy that must still be in the body,
+		// identified by id rather than merely counted.
+		wantID string
 	}{
 		{
 			// Already gated: the list goes back untouched, ids and all.
+			//
+			// wantID is the assertion doing the work here. Checking only that
+			// *an* id survives is satisfied by a body holding nothing but
+			// membersPolicy — which is the "assigned, never appended" failure
+			// that would delete the estate's shared policy and replace it with
+			// Purser's own, passing green.
 			name:     "carried through",
 			policies: liveGatedApp("")["policies"].([]any),
 			wantLen:  1,
+			wantID:   "e9054499-3680-40e3-a03b-96e8eff3f3e5",
 		},
 		{
 			// Not gated yet: membersPolicy is appended and the existing policy
@@ -1005,6 +1022,7 @@ func TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten(t *testing.T) {
 			name:     "appended alongside",
 			policies: []any{foreign},
 			wantLen:  2,
+			wantID:   "033c9a30-8011-4362-b9f4-50adcdbc7206",
 		},
 	}
 
@@ -1024,6 +1042,17 @@ func TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten(t *testing.T) {
 			if !ok || len(pols) != tc.wantLen {
 				t.Fatalf("policies = %v, want %d of them", api.lastBody["policies"], tc.wantLen)
 			}
+			// The policy that was already there must still be there, by id.
+			found := false
+			for _, raw := range pols {
+				if pol, ok := raw.(map[string]any); ok && pol["id"] == tc.wantID {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("the pre-existing policy %s is not in the body — a gated update appends to the policy list, it never assigns over it: %v", tc.wantID, pols)
+			}
+
 			// Every policy that arrived with an id must leave with it. The one
 			// membersPolicy adds has none, and must not acquire one.
 			for i, raw := range pols {

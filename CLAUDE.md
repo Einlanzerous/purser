@@ -514,10 +514,18 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   PRSR-40 was filed to rule out is structurally impossible. The corollary is the
   thing to protect: **strip a policy's `id` and it stops being a reference**, so
   the app gets gated by a fresh private copy that no longer tracks the shared
-  group, with nothing erroring and the plan still saying "fix a logo". Adding
-  `id` to `serverOwned` is the tidy-looking edit that would do it;
+  group, with nothing erroring and the plan still saying "fix a logo". The lever
+  is `livePolicies` and the append through it — *not* `serverOwned`, which
+  already lists `id` and is applied only to the top-level application map,
+  never walking into the policy objects inside it. What invites the mistake is
+  symmetry: a carried policy really does arrive with server-assigned
+  `created_at`, `updated_at` and `uid`, so the obvious tidy-up is a policy-level
+  strip modelled on `serverOwned`, and `id` goes in with them because at the
+  callsite it looks like the same kind of field.
   `TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten` is the guard, and
-  it covers the append path because the carry-through path cannot fail this way.
+  it pins the pre-existing policy **by id** on both arms: counting the list is
+  not enough, since a body holding only `membersPolicy` satisfies a count and is
+  precisely the assign-instead-of-append failure.
   A `reusable: false` policy is the opposite — its body **is** honoured (the same
   probe flipped one to `deny` and the read-back confirmed it), so a gated update
   is a real write of that policy's content, safe only because `Ensure` takes its
