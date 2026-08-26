@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.16.0](https://github.com/Einlanzerous/purser/compare/v0.15.0...v0.16.0) (2026-08-26)
+
+
+### Features
+
+* **spinup:** Cloudflare Access application provisioner (PRSR-29) ([#42](https://github.com/Einlanzerous/purser/issues/42)) ([19e9965](https://github.com/Einlanzerous/purser/commit/19e9965e3f87faca0df7ae7be508941dd71602c3))
+* **spinup:** provision-service CLI + HTTP surface (PRSR-31) ([#45](https://github.com/Einlanzerous/purser/issues/45)) ([3a35a04](https://github.com/Einlanzerous/purser/commit/3a35a046a325699e2f934197a5dada9ad63738b7))
+* **spinup:** resolve the launcher icon from Placard (PRSR-37) ([#50](https://github.com/Einlanzerous/purser/issues/50)) ([adf6390](https://github.com/Einlanzerous/purser/commit/adf6390fa34e8f7f720ec7fbbaa9f35e4a1ed383))
+* **spinup:** ServiceProvisioner, ServiceSpec and the resource table (PRSR-27) ([#37](https://github.com/Einlanzerous/purser/issues/37)) ([d8822a3](https://github.com/Einlanzerous/purser/commit/d8822a35f3a93887f4d3444e0f3a1aff957aba66))
+* **spinup:** the DNS record provisioner (PRSR-28) ([#44](https://github.com/Einlanzerous/purser/issues/44)) ([8a8c016](https://github.com/Einlanzerous/purser/commit/8a8c016cce0fb25468a55e151861adbc181ab494))
+* **spinup:** tunnel ingress-route provisioner (PRSR-30) ([#43](https://github.com/Einlanzerous/purser/issues/43)) ([c72522b](https://github.com/Einlanzerous/purser/commit/c72522b8caf2a11f6fbb3232cac814c0e952e778))
+
+
+### Bug Fixes
+
+* **cfaccess:** an application serving a path is not that hostname's application (PRSR-41) ([#49](https://github.com/Einlanzerous/purser/issues/49)) ([0221462](https://github.com/Einlanzerous/purser/commit/0221462b406c77112ccdc842c0a06ae24aaf2bd1))
+
 ## [0.15.0](https://github.com/Einlanzerous/purser/compare/v0.14.0...v0.15.0) (2026-08-23)
 
 
