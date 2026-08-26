@@ -1073,6 +1073,48 @@ func TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten(t *testing.T) {
 	}
 }
 
+// A bookmark's empty policy list is accepted on write, not merely returned on
+// read.
+//
+// Observed live (PRSR-40): a disposable bookmark application was created and then
+// updated through this exact code. Cloudflare took `policies: []`, echoed it back
+// as `[]`, kept the scheme on `domain`, preserved `tags`, and returned a much
+// smaller object than a self_hosted app — no `destinations`, no
+// `self_hosted_domains`, no `session_duration`.
+//
+// Worth its own test because the bookmark branch is a different body rather than
+// a variant of the gated one, and because `policies` is the **one assignment** in
+// desiredApp: everywhere else the rule is append-never-assign, and here it is
+// inverted on purpose. A bookmark has no policies by definition, so a shape
+// converted from gated must not keep its old gate, and there is nothing anyone
+// could have added deliberately.
+func TestEnsure_BookmarkAssignsAnEmptyPolicyListWhichCloudflareAccepts(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	spec := gatedSpec(t, logo.URL)
+	spec.Access = spinup.AccessBookmark
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if api.lastBody["type"] != "bookmark" {
+		t.Errorf("type = %v, want bookmark", api.lastBody["type"])
+	}
+	// A bookmark's domain carries a scheme; a self_hosted app's does not.
+	if got, want := api.lastBody["domain"], "https://"+testHost; got != want {
+		t.Errorf("domain = %v, want %q", got, want)
+	}
+	pols, ok := api.lastBody["policies"].([]any)
+	if !ok {
+		t.Fatalf("a bookmark must be sent with an explicitly empty policy list, got %#v", api.lastBody["policies"])
+	}
+	if len(pols) != 0 {
+		t.Errorf("a bookmark has no policies by definition, got %v", pols)
+	}
+}
+
 // The create path builds its policy from nothing, and that one has no id to
 // keep — it is an inline definition, and Cloudflare turns it into an
 // application-scoped policy.

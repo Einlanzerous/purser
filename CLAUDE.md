@@ -789,20 +789,33 @@ and `putConfig` construct; confirming that a PUT bumps a version is not
 confirming that the document we would PUT is one Cloudflare accepts.
 
 **PRSR-40 closed that gap for Access, and only for Access** (2026-08-26). It ran
-the real `AccessProvisioner` — not curl — against the live API on a disposable
-hostname, so what went on the wire was `desiredApp`'s own body. Executed live and
-working: the gated **create** (inline policy accepted, echoed back with a fresh
-id and `reusable: false`), the full-replacement **update** on both branches
-(carry-through when the group is already admitted, and the **append** when it is
-not — the foreign policy survived at precedence 1 and the members policy landed
-at 2), the logo **clear** (`logo_url: ""` really does remove it, and the plan
-named the clearing first), and **`Teardown`**, including a second teardown of an
-already-gone app where `confirmGone`'s re-read correctly reported success. The
-estate was byte-identical to its pre-probe snapshot afterwards, `updated_at`
-included, and both disposable apps and the disposable policy were deleted.
+the real `AccessProvisioner` — not curl — against the live API on disposable
+hostnames, so what went on the wire was `desiredApp`'s own body. **Every write
+verb in `access.go` has now executed**, on both application shapes:
 
-So the caveat is now narrower and still real: **the DNS write verbs and the
-tunnel write verbs have never executed against Cloudflare.** `DNSProvisioner`'s
+- **gated create** — the inline policy is accepted, and comes back with a fresh
+  id, `reusable: false`, `precedence: 1`. So a new gated service gets its own
+  private gate rather than joining the estate's shared `Standard`.
+- **gated update, both branches** — carry-through when the group is already
+  admitted, and the **append** when it is not (the foreign policy survived at
+  precedence 1, the members policy landed at 2).
+- **bookmark create and update** — a materially different body, not a variant of
+  the gated one: `type: bookmark`, a `domain` carrying a **scheme**, and
+  `policies` **assigned** to `[]any{}` rather than appended to. Cloudflare accepts
+  the empty list and echoes it back as `[]`, `tags` survives, and the response
+  key set is far smaller than a `self_hosted` app's — no `destinations`,
+  `self_hosted_domains` or `session_duration`. Added after review pointed out the
+  residual caveat below was still exhaustive and still omitted this one.
+- **the logo clear** — `logo_url: ""` really does remove it (the key is absent on
+  read-back), and the plan named the clearing first.
+- **`Teardown`** — including a second teardown of an already-gone app, where
+  `confirmGone`'s re-read correctly reported success rather than an error.
+
+The estate was byte-identical to its pre-probe snapshot afterwards, `updated_at`
+included; all three disposable apps and the disposable policy were deleted.
+
+So the caveat is now genuinely narrower: **the DNS write verbs and the tunnel
+write verbs have never executed against Cloudflare.** `DNSProvisioner`'s
 create/update/delete and `TunnelProvisioner.putConfig` are still fake-only —
 PRSR-38 probed the DNS delete with raw curl, which is not the same as running
 the provisioner. The tunnel is the one that matters most and is the worst

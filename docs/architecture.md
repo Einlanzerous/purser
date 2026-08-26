@@ -859,11 +859,21 @@ an envelope is the one nobody will think to re-check.
   the bytes on the wire were `desiredApp`'s own rather than curl's approximation
   of them — which is precisely what PRSR-38 could not claim.
 
-  Executed live and correct: the gated **create**, the full-replacement
-  **update** on both of its branches, the logo **clear**, and **`Teardown`**
-  (twice, the second on an already-gone app, where `confirmGone`'s re-read
-  correctly reported success rather than an error). The estate was byte-identical
-  to its pre-probe snapshot afterwards, `updated_at` included.
+  **Every write verb in `access.go` has now executed**, on both application
+  shapes: the gated **create**, the full-replacement **update** on both of its
+  branches, the **bookmark** create and update, the logo **clear**, and
+  **`Teardown`** (twice, the second on an already-gone app, where `confirmGone`'s
+  re-read correctly reported success rather than an error). The estate was
+  byte-identical to its pre-probe snapshot afterwards, `updated_at` included.
+
+  The bookmark was added after review caught the residual caveat below still
+  reading as exhaustive while omitting it — the same failure the paragraph it
+  replaced had opened by admitting. It is a materially different body, not a
+  variant of the gated one: `type: bookmark`, a `domain` carrying a **scheme**,
+  and `policies` **assigned** to an empty list rather than appended to.
+  Cloudflare accepts the empty list and echoes it back as `[]`, `tags` survives,
+  and the response key set is far smaller than a `self_hosted` app's — no
+  `destinations`, `self_hosted_domains` or `session_duration`.
 
   The question it was filed for — whether echoing a `reusable: true` policy back
   inline edits the shared object — is answered **no, structurally**:
