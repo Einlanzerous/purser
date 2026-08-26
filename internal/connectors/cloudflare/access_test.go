@@ -1453,3 +1453,56 @@ func TestEnsure_ABrokenSpecLogoDoesNotClearTheWorkingLiveOne(t *testing.T) {
 		t.Errorf("logo_url = %v, want the working icon %q kept — a spec asking for a different icon did not ask for this one to be removed", got, live)
 	}
 }
+
+// When the live icon *is* the rotted URL the spec asks for, the apply clears it,
+// so the drift the plan reports can actually be cleared.
+//
+// The keep added for "a spec named a different icon and it does not serve" was
+// over-broad by exactly one condition. Where `current == want`, `current` is not
+// a working tile to protect — it is the URL checkLogo just proved dead — and
+// writing it back makes the drift permanent: the plan reports "set correctly but
+// not a servable image" for ever, NeedsAttention never clears, and every --apply
+// is a full-replacement PUT of a gated application for a change that cannot
+// happen.
+//
+// This is the state argosy and switchyard were both actually in, which is why it
+// is the case the load check exists for: a hand-written URL that rotted after it
+// was written. TestInspect_LogoUrlMatchesButDoesNotLoad pins the plan half; this
+// is its missing Ensure counterpart.
+func TestEnsure_ARottedLogoTheSpecStillAsksForIsCleared(t *testing.T) {
+	dead := logoServer(t, http.StatusNotFound, "")
+	rotted := dead.URL + "/sy_mark.svg"
+
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(rotted)}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: dead.Client()})
+	spec := gatedSpec(t, rotted) // the spec names the very url that rotted
+
+	// The plan reports it, and reports it as drift rather than a note: unlike an
+	// unresolvable candidate, this one --apply really will act on.
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if st.Matches {
+		t.Fatalf("a dead logo the spec asks for is drift the apply can fix: %q", st.Detail)
+	}
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if got := api.lastBody["logo_url"]; got != "" {
+		t.Fatalf("logo_url = %v, want it cleared — writing the dead url back makes the drift permanent", got)
+	}
+
+	// And now it converges: with the icon cleared, the next plan reports a note
+	// rather than drift, so NeedsAttention stops firing on a change that cannot
+	// happen.
+	api.apps = []map[string]any{liveGatedApp("")}
+	again, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+	if err != nil {
+		t.Fatalf("re-inspect: %v", err)
+	}
+	if !again.Matches {
+		t.Errorf("the second plan should have nothing left to act on, got %q", again.Detail)
+	}
+}

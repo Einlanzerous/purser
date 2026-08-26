@@ -896,7 +896,22 @@ func (p *AccessProvisioner) resolveLogo(ctx context.Context, spec spinup.Service
 	case logoOK:
 		return want, ""
 	case logoBroken:
-		if current != "" {
+		// `current != want` is the whole of the condition this keep was reasoned
+		// about, and leaving it off made the fix over-broad by exactly one case.
+		//
+		// When the live icon *is* the URL the spec asks for and that URL is dead,
+		// `current` is not a working tile to protect — it is the thing checkLogo
+		// just proved is broken. Writing it back makes the drift permanent: the
+		// plan reports "set correctly but not a servable image" for ever,
+		// NeedsAttention never clears, and every --apply performs a
+		// full-replacement PUT of a gated application for a change that cannot
+		// happen. Clearing converges instead, and the next plan then reports a
+		// note rather than drift.
+		//
+		// The note's own wording was the tell — "clearing a working icon is not
+		// what a spec asking for *a different one* meant" is self-contradictory
+		// when the spec asked for this one.
+		if current != "" && current != want {
 			// The spec named an icon that does not serve, and something that
 			// does is already on the tile. Keeping it is not a fallback, it is
 			// the only non-destructive answer: writing "" here clears a working

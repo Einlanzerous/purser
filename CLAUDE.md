@@ -573,7 +573,13 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   broken case used to discard `current` and return `""`, which `desiredApp`
   writes as an empty `logo_url` and PRSR-40 confirmed live really does remove the
   icon — so a spec naming a mark that 404s **cleared the working one already on
-  the tile**, and the plan had said `update`, naming the new URL. A spec asking
+  the tile**, and the plan had said `update`, naming the new URL. The keep is
+  conditioned on `current != want`, which is the whole of what it was reasoned
+  about: where the live icon *is* the dead URL the spec asks for, `current` is
+  not a tile to protect but the thing just proved broken, and writing it back
+  makes the drift permanent — the plan reporting "set correctly but not a
+  servable image" for ever while every `--apply` PUTs a gated application for a
+  change that cannot happen. Clearing there converges. A spec asking
   for a different icon did not ask for this one to be removed, and losing a
   working tile is strictly worse than not gaining the new one. Only
   `spinup.LogoNone` clears, which is the same rule the ref itself encodes.
