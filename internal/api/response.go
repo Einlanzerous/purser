@@ -174,7 +174,7 @@ type spinupSpecDTO struct {
 	Mode        string `json:"mode"`
 	Upstream    string `json:"upstream"`
 	Access      string `json:"access"`
-	LogoURL     string `json:"logo_url,omitempty"`
+	Logo        string `json:"logo,omitempty"`
 	Tunnel      string `json:"tunnel,omitempty"`
 }
 
@@ -212,7 +212,7 @@ func newSpinupResponse(res *spinup.Result) spinupResponse {
 			Mode:        string(res.Spec.Mode),
 			Upstream:    res.Spec.Upstream,
 			Access:      string(res.Spec.Access),
-			LogoURL:     res.Spec.LogoURL,
+			Logo:        string(res.Spec.Logo),
 			Tunnel:      string(res.Spec.Tunnel),
 		},
 		Applied: res.Applied,

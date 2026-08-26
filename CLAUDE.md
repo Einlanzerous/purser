@@ -39,6 +39,10 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `ErrUnavailable`, and the `Ensure` orchestrator. Keyed on hostname, not on a
   person. It imports `internal/model` and nothing else of ours — deliberately
   not `internal/connector`, and not `internal/store`.
+- `internal/placard/` — the launcher-mark resolver (PRSR-37). A client for
+  Placard's `/api/services`, deliberately **not** under `internal/connectors/`:
+  Placard is never an invite target and implements neither axis's interface.
+  It picks a URL and never decides one — see the invariant below.
 - `internal/store/` — pgx pool, embedded migrator, repo queries.
 - `internal/delivery/` — SMTP sender (email delivery).
 - `internal/api/` — thin HTTP surface.
@@ -542,18 +546,43 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `Inspect` it is a note rather than drift, because an update here is that
   full-replacement PUT. Never fatal either way: a gated app is a DNS
   prerequisite, so refusing it would leave a service unpublished over an icon.
-  **A spec that names no logo is an instruction, not silence.** `resolveLogo("")`
-  returns `""` — "clearing is intended, not a fallback" — and `desiredApp`
-  writes the empty string rather than omitting the key, so that a rotted URL can
-  be cleared at all. Against a live application carrying a working icon those
-  two compose into an `--apply` that strips it, which is what PRSR-38's first
-  live plan reported (`update`, "has a logo (…), spec sets none"). That is
-  correct for a spec that really means "no icon", so the invariant is not about
-  the clearing: it is that the *plan* must name it, because preview-by-default
-  is the only thing standing between a forgotten `--logo` and a deleted icon.
-  Pinned by `TestArgosy_ASpecWithNoLogoWouldClearTheLiveOne`. When PRSR-37 makes
-  a logo Placard-resolved, "the spec named nothing" and "Placard has no mark for
-  this slug" must both stay distinguishable from "the spec asked for no icon".
+- **A logo is a ref with three states, and only one of them removes an icon**
+  (PRSR-37). `ServiceSpec.Logo` is `placard` | `none` | an https URL, defaulted
+  to `placard` in `Normalized` — so an omitted `--logo` means *resolve it*, not
+  *clear it*. That inverts the trap PRSR-38 found live: `resolveLogo("")` used to
+  return `""` ("clearing is intended, not a fallback") and `desiredApp` writes
+  the empty string rather than omitting the key, so a forgotten flag composed
+  into an `--apply` that stripped a working tile — reported then as `update`,
+  "has a logo (…), spec sets none". Clearing is still expressible and still
+  correct; it now takes a keyword somebody typed.
+  Defaulted in `Normalized` rather than at each surface for the reason `Mode`,
+  `Access` and `Tunnel` are trimmed there: the CLI and the HTTP API must not
+  disagree about what an omitted field means.
+  **The plan must still name a clearing before it happens** — preview-by-default
+  is the last thing between `--logo none` and a deleted icon — and the three
+  answers stay distinguishable, which is what PRSR-38 asked for: "the spec asked
+  for no icon" is drift, while "Placard has no mark for this slug" and "Placard
+  could not be asked" are *notes* that change nothing. Collapsing the last two
+  into the first would clear icons estate-wide on a registry blip; collapsing
+  them into drift would have the plan promise a deletion `--apply` will not do.
+  Pinned by `TestArgosy_AnOmittedLogoNoLongerClearsTheLiveOne`,
+  `TestArgosy_LogoNoneStillClearsTheLiveOne` and
+  `TestEnsure_AnUnresolvableLogoLeavesTheLiveOneAlone`.
+- **Placard picks the URL; the write-time fetch decides** (PRSR-37).
+  `internal/placard` resolves a mark by service key, behind a one-method
+  `cloudflare.LogoResolver` so the Access provisioner does not import a second
+  upstream to decorate a tile. It answers *pick*, never *verify*: Placard's own
+  per-file `check` is a periodic monitor carrying a `checked_at`, so a stale
+  green is exactly how the silent failure returns, and `checkLogo` still runs at
+  the moment of writing.
+  Two live traps it exists for. **A working `logo_url` is not a correct one** —
+  argosy's old URL answered `200 image/png` and was the 3.6:1 wordmark, which
+  letterboxes to a sliver in a square tile, and no fetch check can tell that from
+  the tile mark; Placard is the thing that knows which asset is which. And
+  **`state: "missing"` still carries a fully populated `canonical_url`**, because
+  Placard reports where a file *would* live — so reading the URL without reading
+  the state writes a guaranteed 404, which is the exact condition switchyard's
+  tile was in.
 - **The Access teardown confirms absence by reading, not by an error code.**
   `dnsRecordNotFound` works because 81044 was observed; there is no observed
   Access equivalent, and the rule above forbids guessing one. So a failed delete
@@ -822,18 +851,46 @@ the provisioner. The tunnel is the one that matters most and is the worst
 candidate for a casual probe, since its write is a read-modify-write of a
 document holding every other service's routes.
 
+**PRSR-37** made the launcher icon a resolved fact rather than a typed path.
+`ServiceSpec.Logo` is a ref (`placard` | `none` | url) defaulting to `placard`,
+`internal/placard` resolves a mark by service key behind a one-method
+`LogoResolver`, and every answer other than "here is the mark" leaves the tile
+alone. Verified by running the binary against live Placard and live Cloudflare in
+plan mode: switchyard resolves to
+`…/placard@main/switchyard/switchyard-mark-light.png` against a stored URL that
+is a live 404, argosy reports the repoint from its 3.6:1 wordmark to the tile
+mark with both URLs named, and chronicle — which Placard has never heard of —
+reports `adopt` with a note rather than drift or a failure. It is also what
+turned up PRSR-41.
+
 **PRSR-33** wires the `dev` tunnel ref
 that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
 spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
 the `Teardown` walk — its orchestration, that is; the Access provisioner's own
 `Teardown` has now run live (PRSR-40), so what is left there is the ordering and
-the "is this hostname still someone's?" question. **PRSR-37** is resolving a
-service's logo from Placard instead of hand-writing the URL into a spec — which
-PRSR-38's launcher audit turned from a tidiness ticket into a real one, since
-switchyard's stored `logo_url` is a live 404 and argosy's is the 3.6:1 wordmark
-rather than the tile mark. **PRSR-39** is the zone pre-flight that PRSR-38's
-probe showed was available all along. **PRSR-36** and **PRSR-40** are both
-closed.
+the "is this hostname still someone's?" question. **PRSR-39** is the zone
+pre-flight that PRSR-38's probe showed was available all along. **PRSR-36**,
+**PRSR-37** and **PRSR-40** are all closed.
+
+**PRSR-41 is open, `high`, and was found by running the binary** — the third
+time on this axis that has caught something reading could not (PRSR-31's
+outcome line, PRSR-38's fixture, and now this). `findApp` matches an application
+on hostname alone, because `domainHost` strips the path so a bookmark's URL and
+a self_hosted app's bare hostname compare equal. Two applications legitimately
+serve `switchyard.zerogravity.industries`: the service, and a **path-scoped
+`decision: bypass`** app that lets GitHub's webhook POST to
+`/v1/external/github` with no Access authentication at all, HMAC-authed instead.
+`findApp` returns the bypass one, since it sorts first. An `--apply` would then
+write `domain` back as the bare hostname — **widening an unauthenticated bypass
+from one path to the whole of Switchyard**, renaming it, making it launcher-
+visible, and leaving the real application untouched so nothing looks like it
+landed where it was aimed. Nothing has been applied; every estate run so far is
+a plan. The fix has a precedent in this repo — DNS's `pickCandidate` refuses
+when several records answer for a name and none is the spec's — and the same
+`StepRefused` answer fits, since the read succeeded and re-running will not fix
+it. **Do not `--apply` a switchyard spec until it lands**, which matters because
+PRSR-37's own headline use case ("fix switchyard's broken icon") is the command
+that triggers it.
 
 **PRSR-36** asked for two Cloudflare response shapes that PRSR-28's fixes were
 reasoning about from the published schema rather than from a response anybody

@@ -917,6 +917,52 @@ an envelope is the one nobody will think to re-check.
   same as running the provisioner, and the tunnel write is a read-modify-write of
   a document holding every other service's routes — the worst candidate for a
   casual probe and the one most worth a disposable-tunnel exercise.
+- ~~**PRSR-37 — resolve the launcher icon from Placard.**~~ **Done, 2026-08-26.**
+  `ServiceSpec.Logo` is now a ref — `placard` | `none` | an https URL — defaulted
+  to `placard` in `Normalized`, so a spec names a *service* and gets the right
+  mark. `internal/placard` does the lookup behind a one-method
+  `cloudflare.LogoResolver`, which keeps the Access provisioner from importing a
+  second upstream to decorate a tile.
+
+  Three answers, and only one of them writes:
+
+  | answer | what happens |
+  |---|---|
+  | Placard has the mark | the URL is verified by the write-time fetch, then written |
+  | Placard has no mark for the slug | a **note**; the tile is left exactly as it is |
+  | Placard could not be asked (down, or unconfigured) | a **note**; the tile is left exactly as it is |
+  | the spec says `none` | **drift**, named in the plan, and `--apply` clears it |
+
+  That inverts PRSR-38's trap. An omitted `--logo` used to mean "clear it", so a
+  forgotten flag stripped a working icon; it now means "resolve it", and only a
+  keyword removes one. The last two rows must stay notes rather than drift — a
+  plan reporting drift there would promise a deletion `--apply` will not perform,
+  and treating "the registry is down" as "there is no icon" clears tiles
+  estate-wide on a blip.
+
+  Placard **picks**; it never **decides**. Its per-file `check` is a periodic
+  monitor with a `checked_at`, so `checkLogo`'s sessionless fetch still runs at
+  the moment of writing. Two live conditions justify the whole approach: argosy's
+  old URL answered `200 image/png` and was the 3.6:1 wordmark — a *working*
+  logo_url that is not a *correct* one, which no fetch check can distinguish —
+  and a file Placard reports as `state: "missing"` still carries a fully
+  populated `canonical_url`, so reading the URL without the state writes a
+  guaranteed 404.
+
+  Verified by running the binary against live Placard and live Cloudflare in plan
+  mode, not only under `go test`: switchyard resolves to Placard's mark against a
+  stored URL that is a live 404; argosy reports the repoint with both URLs named;
+  chronicle, which Placard has never heard of, reports `adopt` with a note.
+- **PRSR-41** — `findApp` matches an application on hostname alone, so a
+  switchyard spec resolves to the **path-scoped `decision: bypass`** application
+  that fronts the GitHub webhook rather than to switchyard itself, and an
+  `--apply` would rewrite its `domain` to the bare hostname — widening an
+  unauthenticated bypass from one path to the whole service. Found by running the
+  binary while verifying PRSR-37, whose headline use case is the command that
+  triggers it. Nothing has been applied. The fix has a precedent in
+  `pickCandidate`: refuse when several candidates answer for one name and none is
+  the spec's, as `StepRefused` rather than `StepUnknown`, because the read
+  succeeded.
 - **PRSR-33** — the `dev` tunnel ref, which resolves to a refusal today rather
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod
