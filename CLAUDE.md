@@ -502,6 +502,34 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   read — Cloudflare is documented to return bare references for apps whose
   policies are managed separately — is left untouched and reported as a note,
   for the same reason an unfetchable logo is.
+  **A policy's `id` is the load-bearing field, and which half of the body counts
+  depends on `reusable`** (PRSR-40, measured 2026-08-26 on a disposable app and a
+  disposable reusable policy shared by two disposable apps). A `reusable: true`
+  policy in an application write is a **reference**: Cloudflare reads the id and
+  ignores everything else. The probe sent one back with `name` rewritten and
+  `decision` flipped to `deny`; the write returned 200 echoing the policy's real
+  name and decision, the standalone policy's `updated_at` did not move, and the
+  second app sharing it was untouched. So echoing the estate's `Standard` policy
+  back cannot edit the gate on the six services that share it — the outcome
+  PRSR-40 was filed to rule out is structurally impossible. The corollary is the
+  thing to protect: **strip a policy's `id` and it stops being a reference**, so
+  the app gets gated by a fresh private copy that no longer tracks the shared
+  group, with nothing erroring and the plan still saying "fix a logo". The lever
+  is `livePolicies` and the append through it — *not* `serverOwned`, which
+  already lists `id` and is applied only to the top-level application map,
+  never walking into the policy objects inside it. What invites the mistake is
+  symmetry: a carried policy really does arrive with server-assigned
+  `created_at`, `updated_at` and `uid`, so the obvious tidy-up is a policy-level
+  strip modelled on `serverOwned`, and `id` goes in with them because at the
+  callsite it looks like the same kind of field.
+  `TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten` is the guard, and
+  it pins the pre-existing policy **by id** on both arms: counting the list is
+  not enough, since a body holding only `membersPolicy` satisfies a count and is
+  precisely the assign-instead-of-append failure.
+  A `reusable: false` policy is the opposite — its body **is** honoured (the same
+  probe flipped one to `deny` and the read-back confirmed it), so a gated update
+  is a real write of that policy's content, safe only because `Ensure` takes its
+  own fresh read immediately before building the body.
 - **A logo has three outcomes, not two, and none of them fails the step.**
   Cloudflare stores any `logo_url` without validating it and the launcher falls
   back to the service's initials, so a wrong URL is indistinguishable from an
@@ -752,35 +780,60 @@ instead of a wire shape, and it is the argument for this ticket existing at all:
 five green tests could not see it, and one live plan could. The fixture is now
 the observed response, `tags` and `policies` included.
 
-Still true, and **wider than "Teardown hasn't run"** — which is what this
-paragraph said first, and it read as exhaustive when it was not. **No write verb
-this axis owns has ever executed against Cloudflare.** The exercise was
-adopt-only by construction: the plan wrote nothing, `--apply` produced two rows
-and zero upstream calls, the re-run was `ok`/`ok`. So what PRSR-38 established is
-a claim about the **read** paths — `Inspect`, the matchers, the reconcile logic
-and the statuses they produce. `AccessProvisioner`'s full-replacement `PUT`, the
-DNS create/update, `TunnelProvisioner.putConfig`, and every `Teardown` are all
-still fake-only.
-PRSR-38's probes do not close that gap and must not be read as if they did: they
-were **raw API calls**, so they confirm Cloudflare's behaviour, not the bodies
-`desiredApp` and `putConfig` construct. Confirming that a PUT bumps a version is
-not confirming that the document we would PUT is one Cloudflare accepts.
-The first live execution of the Access `PUT` will most likely be a PRSR-37 logo
-fix on a **gated** app, and that body carries back the `policies` list — observed
-to be full objects with `reusable: true`, shared by six applications — plus
-`tags`, which nothing here models. Whether Cloudflare takes a reusable policy
-echoed inline rather than as a reference is **PRSR-40**, and the field that
-disappears if the answer is no is the one that gates the service.
+PRSR-38 was **adopt-only by construction** — the plan wrote nothing, `--apply`
+produced two rows and zero upstream calls, the re-run was `ok`/`ok` — so what it
+established was a claim about the **read** paths: `Inspect`, the matchers, the
+reconcile logic and the statuses they produce. Its own probes were **raw API
+calls**, confirming Cloudflare's behaviour rather than the bodies `desiredApp`
+and `putConfig` construct; confirming that a PUT bumps a version is not
+confirming that the document we would PUT is one Cloudflare accepts.
+
+**PRSR-40 closed that gap for Access, and only for Access** (2026-08-26). It ran
+the real `AccessProvisioner` — not curl — against the live API on disposable
+hostnames, so what went on the wire was `desiredApp`'s own body. **Every write
+verb in `access.go` has now executed**, on both application shapes:
+
+- **gated create** — the inline policy is accepted, and comes back with a fresh
+  id, `reusable: false`, `precedence: 1`. So a new gated service gets its own
+  private gate rather than joining the estate's shared `Standard`.
+- **gated update, both branches** — carry-through when the group is already
+  admitted, and the **append** when it is not (the foreign policy survived at
+  precedence 1, the members policy landed at 2).
+- **bookmark create and update** — a materially different body, not a variant of
+  the gated one: `type: bookmark`, a `domain` carrying a **scheme**, and
+  `policies` **assigned** to `[]any{}` rather than appended to. Cloudflare accepts
+  the empty list and echoes it back as `[]`, `tags` survives, and the response
+  key set is far smaller than a `self_hosted` app's — no `destinations`,
+  `self_hosted_domains` or `session_duration`. Added after review pointed out the
+  residual caveat below was still exhaustive and still omitted this one.
+- **the logo clear** — `logo_url: ""` really does remove it (the key is absent on
+  read-back), and the plan named the clearing first.
+- **`Teardown`** — including a second teardown of an already-gone app, where
+  `confirmGone`'s re-read correctly reported success rather than an error.
+
+The estate was byte-identical to its pre-probe snapshot afterwards, `updated_at`
+included; all three disposable apps and the disposable policy were deleted.
+
+So the caveat is now genuinely narrower: **the DNS write verbs and the tunnel
+write verbs have never executed against Cloudflare.** `DNSProvisioner`'s
+create/update/delete and `TunnelProvisioner.putConfig` are still fake-only —
+PRSR-38 probed the DNS delete with raw curl, which is not the same as running
+the provisioner. The tunnel is the one that matters most and is the worst
+candidate for a casual probe, since its write is a read-modify-write of a
+document holding every other service's routes.
 
 **PRSR-33** wires the `dev` tunnel ref
 that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
 spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
-the `Teardown` walk, **PRSR-37** resolving a service's logo from Placard instead
-of hand-writing the URL into a spec — which PRSR-38's launcher audit turned from
-a tidiness ticket into a real one, since switchyard's stored `logo_url` is a live
-404 and argosy's is the 3.6:1 wordmark rather than the tile mark — and
-**PRSR-39** the zone pre-flight that PRSR-38's probe showed was available all
-along. **PRSR-36** is settled by PRSR-38 and can close.
+the `Teardown` walk — its orchestration, that is; the Access provisioner's own
+`Teardown` has now run live (PRSR-40), so what is left there is the ordering and
+the "is this hostname still someone's?" question. **PRSR-37** is resolving a
+service's logo from Placard instead of hand-writing the URL into a spec — which
+PRSR-38's launcher audit turned from a tidiness ticket into a real one, since
+switchyard's stored `logo_url` is a live 404 and argosy's is the 3.6:1 wordmark
+rather than the tile mark. **PRSR-39** is the zone pre-flight that PRSR-38's
+probe showed was available all along. **PRSR-36** and **PRSR-40** are both
+closed.
 
 **PRSR-36** asked for two Cloudflare response shapes that PRSR-28's fixes were
 reasoning about from the published schema rather than from a response anybody
