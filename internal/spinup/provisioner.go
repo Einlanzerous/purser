@@ -26,6 +26,30 @@ var ErrUnavailable = errors.New("spinup: provisioner not available")
 // breakage.
 func IsUnavailable(err error) bool { return errors.Is(err, ErrUnavailable) }
 
+// ErrRefused is returned by a provisioner whose read *succeeded* and came back
+// with something it will not act on. Nothing broke and nothing was done — but
+// unlike ErrUnavailable, what needs fixing is upstream rather than in Purser's
+// configuration, and unlike a transport failure, re-running changes nothing.
+//
+// The tunnel is the case it exists for. Its ingress configuration is one
+// document per tunnel holding every service's routes, so a shape the
+// provisioner cannot write into safely — a catch-all rule that is not last, no
+// catch-all at all, a tunnel that is locally managed and therefore is not
+// serving the document this API returns — is refused rather than repaired on a
+// guess (PRSR-30). Read and write both refuse it, so a plan never promises what
+// an apply declines.
+//
+// It is a sentinel rather than a bool on State for the reason PRSR-21 gave on
+// the person axis: a status carrying a modifier makes every consumer that
+// buckets by status remember the modifier exists. Here it lets the orchestrator
+// answer with a status of its own (StepRefused) instead of putting the
+// difference in the Err string, where a reader has to know to look.
+var ErrRefused = errors.New("spinup: not something this provisioner will act on")
+
+// IsRefused reports whether err is the "upstream is unusable" sentinel, through
+// any number of wrappings.
+func IsRefused(err error) bool { return errors.Is(err, ErrRefused) }
+
 // Target is a spec with the orchestrator's per-run resolutions applied. It is
 // what provisioners are handed, so no provisioner resolves a ref itself and
 // none of them can disagree about what "prod" means.
@@ -67,6 +91,18 @@ type Resource struct {
 	ExternalID string
 	ParentID   string
 	Detail     string
+	// Warning is something that went wrong *around* a step that succeeded —
+	// nothing this step did, and not a reason to call it failed.
+	//
+	// Its own field rather than a sentence appended to Detail, because the two
+	// are read by different people for different reasons. Detail describes this
+	// resource, and a surface may reasonably truncate it; a warning here says
+	// something may have happened to a resource that is not this one at all —
+	// the tunnel's concurrent-write note means another service's ingress route
+	// may have been dropped from the shared document. A caller must be able to
+	// find that without pattern-matching a substring out of a description, and a
+	// renderer must be able to give it the prominence it needs (PRSR-31).
+	Warning string
 }
 
 // ServiceProvisioner manages one kind of edge resource for a service. It is the

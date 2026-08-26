@@ -924,8 +924,15 @@ func TestTunnel_EnsureNotesAConcurrentVersionJump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("this step did what it said, so it is not a failure: %v", err)
 	}
-	if !strings.Contains(res.Detail, "another writer") {
-		t.Errorf("Detail should carry the warning, got %q", res.Detail)
+	// On Warning, not Detail. Detail describes *this* resource and a surface may
+	// truncate it; this says another service's route may have been dropped from
+	// the shared document, which a caller must be able to find without picking a
+	// substring out of a description (PRSR-31).
+	if !strings.Contains(res.Warning, "another writer") {
+		t.Errorf("Warning should carry the note, got %q", res.Warning)
+	}
+	if strings.Contains(res.Detail, "another writer") {
+		t.Errorf("the note belongs on Warning alone, not also on Detail: %q", res.Detail)
 	}
 }
 
@@ -937,8 +944,8 @@ func TestTunnel_EnsureDoesNotWarnOnItsOwnWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if strings.Contains(res.Detail, "another writer") {
-		t.Errorf("a lone writer should raise nothing, got %q", res.Detail)
+	if res.Warning != "" {
+		t.Errorf("a lone writer should raise nothing, got %q", res.Warning)
 	}
 }
 
@@ -1201,5 +1208,76 @@ func TestTunnel_UnavailableIsTheSpinUpSentinelNotThePersonAxisOne(t *testing.T) 
 	err := p.Teardown(context.Background(), spinup.Target{Spec: spinup.ServiceSpec{Hostname: "x.example.com"}}, model.ServiceResource{})
 	if !errors.Is(err, spinup.ErrUnavailable) {
 		t.Fatalf("want spinup.ErrUnavailable, got %v", err)
+	}
+}
+
+// The refusals this file already makes are only half of what the orchestrator
+// needs: it has to be able to tell them apart from a read that never completed,
+// because the two want opposite things from an operator (PRSR-31). A missing
+// sentinel here is invisible — every one of these still refuses, and every one
+// would report as `unknown`, telling the operator to re-run something that will
+// say this until they go and fix the tunnel.
+func TestTunnel_UnwritableDocumentsAreRefusedNotMerelyUnknown(t *testing.T) {
+	const noCatchAll = `{"ingress":[
+		{"hostname":"lyceum.zerogravity.industries","service":"http://lyceum:8083"}
+	]}`
+	host := "interlock.zerogravity.industries"
+	cases := []struct {
+		name   string
+		config string
+		source string
+	}{
+		{"a catch-all that is not last has already killed the tail", deadTail, "cloudflare"},
+		{"no catch-all at all is not a document cloudflared would serve", noCatchAll, "cloudflare"},
+		{"a locally-managed tunnel is not serving this document", liveShape, "local"},
+		{"a tunnel that will not say is not evidence either way", liveShape, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeTunnel(t, tc.config)
+			f.source = tc.source
+			p := f.prov(t)
+			// A hostname the document does not already serve, so this is an
+			// answer --apply would act on rather than an already-published one.
+			tgt := target(t, host, "http://interlock:8080")
+
+			_, err := p.Inspect(context.Background(), tgt)
+			if err == nil {
+				t.Fatal("want a refusal")
+			}
+			if !spinup.IsRefused(err) {
+				t.Errorf("Inspect: the orchestrator must read this as refused, not as a failed read: %v", err)
+			}
+			if spinup.IsUnavailable(err) {
+				t.Error("the provisioner is configured; what is wrong is upstream")
+			}
+
+			if _, err := p.Ensure(context.Background(), tgt); err == nil {
+				t.Error("Ensure must refuse too")
+			} else if !spinup.IsRefused(err) {
+				t.Errorf("Ensure: want a refusal the orchestrator can recognise, got %v", err)
+			}
+			if _, puts := f.counts(); puts != 0 {
+				t.Errorf("a refused document must not be written, saw %d PUTs", puts)
+			}
+		})
+	}
+}
+
+// The converse, and the reason the sentinel rides on documentShape rather than
+// on terminalIndex: a read that did not produce a document must stay `unknown`.
+// Telling an operator to go and fix a tunnel that is healthy is the same wrong
+// answer pointed the other way, and it is the more likely of the two.
+func TestTunnel_AFailedReadIsNotARefusal(t *testing.T) {
+	f := newFakeTunnel(t, liveShape)
+	f.getErr = "service temporarily unavailable"
+	p := f.prov(t)
+
+	_, err := p.Inspect(context.Background(), target(t, "interlock.zerogravity.industries", "http://interlock:8080"))
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if spinup.IsRefused(err) {
+		t.Errorf("a failed read is not a document anybody has judged: %v", err)
 	}
 }

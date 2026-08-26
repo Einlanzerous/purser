@@ -3,6 +3,7 @@ package spinup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -801,3 +802,183 @@ func (p *spyProv) Inspect(ctx context.Context, t Target) (State, error) {
 
 var _ ServiceProvisioner = (*spyProv)(nil)
 var _ ServiceProvisioner = (*Unavailable)(nil)
+
+// --- refused vs unknown (PRSR-31) -------------------------------------------
+
+// The split PRSR-30's review filed and PRSR-31 settled. Both states decline to
+// act; they differ in what an operator should do next, and until this the
+// difference lived in the Err string — a second field a reader has to know to
+// consult, which is the shape PRSR-21 removed from the person axis.
+func TestEnsure_RefusedIsNotUnknown(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want StepStatus
+	}{
+		{
+			// The read never completed. Re-running is the whole fix.
+			name: "a transport failure is unknown",
+			err:  errors.New("502 from the api"),
+			want: StepUnknown,
+		},
+		{
+			// The read completed and came back with a document nobody may write
+			// to. Re-running repeats it until somebody fixes it upstream.
+			name: "an unwritable upstream is refused",
+			err:  fmt.Errorf("%w: the catch-all rule is not last", ErrRefused),
+			want: StepRefused,
+		},
+		{
+			// Wrapped several layers deep, the way a provisioner actually
+			// returns it — inspectIngress wraps documentShape, which wraps the
+			// sentinel.
+			name: "refused through several wrappings",
+			err:  fmt.Errorf("cloudflare: tunnel abc: %w", fmt.Errorf("%w: no catch-all at all", ErrRefused)),
+			want: StepRefused,
+		},
+		{
+			// And unavailable still wins over both: an unconfigured provisioner
+			// is Purser's own gap, fixed here rather than upstream.
+			name: "unavailable is neither",
+			err:  fmt.Errorf("%w: set PURSER_CF_ZONE_ID", ErrUnavailable),
+			want: StepUnavailable,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			route := &fakeProv{kind: model.ResourceTunnelRoute, inspectErr: tc.err}
+			st := newStore()
+			res, err := New(st, NewRegistry(route), WithTunnels(prodTunnels())).
+				Ensure(context.Background(), Request{Spec: tunnelledSpec(), Apply: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := wantStatus(t, res, model.ResourceTunnelRoute, tc.want)
+			if f.Err == "" {
+				t.Error("every one of these must carry the reason")
+			}
+			if route.ensures != 0 {
+				t.Error("--apply acted on a step it could not decide from")
+			}
+		})
+	}
+}
+
+// A refusal reaching Ensure rather than Inspect is the document changing shape
+// between the plan and the apply. It is still refused rather than failed: the
+// operator's next move is the same, and nothing was written either way.
+func TestEnsure_RefusalOnTheWritePathIsAlsoRefused(t *testing.T) {
+	route := &fakeProv{
+		kind:      model.ResourceTunnelRoute,
+		ensureErr: fmt.Errorf("%w: the catch-all rule moved", ErrRefused),
+	}
+	res, err := New(newStore(), NewRegistry(route), WithTunnels(prodTunnels())).
+		Ensure(context.Background(), Request{Spec: tunnelledSpec(), Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceTunnelRoute, StepRefused)
+}
+
+// Refused behaves like unknown everywhere it should: it is not in place, so it
+// holds the DNS step, and it is not pending, because --apply is not what fixes
+// it.
+func TestEnsure_RefusedBlocksDNSAndIsNotPending(t *testing.T) {
+	route := &fakeProv{
+		kind:       model.ResourceTunnelRoute,
+		inspectErr: fmt.Errorf("%w: the catch-all rule is not last", ErrRefused),
+	}
+	dns := absent(model.ResourceDNSRecord, "rec-1")
+	st := newStore()
+
+	res, err := New(st, NewRegistry(route, dns), WithTunnels(prodTunnels())).
+		Ensure(context.Background(), Request{Spec: tunnelledSpec(), Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceTunnelRoute, StepRefused)
+	wantStatus(t, res, model.ResourceDNSRecord, StepBlocked)
+	if dns.ensures != 0 {
+		t.Fatal("a hostname was published in front of a tunnel that cannot serve it")
+	}
+	if res.Pending() != 0 {
+		t.Error("neither a refused step nor the step it blocks is fixed by --apply, so neither is pending")
+	}
+	if st.count() != 0 {
+		t.Error("nothing should have been recorded")
+	}
+}
+
+// A warning belongs to a step that *succeeded*, so it must not be confused with
+// Err and must not quietly become part of the description. The tunnel's is the
+// one that matters: it says another service's ingress route may have been
+// dropped from the shared document, which the step's own status cannot convey.
+func TestEnsure_CarriesAWarningFromAStepThatSucceeded(t *testing.T) {
+	route := &fakeProv{
+		kind:    model.ResourceTunnelRoute,
+		ensured: Resource{Detail: "routed to http://interlock:8080", Warning: "another writer changed the shared configuration"},
+	}
+	res, err := New(newStore(), NewRegistry(route), WithTunnels(prodTunnels())).
+		Ensure(context.Background(), Request{Spec: tunnelledSpec(), Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := wantStatus(t, res, model.ResourceTunnelRoute, StepCreate)
+	if !f.Applied {
+		t.Error("a warning is not a failure — the step did what it said")
+	}
+	if f.Warning != "another writer changed the shared configuration" {
+		t.Errorf("the warning should reach the finding, got %q", f.Warning)
+	}
+	if f.Err != "" {
+		t.Errorf("a warning is not an error, got Err=%q", f.Err)
+	}
+	if strings.Contains(f.Detail, "another writer") {
+		t.Errorf("it must not also be folded into the description: %q", f.Detail)
+	}
+}
+
+// An orphan is the one status where "nothing needs attention" is true and "the
+// edge holds only what the spec asks for" is not — everything the spec calls
+// for is in place, and something it no longer calls for is still live.
+//
+// Excluded on purpose: Ensure only adds and updates, so counting it would have
+// every run of a deliberately narrowed spec report trouble for ever with no
+// command to type. Pinned so the exclusion is a decision rather than an
+// oversight, and so PRSR-34 has to come past this test to change it.
+func TestNeedsAttention_ExcludesAnOrphanButNotTheRest(t *testing.T) {
+	// A spec that no longer wants an Access app, with one still recorded.
+	spec := directSpec()
+	spec.Access = AccessNone
+	st := newStore()
+	st.put(model.ServiceResource{
+		ServiceKey: spec.Key, Hostname: spec.Hostname,
+		Kind: model.ResourceAccessApp, ExternalID: "app-1", Status: model.ResourceActive,
+	})
+
+	res, err := New(st, NewRegistry(present(model.ResourceDNSRecord, "rec-1", "zone-1"))).
+		Ensure(context.Background(), Request{Spec: spec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceAccessApp, StepOrphaned)
+	if n := len(res.NeedsAttention()); n != 0 {
+		t.Errorf("an orphan is not something --apply or this axis can act on, got %d needing attention", n)
+	}
+
+	// ...and the exclusion is specific to orphaned, not a hole in the list.
+	for _, status := range []StepStatus{
+		StepUnavailable, StepRefused, StepUnknown, StepBlocked, StepFailed, StepAppliedNotRecorded,
+	} {
+		r := &Result{Findings: []StepFinding{{Kind: model.ResourceDNSRecord, Status: status}}}
+		if len(r.NeedsAttention()) != 1 {
+			t.Errorf("%s should need attention", status)
+		}
+	}
+	for _, status := range []StepStatus{StepOK, StepAdopt, StepCreate, StepUpdate, StepSkipped, StepMissing, StepOrphaned} {
+		r := &Result{Findings: []StepFinding{{Kind: model.ResourceDNSRecord, Status: status}}}
+		if len(r.NeedsAttention()) != 0 {
+			t.Errorf("%s should not need attention", status)
+		}
+	}
+}

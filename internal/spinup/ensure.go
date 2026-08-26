@@ -135,22 +135,38 @@ const (
 	// configured. Nothing broke and nothing was done; mirrors
 	// model.TaskUnavailable.
 	StepUnavailable StepStatus = "unavailable"
-	// StepUnknown — the current state could not be determined, so nothing may
-	// be decided from it. Never collapsed into "absent": acting on an
-	// unverifiable answer is how a spin-up creates a second copy of something,
-	// and on the tunnel it would mean rewriting a shared document from a read
-	// that just failed. Apply does not act on an unknown step.
+	// StepUnknown — the current state could not be *read*, so nothing may be
+	// decided from it. Never collapsed into "absent": acting on an unverifiable
+	// answer is how a spin-up creates a second copy of something, and on the
+	// tunnel it would mean rewriting a shared document from a read that just
+	// failed. Apply does not act on an unknown step.
 	//
-	// Two different things reach it, and they want opposite responses from an
-	// operator. Usually the read failed, and re-running is the whole fix. But a
-	// provisioner also reports this for a read that *succeeded* and returned
-	// something it will not act on — the tunnel's ingress document is one
-	// object holding every service's routes, so a shape it cannot write into
-	// safely is refused here rather than previewed as a `create` that `--apply`
-	// then declines (PRSR-30). That one is permanent: re-running repeats it
-	// until somebody fixes what is upstream, and the Err string is where the
-	// difference is spelled out.
+	// This is the transient half, and re-running is the whole fix. The
+	// permanent half is StepRefused.
 	StepUnknown StepStatus = "unknown"
+	// StepRefused — the read *succeeded* and came back with something the
+	// provisioner will not act on. Apply does not act on it either.
+	//
+	// Split from StepUnknown because the two want opposite responses from an
+	// operator, and until PRSR-31 the difference lived in the Err string. A
+	// failed read says "run it again". This says "go and fix the thing
+	// upstream, because running it again will print this until you do" — the
+	// tunnel's ingress document with a catch-all that is not last, or a tunnel
+	// that is locally managed and therefore is not serving the document the API
+	// returns (PRSR-30).
+	//
+	// It is a status rather than a flag beside `unknown` for the reason PRSR-21
+	// removed `TaskFailed` + `Pending bool` from the person axis: a status
+	// carrying a modifier makes every consumer that buckets by status remember
+	// the modifier exists, and the note filed under "what failed" then had to be
+	// relabelled at the point of rendering. The one thing this distinction is
+	// ever consulted for is the difference, so it switches on a status.
+	//
+	// Distinct from StepUnavailable in the other direction: unavailable is
+	// Purser's own configuration missing a credential, which the operator fixes
+	// here. Refused is upstream being in a shape nobody can safely write to,
+	// which they fix there.
+	StepRefused StepStatus = "refused"
 	// StepFailed — the write was attempted and errored. Nothing is recorded,
 	// so a re-run reconsiders the step from scratch.
 	StepFailed StepStatus = "failed"
@@ -175,6 +191,10 @@ type StepFinding struct {
 	// ExternalID is the resource's upstream id, when it has one. Empty for a
 	// tunnel route by nature, not by omission.
 	ExternalID string
+	// Warning is trouble around a step that nonetheless succeeded — see
+	// Resource.Warning. Distinct from Err, which belongs to a step that did not
+	// do what it said.
+	Warning string
 	// Applied reports that this run changed something — upstream, the record, or
 	// both. Always false on a dry run.
 	Applied bool
@@ -221,9 +241,14 @@ func (r *Result) Changed() int {
 
 // Pending reports how many steps still want doing — the count that makes
 // "nothing to do" distinguishable from "re-run with --apply". Statuses that need
-// a human (unavailable, unknown, failed) are not counted here, and neither is
-// blocked: re-running with --apply does not fix any of them, because the reason
-// they didn't happen was never the missing flag.
+// a human (unavailable, refused, unknown, failed) are not counted here, and
+// neither is blocked: re-running with --apply does not fix any of them, because
+// the reason they didn't happen was never the missing flag.
+//
+// So a zero here is NOT the claim that the edge is as the spec asks — only that
+// the flag would add nothing. Anything reporting an overall verdict has to
+// consult the statuses too; reading this alone as success is what had the CLI
+// sign off an unavailable DNS step as a service that was up (PRSR-31).
 func (r *Result) Pending() int {
 	n := 0
 	for _, f := range r.Findings {
@@ -235,6 +260,50 @@ func (r *Result) Pending() int {
 		}
 	}
 	return n
+}
+
+// NeedsAttention reports the steps in a state a person has to resolve — the
+// answer to "is this service's edge as the spec asks?", which neither Pending
+// nor Changed answers.
+//
+// It exists because the two counts that *look* like a verdict are not one.
+// Pending excludes every status here on purpose (--apply fixes none of them), so
+// a plan against an unconfigured deployment reports `pending: 0, changed: 0` and
+// nothing anywhere contradicts it — which is exactly how the CLI came to print
+// "the edge already matches this spec" over a hostname that does not resolve
+// (PRSR-31).
+//
+// Living here rather than in a renderer is the point: the CLI's exit code and
+// the HTTP response answer it from the same list, so the two surfaces cannot
+// drift about what counts as fine. `blocked` is included — the step did not
+// happen, and the hostname does not work — even though what needs attention is
+// really its prerequisite.
+//
+// `orphaned` is deliberately NOT included, and it is the one exclusion worth
+// arguing rather than assuming. Everything the spec asks for is in place; what
+// is extra is a resource this spec no longer calls for, left over from an
+// earlier one. So the claim this answers is "the spec is satisfied", not
+// "nothing else is here" — the honest weaker one, and the caller-facing wording
+// must not round it up.
+//
+// It is excluded because nothing here can act on it. `Ensure` only ever adds and
+// updates; removing an orphan is `Teardown`'s, which nothing orchestrates yet
+// (PRSR-34). Counting it would make every run of a deliberately narrowed spec
+// report trouble and exit non-zero, for ever, with no command to type — the
+// prescribe-a-provable-no-op mistake `offboard`'s SSO warning exists to avoid,
+// which teaches an operator to ignore the signal that matters. It is reported
+// loudly on its own line instead, since nothing else in the report would mention
+// a resource that is still serving traffic. Revisit this when PRSR-34 gives it
+// somewhere to go.
+func (r *Result) NeedsAttention() []StepFinding {
+	var out []StepFinding
+	for _, f := range r.Findings {
+		switch f.Status {
+		case StepUnavailable, StepRefused, StepUnknown, StepBlocked, StepFailed, StepAppliedNotRecorded:
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // inPlace reports whether this step leaves its resource in place for a later
@@ -383,6 +452,12 @@ func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKi
 	case IsUnavailable(err):
 		f.Status, f.Err = StepUnavailable, err.Error()
 		return f
+	case IsRefused(err):
+		// The read worked and upstream is in a shape this provisioner will not
+		// write into. Apply declines for the same reason a dry run reports it,
+		// and re-running will say this until somebody changes what is upstream.
+		f.Status, f.Err = StepRefused, err.Error()
+		return f
 	case err != nil:
 		// Unknown, never absent — and apply stops here rather than writing
 		// blind. A retry costs one re-run; acting on a state that could not be
@@ -447,6 +522,14 @@ func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKi
 	case IsUnavailable(err):
 		f.Status, f.Err = StepUnavailable, err.Error()
 		return f
+	case IsRefused(err):
+		// Reachable only when upstream changed shape between the Inspect above
+		// and this call — the plan was made from a document that was writable
+		// and the write found one that isn't. Reported as refused rather than
+		// failed because the operator's next move is the same as if the plan had
+		// said so: fix what is upstream. Nothing was written either way.
+		f.Status, f.Err = StepRefused, err.Error()
+		return f
 	case err != nil:
 		f.Status, f.Err = StepFailed, err.Error()
 		return f
@@ -455,7 +538,7 @@ func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKi
 	// Inspect's description of the state this call just replaced would present
 	// the old world as the result. A provisioner that returns none leaves the
 	// line without a description, which is honest.
-	f.Detail = res.Detail
+	f.Detail, f.Warning = res.Detail, res.Warning
 
 	// The ids are merged the other way round, and deliberately. A provisioner
 	// that returns a partial Resource — an update that had nothing new to say,

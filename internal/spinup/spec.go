@@ -18,6 +18,7 @@
 package spinup
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -182,6 +183,29 @@ type ServiceSpec struct {
 // that column is compared exactly — so "Argosy" and "argosy" would otherwise be
 // two services holding one hostname's resources between them.
 func (s ServiceSpec) Normalized() ServiceSpec {
+	// These three come first, because the rest of this function *reads* them —
+	// and the ordering is load-bearing rather than tidy. Mode decides whether
+	// Upstream is case-folded below, so trimming Mode afterwards left `"direct "`
+	// skipping that fold: two spellings of one spec normalized to two different
+	// specs, and since validHostname assumes what Normalized produced, an
+	// upstream like "Origin.Example.Com" was then refused outright on one
+	// spelling and accepted on the other (PRSR-31).
+	//
+	// Trimmed rather than trimmed-at-each-caller: all three are compared against
+	// constants, so a stray space is a refusal — and it was a refusal on the HTTP
+	// path only, because the CLI trimmed them itself and this did not. One
+	// surface accepting `"direct "` while the other answers `unknown mode
+	// "direct "` is a difference nobody would guess at.
+	//
+	// Trimmed but deliberately NOT case-folded, unlike Key and Hostname. Those
+	// are identity keys, where two spellings of one value would split a service's
+	// resources between them; these are a closed set matched against constants,
+	// and quietly accepting `"Direct"` widens what a spec may say without anybody
+	// deciding it should.
+	s.Mode = Mode(strings.TrimSpace(string(s.Mode)))
+	s.Access = AccessShape(strings.TrimSpace(string(s.Access)))
+	s.Tunnel = TunnelRef(strings.TrimSpace(string(s.Tunnel)))
+
 	s.Key = strings.ToLower(strings.TrimSpace(s.Key))
 	// TrimRight, not TrimSuffix: "host.example.com.." is as much a trailing-dot
 	// mistake as one dot is, and leaving the second one turns an empty label
@@ -416,12 +440,22 @@ func (s ServiceSpec) dependsOn(kind model.ResourceKind) []model.ResourceKind {
 // hasn't been told its id.
 type TunnelSet map[TunnelRef]string
 
+// ErrTunnelUnconfigured is returned when a spec names a tunnel this deployment
+// has no id for. Validate has already rejected refs that are not names at all,
+// so this is only ever a legal ref nobody has wired — `dev`, until PRSR-33.
+//
+// A sentinel rather than a bare error because it is the one refusal Ensure can
+// still raise that is the *caller's* to fix rather than an outage, and the HTTP
+// surface has to tell those apart to choose a status code. Matching on the
+// message would have made that distinction depend on the wording above.
+var ErrTunnelUnconfigured = errors.New("spinup: tunnel is not configured")
+
 // Resolve returns the tunnel id for a ref.
 func (ts TunnelSet) Resolve(ref TunnelRef) (string, error) {
 	if id := strings.TrimSpace(ts[ref]); id != "" {
 		return id, nil
 	}
-	return "", fmt.Errorf("spinup: tunnel %q is not configured (%s)", ref, configuredTunnels(ts))
+	return "", fmt.Errorf("%w: %q (%s)", ErrTunnelUnconfigured, ref, configuredTunnels(ts))
 }
 
 // configuredTunnels renders what *is* wired, so the refusal distinguishes "you

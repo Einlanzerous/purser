@@ -537,9 +537,20 @@ func pickMatch(found []dnsRecord, want dnsRecord) (dnsRecord, bool) {
 // pickCandidate chooses which existing record an update would change, and
 // refuses when the answer is not one record.
 //
-// Refusing is the whole point. The orchestrator turns an error here into
-// `unknown` and does not act on it, so an ambiguous name costs a re-run after a
-// human looks — where a guess costs whichever record was not this service's.
+// Refusing is the whole point: a guess costs whichever record was not this
+// service's.
+//
+// The refusal carries spinup.ErrRefused, so the orchestrator reports `refused`
+// rather than `unknown` (PRSR-31). The read *succeeded* — several records
+// genuinely answer for this name — and nothing changes until a human edits the
+// zone, which is what the message already says. Reported as `unknown` it drew
+// "could not be read, so nothing was decided from it — re-run", and re-running
+// reprints it for ever: the exact sentence the refused/unknown split exists to
+// stop printing.
+//
+// records()'s full-page refusal is deliberately on the other side of that line
+// and stays `unknown`: there the filter narrowed nothing, so the answer really
+// was not read, and a re-run is the fix.
 func pickCandidate(found []dnsRecord, want dnsRecord) (dnsRecord, error) {
 	var sameType []dnsRecord
 	for _, r := range found {
@@ -556,8 +567,8 @@ func pickCandidate(found []dnsRecord, want dnsRecord) (dnsRecord, error) {
 		// name has exactly one record and it is the one the spec is about.
 		return found[0], nil
 	}
-	return dnsRecord{}, fmt.Errorf("cloudflare: %d records already answer for %s (%s) and none matches the spec — Purser will not guess which one is this service's; resolve it in the Cloudflare dashboard",
-		len(found), want.Name, describeAll(found))
+	return dnsRecord{}, fmt.Errorf("%w: cloudflare: %d records already answer for %s (%s) and none matches the spec — Purser will not guess which one is this service's; resolve it in the Cloudflare dashboard",
+		spinup.ErrRefused, len(found), want.Name, describeAll(found))
 }
 
 // --- rendering -------------------------------------------------------------

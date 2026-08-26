@@ -367,3 +367,68 @@ func TestTunnelSet_Resolve(t *testing.T) {
 		t.Error("an empty set must refuse rather than resolve to an empty id")
 	}
 }
+
+// Mode, Access and Tunnel are compared against constants, so a stray space is a
+// refusal — and it used to be a refusal on one surface only, because the CLI
+// trimmed them itself and Normalized did not. An automation caller posting
+// `{"mode": "direct "}` got `unknown mode "direct "` for a value the CLI
+// accepted (PRSR-31).
+func TestNormalized_TrimsTheFieldsComparedAgainstConstants(t *testing.T) {
+	spec := ServiceSpec{
+		Key: "interlock", Hostname: "interlock.zerogravity.industries",
+		Mode: " tunnelled ", Upstream: "http://interlock:8080",
+		Access: "\tgated\n", Tunnel: " prod ",
+	}
+	got, err := spec.Validate()
+	if err != nil {
+		t.Fatalf("padding is not a different spec: %v", err)
+	}
+	if got.Mode != ModeTunnelled || got.Access != AccessGated || got.Tunnel != TunnelProd {
+		t.Errorf("want the trimmed constants, got mode=%q access=%q tunnel=%q", got.Mode, got.Access, got.Tunnel)
+	}
+}
+
+// Trimmed, but not case-folded. Key and Hostname are identity keys, where two
+// spellings of one value would split a service's resources between them; these
+// three are a closed set, and quietly accepting "Direct" widens what a spec may
+// say without anybody deciding it should.
+func TestNormalized_DoesNotCaseFoldTheClosedSets(t *testing.T) {
+	spec := ServiceSpec{
+		Key: "argosy", Hostname: "argosy.zerogravity.industries",
+		Mode: "Direct", Upstream: "100.64.0.7", Access: "bookmark",
+	}
+	if _, err := spec.Validate(); err == nil {
+		t.Error(`"Direct" is not a mode; accepting it would widen the set by accident`)
+	}
+}
+
+// The trims have to come *before* anything reads the fields they clean. A
+// direct spec lowercases its Upstream — it becomes a DNS record's value, and DNS
+// is case-insensitive — and that branch tests Mode, so trimming Mode afterwards
+// left `"direct "` skipping the fold. Two spellings of one spec then normalize
+// to two different specs, which is the thing this trimming exists to prevent,
+// one statement further out.
+func TestNormalized_TrimsBeforeAnythingReadsTheTrimmedFields(t *testing.T) {
+	padded := ServiceSpec{
+		Key: "argosy", Hostname: "argosy.zerogravity.industries",
+		Mode: "direct ", Upstream: "Origin.Example.Com", Access: "bookmark",
+	}
+	clean := padded
+	clean.Mode = ModeDirect
+
+	gotPadded, err := padded.Validate()
+	if err != nil {
+		t.Fatalf("padded: %v", err)
+	}
+	gotClean, err := clean.Validate()
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if gotPadded.Upstream != gotClean.Upstream {
+		t.Errorf("padding the mode changed how the upstream normalized: %q vs %q",
+			gotPadded.Upstream, gotClean.Upstream)
+	}
+	if gotPadded.Upstream != "origin.example.com" {
+		t.Errorf("a direct upstream is a DNS record's value and folds to lower case, got %q", gotPadded.Upstream)
+	}
+}

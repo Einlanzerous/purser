@@ -1,7 +1,8 @@
-// Package api is Purser's thin HTTP surface over the invite orchestrator. It is
-// deliberately small: a health check, an endpoint to run an invite, and one to
-// read an invite's status. The CLI shares the same orchestrator, so this is a
-// convenience for automation (n8n, scripts) rather than the primary interface.
+// Package api is Purser's thin HTTP surface over the two orchestrators. It is
+// deliberately small: a health check, an endpoint to run an invite, one to read
+// an invite's status, and one to stand up a service's edge. The CLI shares the
+// same orchestrators, so this is a convenience for automation (n8n, scripts)
+// rather than the primary interface.
 package api
 
 import (
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Einlanzerous/purser/internal/invite"
 	"github.com/Einlanzerous/purser/internal/model"
+	"github.com/Einlanzerous/purser/internal/spinup"
 	"github.com/Einlanzerous/purser/internal/store"
 	"github.com/Einlanzerous/purser/internal/version"
 )
@@ -23,17 +25,23 @@ import (
 // Server serves the Purser HTTP API.
 type Server struct {
 	svc      *invite.Service
+	spin     *spinup.Service
 	store    *store.Store
 	apiToken string
 }
 
 // New builds the API server. apiToken, when non-empty, is required as a bearer
 // token on the /v1 endpoints.
-func New(svc *invite.Service, st *store.Store, apiToken string) *Server {
+//
+// spin may be nil, which disables the spin-up endpoint rather than panicking on
+// it — the composition root always supplies one, and a caller constructing this
+// for a narrower purpose should get a 503 naming the omission rather than a
+// crash on the first request.
+func New(svc *invite.Service, spin *spinup.Service, st *store.Store, apiToken string) *Server {
 	if apiToken == "" {
 		log.Printf("api: PURSER_API_TOKEN is empty — /v1 endpoints are UNAUTHENTICATED (fine only behind construct_net/Tailscale)")
 	}
-	return &Server{svc: svc, store: st, apiToken: apiToken}
+	return &Server{svc: svc, spin: spin, store: st, apiToken: apiToken}
 }
 
 // Handler returns the mux with all routes registered.
@@ -42,6 +50,7 @@ func (s *Server) Handler() *http.ServeMux {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("POST /v1/invites", s.auth(s.handleCreateInvite))
 	mux.HandleFunc("GET /v1/invites/{id}", s.auth(s.handleGetInvite))
+	mux.HandleFunc("POST /v1/spinups", s.auth(s.handleSpinup))
 	return mux
 }
 
@@ -173,6 +182,97 @@ func (s *Server) handleGetInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, newStatusResponse(inv, tasks))
+}
+
+// spinupRequest is the POST /v1/spinups body: a ServiceSpec, plus whether to
+// act on it.
+//
+// `apply` defaults to false, so the unadorned request is a plan. That is the
+// same default the CLI has and it matters more here: this endpoint creates real
+// edge infrastructure, and a caller who forgets the field gets a report rather
+// than a rewritten ingress document.
+type spinupRequest struct {
+	Service     string `json:"service"`
+	DisplayName string `json:"display_name"`
+	Hostname    string `json:"hostname"`
+	Mode        string `json:"mode"`
+	Upstream    string `json:"upstream"`
+	Access      string `json:"access"`
+	LogoURL     string `json:"logo_url"`
+	Tunnel      string `json:"tunnel"`
+	Apply       bool   `json:"apply"`
+}
+
+func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
+	if s.spin == nil {
+		writeError(w, http.StatusServiceUnavailable, "this build has no spin-up orchestrator wired")
+		return
+	}
+	var req spinupRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	spec := spinup.ServiceSpec{
+		Key:         req.Service,
+		DisplayName: req.DisplayName,
+		Hostname:    req.Hostname,
+		Mode:        spinup.Mode(req.Mode),
+		Upstream:    req.Upstream,
+		Access:      spinup.AccessShape(req.Access),
+		LogoURL:     req.LogoURL,
+		Tunnel:      spinup.TunnelRef(req.Tunnel),
+	}
+	// Validated here so a malformed spec is a 400 rather than a 500. Ensure
+	// validates again — it is the orchestrator's own precondition and not
+	// something a caller may skip — and this call is what decides whose fault
+	// the refusal is.
+	if _, err := spec.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	res, err := s.spin.Ensure(r.Context(), spinup.Request{Spec: spec, Apply: req.Apply})
+	if err != nil {
+		// Everything a provisioner did or failed to do is a finding, so this is
+		// only reached for a request that could not be attempted: an
+		// unresolvable tunnel ref, or a failed read of Purser's own records. The
+		// first is the caller's to fix and names itself; the second is an
+		// outage. They are told apart by the spec having already validated
+		// above, which is what leaves the tunnel ref as the one caller-side
+		// refusal Ensure can still raise.
+		if errors.Is(err, spinup.ErrTunnelUnconfigured) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		log.Printf("api: spin-up of %s failed: %v", spec.Hostname, err)
+		writeError(w, http.StatusInternalServerError, "spin-up failed")
+		return
+	}
+	// Logged as well as returned, unlike the per-step details, because a caller
+	// that ignores these fields would otherwise leave no trace of them anywhere
+	// (compare name_conflict above). Both are things a 200 with sensible counts
+	// does not reveal:
+	//
+	//   applied-not-recorded — the edge changed and the row didn't, so Purser
+	//     cannot tear down what it just created.
+	//   warning — the step *succeeded*, and something around it may not have.
+	//     The tunnel's is the one that matters: another service's ingress route
+	//     may have been dropped from the shared document, which is somebody
+	//     else's outage and appears nowhere in this response's status or counts.
+	//
+	// The CLI does not double-log these; it prints them itself, and `log` writes
+	// to the same stderr its report does.
+	for _, f := range res.Findings {
+		if f.Status == spinup.StepAppliedNotRecorded {
+			log.Printf("api: spin-up of %s: %s changed upstream but was not recorded: %s",
+				spec.Hostname, f.Kind, f.Err)
+		}
+		if f.Warning != "" {
+			log.Printf("api: spin-up of %s: %s: %s", spec.Hostname, f.Kind, f.Warning)
+		}
+	}
+	writeJSON(w, http.StatusOK, newSpinupResponse(res))
 }
 
 // auth wraps a handler with bearer-token check when an API token is configured.

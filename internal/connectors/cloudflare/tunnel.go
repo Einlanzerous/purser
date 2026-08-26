@@ -280,15 +280,22 @@ func (p *TunnelProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 	if err := confirmRoute(after.ingress, t.Spec.Hostname, t.Spec.Upstream); err != nil {
 		return spinup.Resource{}, err
 	}
-	if note := concurrentWriteNote(before.version, after.version, t.TunnelID); note != "" {
-		// Not an error: the route above is confirmed in place, so this step did
-		// what it said. What may have been lost is somebody *else's* route, and
-		// the only useful response is to say so loudly in both places an
-		// operator looks.
-		log.Printf("cloudflare: %s", note)
-		detail += " — " + note
-	}
-	return spinup.Resource{ParentID: t.TunnelID, Detail: detail}, nil
+	// Not an error: the route above is confirmed in place, so this step did what
+	// it said. What may have been lost is somebody *else's* route on this
+	// tunnel, which is why it travels as a Warning rather than as an appendix to
+	// this resource's description.
+	//
+	// It used to be appended to Detail *and* logged here. The log line is gone
+	// because `log` and the CLI's own summary both write to stderr, so one event
+	// read as two — and this is the message whose entire value is being believed
+	// when it fires. But dropping it outright made it invisible to `purser
+	// serve`, where there is no double-print to avoid and a caller that ignores
+	// the field would leave no trace of it anywhere; the API layer logs it from
+	// the Warning field instead, the way it already logs applied-not-recorded
+	// (PRSR-31). Teardown still logs its own — nothing carries a Resource back
+	// from there.
+	note := concurrentWriteNote(before.version, after.version, t.TunnelID)
+	return spinup.Resource{ParentID: t.TunnelID, Detail: detail, Warning: note}, nil
 }
 
 // Teardown removes the hostname's ingress rule from the tunnel it was recorded
@@ -600,7 +607,18 @@ func documentShape(rules []ingressRule) error {
 	if len(rules) == 0 {
 		return nil
 	}
-	return terminalIndexErr(rules)
+	if err := terminalIndexErr(rules); err != nil {
+		// The sentinel rides on this one predicate rather than on terminalIndex
+		// itself, because this is the site that asks it about a document we
+		// *fetched*. terminalIndex's other callers ask it about a document this
+		// run just built (assertWritable) or just read back (confirmRoute), and
+		// those failures are our own arithmetic or a concurrent writer — a
+		// breakage, not a state somebody has to go and fix upstream. Both
+		// callers of documentShape wrap with %w, so the refusal reaches the
+		// orchestrator from the read path and the write path alike (PRSR-31).
+		return fmt.Errorf("%w: %w", spinup.ErrRefused, err)
+	}
+	return nil
 }
 
 // terminalIndexErr is terminalIndex's refusal without its index.
@@ -812,9 +830,9 @@ func checkTunnelSource(tunnelID, source string) error {
 	case remotelyManaged:
 		return nil
 	case "":
-		return fmt.Errorf("cloudflare: tunnel %s did not report whether it is locally or remotely managed, so this configuration cannot be shown to be the one it serves — refusing to read a route from it or write one into it", tunnelID)
+		return fmt.Errorf("%w: cloudflare: tunnel %s did not report whether it is locally or remotely managed, so this configuration cannot be shown to be the one it serves — refusing to read a route from it or write one into it", spinup.ErrRefused, tunnelID)
 	default:
-		return fmt.Errorf("cloudflare: tunnel %s is configured by a file on the origin machine (source %q), not over the API — a route written here would be stored and read back correctly and never served; manage its ingress in that cloudflared config, or convert the tunnel to remote management", tunnelID, source)
+		return fmt.Errorf("%w: cloudflare: tunnel %s is configured by a file on the origin machine (source %q), not over the API — a route written here would be stored and read back correctly and never served; manage its ingress in that cloudflared config, or convert the tunnel to remote management", spinup.ErrRefused, tunnelID, source)
 	}
 }
 
