@@ -62,10 +62,10 @@ package cloudflare
 // Cloudflare's documentation; where behaviour is inferred rather than observed
 // the comment says so. **PRSR-40 (2026-08-26) then ran this file's write verbs
 // against the live API** — the gated create, the full-replacement update on both
-// of its branches, the logo clear, and Teardown including its confirm-by-reading
-// path — driven through this exact code rather than through curl, on a
-// disposable hostname. So "what we believe the API accepts" is no longer the
-// right way to read the writes.
+// of its branches, the bookmark create and update, the logo clear, and Teardown
+// including its confirm-by-reading path — driven through this exact code rather
+// than through curl, on disposable hostnames. So "what we believe the API
+// accepts" is no longer the right way to read the writes.
 //
 // It is still the right way to read the *tests*, which is why the heading says
 // what it says: a green suite here proves this file agrees with a fake somebody
