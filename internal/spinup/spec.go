@@ -102,6 +102,35 @@ const (
 // something an operator should go and configure.
 var tunnelRefs = []TunnelRef{TunnelProd, TunnelDev}
 
+// LogoRef names where a service's launcher icon comes from.
+//
+// Three states, because the icon has three and a plain URL string only had two.
+// "The spec named nothing", "the spec asked for no icon" and "here is exactly
+// the URL" are different instructions, and collapsing the first two is what made
+// a forgotten flag destructive: PRSR-38's first live plan reported `update` on
+// argosy because the spec named no logo and the live tile carried one, so an
+// --apply would have stripped a working icon. Preview-by-default is the only
+// reason nothing was lost.
+type LogoRef string
+
+const (
+	// LogoPlacard resolves the icon from Placard by Key, and is what an
+	// unspecified logo means (see Normalized).
+	//
+	// Defaulting to *resolve* rather than to *clear* is the correction PRSR-37
+	// makes to that trap. It is also the only default that is right for this
+	// estate: PRSR-38 found seven of ten launcher tiles rendering grey initials
+	// and switchyard's stored URL answering a live 404, all of which Placard can
+	// already fix by name. When Placard has no mark for the slug — or cannot be
+	// asked at all — the icon is left exactly as it is, so the default is never
+	// the destructive answer.
+	LogoPlacard LogoRef = "placard"
+	// LogoNone means the service is to have no icon, deliberately, and clears
+	// whatever is there. It is the only value that removes one, which is what
+	// makes a deletion something an operator asked for by name.
+	LogoNone LogoRef = "none"
+)
+
 // knownTunnel reports whether ref is a name a spec may use.
 func knownTunnel(ref TunnelRef) bool {
 	for _, r := range tunnelRefs {
@@ -158,16 +187,23 @@ type ServiceSpec struct {
 	Upstream string
 	// Access is the Access surface to create.
 	Access AccessShape
-	// LogoURL is the launcher tile's icon.
+	// Logo names where the launcher tile's icon comes from: LogoPlacard,
+	// LogoNone, or an explicit https URL.
 	//
 	// Cloudflare stores whatever URL it is given and never validates it, and the
 	// launcher falls back to two grey initials when it fails to load — so a
 	// wrong URL is indistinguishable from an unset one, with no error anywhere.
-	// Of the six Access apps live before this axis was designed, one had a
-	// working icon (PRSR-29). Validated here only for shape; whether an app may
-	// be created without a *reachable* one is the Access connector's call, since
-	// it is the half that can fetch it.
-	LogoURL string
+	// Of the ten Access apps live when PRSR-38 audited them, three had a working
+	// icon. Validated here only for shape; whether an app may be created without
+	// a *reachable* one is the Access connector's call, since it is the half
+	// that can fetch it.
+	//
+	// A ref rather than a bare URL for the reason Tunnel is one: a spec should
+	// name a thing, not carry an opaque account-specific value somebody has to
+	// get right by hand. It also gives the field the three states the icon
+	// actually has — resolve it, remove it, or use exactly this — where a plain
+	// string had two and made the wrong one the default (see LogoPlacard).
+	Logo LogoRef
 	// Tunnel names which tunnel carries this hostname. Required for
 	// ModeTunnelled — it decides both the ingress document written to and the
 	// DNS record's target — and must be empty for ModeDirect, where nothing
@@ -216,7 +252,12 @@ func (s ServiceSpec) Normalized() ServiceSpec {
 		// A DNS record value, and DNS is case-insensitive.
 		s.Upstream = strings.ToLower(s.Upstream)
 	}
-	s.LogoURL = strings.TrimSpace(s.LogoURL)
+	// Trimmed like the other refs above, and defaulted here rather than at each
+	// surface so the CLI and the HTTP API cannot disagree about what an omitted
+	// logo means.
+	if s.Logo = LogoRef(strings.TrimSpace(string(s.Logo))); s.Logo == "" {
+		s.Logo = LogoPlacard
+	}
 	if s.DisplayName = strings.TrimSpace(s.DisplayName); s.DisplayName == "" {
 		s.DisplayName = s.Key
 	}
@@ -280,14 +321,23 @@ func (s ServiceSpec) Validate() (ServiceSpec, error) {
 	if err := validUpstream(s.Mode, s.Upstream); err != nil {
 		return s, err
 	}
-	if s.LogoURL != "" && !strings.HasPrefix(strings.ToLower(s.LogoURL), "https://") {
-		// https only, and case-insensitively checked, because the launcher
-		// renders this as an <img> inside its own https page: an http:// icon is
-		// blocked as mixed content and falls back to the grey initials this
-		// field exists to avoid — silently, since Cloudflare never validates the
-		// URL it was given (PRSR-29). A scheme-relative or relative path can't
-		// resolve from the viewer's browser at all.
-		return s, fmt.Errorf("spinup: logo url %q must be an absolute https:// url (the launcher loads it from the viewer's browser, and blocks http as mixed content)", s.LogoURL)
+	switch s.Logo {
+	case LogoPlacard, LogoNone:
+	default:
+		if !strings.HasPrefix(strings.ToLower(string(s.Logo)), "https://") {
+			// https only, and case-insensitively checked, because the launcher
+			// renders this as an <img> inside its own https page: an http:// icon
+			// is blocked as mixed content and falls back to the grey initials
+			// this field exists to avoid — silently, since Cloudflare never
+			// validates the URL it was given (PRSR-29). A scheme-relative or
+			// relative path can't resolve from the viewer's browser at all.
+			//
+			// The message names the two keywords as well as the URL rule,
+			// because the commonest way to land here is now a typo in one of
+			// them, and "must be an absolute https:// url" is unhelpful advice
+			// to somebody who typed --logo plackard.
+			return s, fmt.Errorf("spinup: unknown logo %q (want %s, %s, or an absolute https:// url — the launcher loads it from the viewer's browser, and blocks http as mixed content)", s.Logo, LogoPlacard, LogoNone)
+		}
 	}
 	return s, nil
 }

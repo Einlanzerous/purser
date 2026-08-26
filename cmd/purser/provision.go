@@ -10,7 +10,7 @@ import (
 	"github.com/Einlanzerous/purser/internal/spinup"
 )
 
-const provisionUsage = "usage: purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo URL] [--apply]"
+const provisionUsage = "usage: purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply]"
 
 // runProvisionService is `purser provision-service`: stand up the edge for a
 // service — its DNS record, its Cloudflare Access application, and (when it is
@@ -47,7 +47,7 @@ func runProvisionService(args []string) {
 		mode     = fs.String("mode", "", "how traffic reaches it: tunnelled or direct (required)")
 		upstream = fs.String("upstream", "", "tunnelled: the origin url cloudflared forwards to (http://argosy:8096); direct: the record's value, an ip or hostname (required)")
 		access   = fs.String("access", "", "Access surface: gated, bookmark or none (required)")
-		logo     = fs.String("logo", "", "https url for the launcher tile's icon")
+		logo     = fs.String("logo", "", "launcher icon: placard (default — resolve it by service key), none (clear it), or an https url")
 		tunnel   = fs.String("tunnel", "", "which tunnel carries it: prod (required for --mode tunnelled, refused for direct)")
 		apply    = fs.Bool("apply", false, "actually create and update; without it this is a plan")
 	)
@@ -58,6 +58,10 @@ func runProvisionService(args []string) {
 		fmt.Fprintln(os.Stderr, "and — for a tunnelled service — its ingress route. Idempotent per")
 		fmt.Fprintln(os.Stderr, "(hostname, kind): an edge that already matches the spec is adopted, not")
 		fmt.Fprintln(os.Stderr, "rebuilt. Plans by default; --apply to act.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "The launcher icon defaults to --logo placard, which resolves the mark")
+		fmt.Fprintln(os.Stderr, "by service key. An omitted --logo therefore leaves an existing icon")
+		fmt.Fprintln(os.Stderr, "alone; only --logo none removes one.")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
@@ -70,7 +74,7 @@ func runProvisionService(args []string) {
 		Mode:        spinup.Mode(*mode),
 		Upstream:    *upstream,
 		Access:      spinup.AccessShape(*access),
-		LogoURL:     *logo,
+		Logo:        spinup.LogoRef(*logo),
 		Tunnel:      spinup.TunnelRef(*tunnel),
 	}
 	// Validated before the database is touched. Everything the spec can be wrong

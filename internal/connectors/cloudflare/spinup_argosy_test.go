@@ -37,8 +37,12 @@ import (
 // tunnel. The Access application's name defaults to the service key.
 //
 // logo is a parameter rather than a constant because omitting it is not "no
-// opinion": resolveLogo treats an empty spec logo as an instruction to clear
-// whatever is there. See TestArgosy_ASpecWithNoLogoWouldClearTheLiveOne.
+// opinion" and it used not to be safe: resolveLogo read an empty spec logo as an
+// instruction to clear whatever was there, so a forgotten flag stripped a
+// working tile. Since PRSR-37 an omitted logo normalizes to spinup.LogoPlacard
+// and clears nothing — only spinup.LogoNone does. Both halves are exercised:
+// TestArgosy_AnOmittedLogoNoLongerClearsTheLiveOne and
+// TestArgosy_LogoNoneStillClearsTheLiveOne.
 func argosySpec(logo string) spinup.ServiceSpec {
 	return spinup.ServiceSpec{
 		Key:      "argosy",
@@ -46,7 +50,7 @@ func argosySpec(logo string) spinup.ServiceSpec {
 		Mode:     spinup.ModeDirect,
 		Upstream: "100.64.0.7",
 		Access:   spinup.AccessBookmark,
-		LogoURL:  logo,
+		Logo:     spinup.LogoRef(logo),
 	}
 }
 
@@ -80,7 +84,7 @@ func liveBookmark(logo string) map[string]any {
 // orchestrator, the store, and the two fakes a test asserts writes against.
 //
 // logoClient may be nil for a spec that names no logo, which never fetches one.
-func argosyEdge(t *testing.T, z *fakeZone, apps *accessAPI, logoClient *http.Client) (*spinup.Service, *memStore) {
+func argosyEdge(t *testing.T, z *fakeZone, apps *accessAPI, logoClient *http.Client, logos LogoResolver) (*spinup.Service, *memStore) {
 	t.Helper()
 	access := newAccessWithBase(t, apps.server(t).URL, AccessConfig{
 		APIToken:   "cf_token",
@@ -88,6 +92,7 @@ func argosyEdge(t *testing.T, z *fakeZone, apps *accessAPI, logoClient *http.Cli
 		GroupID:    "group123",
 		GroupName:  "zerogravity-members",
 		LogoClient: logoClient,
+		Logos:      logos,
 	})
 	// The tunnel provisioner is registered even though a direct spec never calls
 	// for it. That is the point: the step is reported as `skipped` rather than
@@ -122,7 +127,7 @@ func TestArgosy_AlreadyUpIsAdoptedWithoutTouchingTheEdge(t *testing.T) {
 	logo := logoServer(t, http.StatusOK, "image/png")
 	z := newZone(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "100.64.0.7", TTL: 1})
 	apps := &accessAPI{apps: []map[string]any{liveBookmark(logo.URL)}}
-	svc, st := argosyEdge(t, z, apps, logo.Client())
+	svc, st := argosyEdge(t, z, apps, logo.Client(), nil)
 	spec := argosySpec(logo.URL)
 
 	plan, err := svc.Ensure(ctx, spinup.Request{Spec: spec})
@@ -180,28 +185,66 @@ func TestArgosy_AlreadyUpIsAdoptedWithoutTouchingTheEdge(t *testing.T) {
 	}
 }
 
-// The bug PRSR-38's first live run found, pinned so it cannot come back.
+// PRSR-38's live finding, and PRSR-37's answer to it, in one test.
 //
-// A spec that names no logo is not silence about the icon. resolveLogo is
-// explicit that "the spec asks for no icon — clearing is intended, not a
-// fallback", and desiredApp writes logo_url as an empty string rather than
-// omitting the key, precisely so a rotted URL can be cleared. Against a live
-// application that carries a working logo, those two facts compose into an
-// --apply that strips it.
+// The first live plan reported `update` on argosy: the tile carried a working
+// logo, the ticket's spec named none, and an empty spec logo meant "clear it" —
+// so an --apply would have stripped it. Preview-by-default was the only reason
+// nothing was lost, and the fix was never to stop clearing but to stop an
+// *omission* from meaning it.
 //
-// That is correct behaviour for a spec that really means "no icon", so the
-// finding is not the clearing — it is that the plan must SAY so, and that the
-// suite must exercise it. The first live run reported `update` with the reason
-// in the detail, and preview-by-default is the only reason a working icon
-// survived the exercise. Both halves are asserted here.
-func TestArgosy_ASpecWithNoLogoWouldClearTheLiveOne(t *testing.T) {
+// So the same spec that reported `update` then reports `adopt` now. The spec
+// carries no logo, which normalizes to spinup.LogoPlacard; Placard has no mark
+// for the slug here, so nothing is resolved and the live icon is left alone. The
+// tile matches, and the apply writes back what was already there.
+func TestArgosy_AnOmittedLogoNoLongerClearsTheLiveOne(t *testing.T) {
 	ctx := context.Background()
 	logo := logoServer(t, http.StatusOK, "image/png")
 	z := newZone(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "100.64.0.7", TTL: 1})
 	apps := &accessAPI{apps: []map[string]any{liveBookmark(logo.URL)}}
-	svc, _ := argosyEdge(t, z, apps, logo.Client())
+	// Placard knows other services but not this one — the chronicle case, and
+	// the one that used to be indistinguishable from "remove the icon".
+	logos := &fakeLogos{marks: map[string]string{"lyceum": "https://cdn.example/lyceum.png"}}
+	svc, _ := argosyEdge(t, z, apps, logo.Client(), logos)
 
 	spec := argosySpec("") // the spec as PRSR-38 first wrote it
+
+	plan, err := svc.Ensure(ctx, spinup.Request{Spec: spec})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	f := findingFor(t, plan, model.ResourceAccessApp)
+	if f.Status != spinup.StepAdopt {
+		t.Fatalf("an omitted logo must not read as drift any more, want adopt, got %s (%s)", f.Status, f.Detail)
+	}
+	if strings.Contains(f.Detail, "spec sets none") {
+		t.Errorf("an unresolved icon must never be reported as a spec asking for none: %q", f.Detail)
+	}
+
+	if _, err := svc.Ensure(ctx, spinup.Request{Spec: spec, Apply: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// An adopt writes a row and makes no upstream call, so the tile is untouched
+	// — but if that ever changes, the icon must survive it.
+	if apps.lastMethod == "PUT" {
+		if got := apps.lastBody["logo_url"]; got != logo.URL {
+			t.Errorf("the live icon was not preserved: logo_url = %v, want %q", got, logo.URL)
+		}
+	}
+}
+
+// Clearing is still expressible, and it is still named in the plan before it
+// happens. That was always the correct half of PRSR-38's finding: the problem
+// was never that Purser can remove an icon, but that it could do so because
+// somebody forgot a flag. Now it takes a keyword.
+func TestArgosy_LogoNoneStillClearsTheLiveOne(t *testing.T) {
+	ctx := context.Background()
+	logo := logoServer(t, http.StatusOK, "image/png")
+	z := newZone(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "100.64.0.7", TTL: 1})
+	apps := &accessAPI{apps: []map[string]any{liveBookmark(logo.URL)}}
+	svc, _ := argosyEdge(t, z, apps, logo.Client(), nil)
+
+	spec := argosySpec(string(spinup.LogoNone))
 
 	plan, err := svc.Ensure(ctx, spinup.Request{Spec: spec})
 	if err != nil {
@@ -247,6 +290,43 @@ func TestArgosy_ASpecWithNoLogoWouldClearTheLiveOne(t *testing.T) {
 	}
 }
 
+// The repair this ticket exists for: a tile whose stored URL is the wrong asset,
+// repointed at Placard's mark by name.
+//
+// This is switchyard's case (a stored URL answering a live 404) and argosy's
+// (a stored URL that resolves, to the 3.6:1 wordmark rather than the tile mark).
+// Neither is fixable by a better fetch check — the second one passes every check
+// there is — which is the argument for resolving by slug in the first place.
+func TestArgosy_APlacardMarkRepointsAWrongLogo(t *testing.T) {
+	ctx := context.Background()
+	mark := logoServer(t, http.StatusOK, "image/png")
+	z := newZone(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "100.64.0.7", TTL: 1})
+	apps := &accessAPI{apps: []map[string]any{liveBookmark("https://cdn.jsdelivr.net/gh/Einlanzerous/argosy@main/assets/argosy_black_transparent.png")}}
+	logos := &fakeLogos{marks: map[string]string{"argosy": mark.URL}}
+	svc, _ := argosyEdge(t, z, apps, mark.Client(), logos)
+
+	spec := argosySpec("")
+
+	plan, err := svc.Ensure(ctx, spinup.Request{Spec: spec})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	f := findingFor(t, plan, model.ResourceAccessApp)
+	if f.Status != spinup.StepUpdate {
+		t.Fatalf("a tile pointed at the wrong asset is drift, want update, got %s (%s)", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, mark.URL) {
+		t.Errorf("the plan must name the url it would write; %q missing from %q", mark.URL, f.Detail)
+	}
+
+	if _, err := svc.Ensure(ctx, spinup.Request{Spec: spec, Apply: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := apps.lastBody["logo_url"]; got != mark.URL {
+		t.Errorf("logo_url = %v, want Placard's mark %q", got, mark.URL)
+	}
+}
+
 // Run it twice. Once the rows exist, the same spec is `ok` rather than `adopt` —
 // and `Pending` drops to zero, which is what makes "nothing to do" reportable
 // as distinct from "re-run with --apply".
@@ -255,7 +335,7 @@ func TestArgosy_SecondRunIsAllOKAndPendingIsZero(t *testing.T) {
 	logo := logoServer(t, http.StatusOK, "image/png")
 	z := newZone(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "100.64.0.7", TTL: 1})
 	apps := &accessAPI{apps: []map[string]any{liveBookmark(logo.URL)}}
-	svc, _ := argosyEdge(t, z, apps, logo.Client())
+	svc, _ := argosyEdge(t, z, apps, logo.Client(), nil)
 	spec := argosySpec(logo.URL)
 
 	if _, err := svc.Ensure(ctx, spinup.Request{Spec: spec, Apply: true}); err != nil {
@@ -291,7 +371,7 @@ func TestArgosy_ABrokenBookmarkDoesNotHoldBackDNS(t *testing.T) {
 	ctx := context.Background()
 	z := newZone()
 	apps := &accessAPI{listStatus: 500}
-	svc, _ := argosyEdge(t, z, apps, nil)
+	svc, _ := argosyEdge(t, z, apps, nil, nil)
 
 	plan, err := svc.Ensure(ctx, spinup.Request{Spec: argosySpec("")})
 	if err != nil {
@@ -314,7 +394,7 @@ func TestArgosy_AGatedServiceHoldsDNSWhenAccessIsUnreadable(t *testing.T) {
 	ctx := context.Background()
 	z := newZone()
 	apps := &accessAPI{listStatus: 500}
-	svc, _ := argosyEdge(t, z, apps, nil)
+	svc, _ := argosyEdge(t, z, apps, nil, nil)
 
 	spec := argosySpec("")
 	spec.Access = spinup.AccessGated

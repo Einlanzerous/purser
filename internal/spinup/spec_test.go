@@ -128,8 +128,8 @@ func TestValidate_Refusals(t *testing.T) {
 			// path cannot resolve for anyone.
 			name: "logo url must be absolute",
 			base: directSpec(),
-			spec: func(s ServiceSpec) ServiceSpec { s.LogoURL = "/assets/argosy.png"; return s },
-			want: "must be an absolute https:// url",
+			spec: func(s ServiceSpec) ServiceSpec { s.Logo = "/assets/argosy.png"; return s },
+			want: "absolute https:// url",
 		},
 		{
 			// Blocked as mixed content inside the launcher's https page, which
@@ -137,10 +137,18 @@ func TestValidate_Refusals(t *testing.T) {
 			name: "logo url must be https",
 			base: directSpec(),
 			spec: func(s ServiceSpec) ServiceSpec {
-				s.LogoURL = "http://placard.zerogravity.industries/argosy.png"
+				s.Logo = "http://placard.zerogravity.industries/argosy.png"
 				return s
 			},
-			want: "must be an absolute https:// url",
+			want: "absolute https:// url",
+		},
+		{
+			// The commonest way to land here is now a typo in a keyword rather
+			// than a bad URL, so the refusal has to name the keywords.
+			name: "a misspelled keyword names the keywords, not just the url rule",
+			base: directSpec(),
+			spec: func(s ServiceSpec) ServiceSpec { s.Logo = "plackard"; return s },
+			want: "want placard, none",
 		},
 	}
 	for _, tc := range tests {
@@ -430,5 +438,51 @@ func TestNormalized_TrimsBeforeAnythingReadsTheTrimmedFields(t *testing.T) {
 	}
 	if gotPadded.Upstream != "origin.example.com" {
 		t.Errorf("a direct upstream is a DNS record's value and folds to lower case, got %q", gotPadded.Upstream)
+	}
+}
+
+// An omitted logo means "resolve it", not "remove it".
+//
+// This is the correction PRSR-37 makes to the trap PRSR-38 found live. The spec
+// field used to be a bare URL, so an empty one was indistinguishable from a
+// deliberate "no icon" — and resolveLogo read it as the second, which meant a
+// forgotten --logo would strip a working tile on --apply. The default now
+// resolves from Placard, and the only value that removes an icon is one an
+// operator typed.
+//
+// Defaulted in Normalized rather than at each surface, so the CLI and the HTTP
+// API cannot disagree about what an omitted logo means — the same failure
+// Normalized already exists to prevent for Mode, Access and Tunnel, where one
+// surface trimmed and the other did not.
+func TestNormalizedDefaultsTheLogoToPlacardRatherThanToNothing(t *testing.T) {
+	for _, in := range []LogoRef{"", "   ", "\tplacard\n"} {
+		s := directSpec()
+		s.Logo = in
+		if got := s.Normalized().Logo; got != LogoPlacard {
+			t.Errorf("Normalized().Logo for %q = %q, want %q — an omitted logo must never mean 'clear it'", in, got, LogoPlacard)
+		}
+	}
+
+	// The one value that does clear, and it survives normalization intact.
+	s := directSpec()
+	s.Logo = " none "
+	if got := s.Normalized().Logo; got != LogoNone {
+		t.Errorf("Normalized().Logo = %q, want %q", got, LogoNone)
+	}
+}
+
+// Both keywords and an https URL are accepted; nothing else is.
+func TestValidateAcceptsTheLogoRefs(t *testing.T) {
+	for _, ref := range []LogoRef{
+		LogoPlacard,
+		LogoNone,
+		"https://cdn.jsdelivr.net/gh/Einlanzerous/placard@main/argosy/argosy-mark-light.png",
+		"HTTPS://EXAMPLE.COM/a.png", // scheme compared case-insensitively
+	} {
+		s := directSpec()
+		s.Logo = ref
+		if _, err := s.Validate(); err != nil {
+			t.Errorf("Validate() with logo %q: %v", ref, err)
+		}
 	}
 }

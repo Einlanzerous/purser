@@ -55,6 +55,16 @@
       - PURSER_ARGOSY_BASE_URL=http://argosy:8096
       - PURSER_ARGOSY_PROVISION_TOKEN=${ARGOSY_PROVISION_TOKEN:-}
       - PURSER_ARGOSY_URL=https://argosy.zerogravity.industries
+      # Placard (IDEA-22), where `provision-service` resolves a service's
+      # launcher icon from, so a spec names a service instead of carrying a
+      # hand-typed CDN path (PRSR-37). No token — /api/services is a public
+      # read. Listed rather than left to the compiled default for the reason
+      # every other in-estate base URL is listed: an operator who sets it in
+      # the env file must be able to see it take effect.
+      # Unreachable is never destructive — the Access step reports that the
+      # icon could not be resolved and leaves the tile alone. Only `--logo
+      # none` clears one.
+      - PURSER_PLACARD_URL=${PURSER_PLACARD_URL:-http://placard:4009}
       # Onboarding bundles (PRSR-12). Omitted => the built-in media/all sets.
       # Defining ANY PURSER_BUNDLE_* replaces the built-ins wholesale, so list
       # them all if you override. Bundles grant *:user on Switchyard projects by

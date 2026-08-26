@@ -3,6 +3,7 @@ package cloudflare
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -175,7 +176,7 @@ func gatedSpec(t *testing.T, logo string) spinup.ServiceSpec {
 		Tunnel:      spinup.TunnelProd,
 		Upstream:    "http://argosy:8096",
 		Access:      spinup.AccessGated,
-		LogoURL:     logo,
+		Logo:        spinup.LogoRef(logo),
 	}.Validate()
 	if err != nil {
 		t.Fatalf("spec: %v", err)
@@ -1159,5 +1160,349 @@ func TestEnsure_CreateSendsTheInlinePolicyWithNoID(t *testing.T) {
 	grp, _ := inc[0].(map[string]any)["group"].(map[string]any)
 	if grp == nil || grp["id"] != testGroup {
 		t.Errorf("the policy must admit the configured members group, got %v", inc[0])
+	}
+}
+
+// ─── the Placard resolver (PRSR-37) ─────────────────────────────────────────
+
+// fakeLogos answers all three of LogoResolver's outcomes without a server.
+//
+// Three, not two, is the whole point of the type: "Placard has no mark for this
+// slug" and "Placard could not be asked" are different facts, and the second one
+// treated as the first clears working icons across the estate every time the
+// registry blinks.
+type fakeLogos struct {
+	marks map[string]string // key → canonical url
+	err   error             // set to make every lookup unanswerable
+	calls int
+}
+
+func (f *fakeLogos) Mark(_ context.Context, key string) (string, bool, error) {
+	f.calls++
+	if f.err != nil {
+		return "", false, f.err
+	}
+	url, ok := f.marks[key]
+	return url, ok, nil
+}
+
+// A spec that names no logo resolves one from Placard, and the resolved URL is
+// still verified before it is written.
+//
+// Resolving is what makes the spec name a *service* rather than carry a CDN path
+// somebody typed — the failure PRSR-38 measured, where switchyard's stored URL
+// was a live 404 and argosy's resolved to the 3.6:1 wordmark instead of the tile
+// mark. But Placard's own file `check` is a periodic monitor with a `checked_at`
+// and can be stale, so it picks the URL and PRSR-29's write-time fetch is still
+// what decides.
+func TestEnsure_AnUnspecifiedLogoIsResolvedFromPlacard(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	logos := &fakeLogos{marks: map[string]string{"argosy": logo.URL}}
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client(), Logos: logos})
+
+	spec := gatedSpec(t, "")             // no --logo
+	if spec.Logo != spinup.LogoPlacard { // Normalized's default
+		t.Fatalf("an omitted logo should normalize to %q, got %q", spinup.LogoPlacard, spec.Logo)
+	}
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if logos.calls == 0 {
+		t.Error("Placard was never asked")
+	}
+	if got := api.lastBody["logo_url"]; got != logo.URL {
+		t.Errorf("logo_url = %v, want the resolved mark %q", got, logo.URL)
+	}
+}
+
+// The two answers that must never clear an icon.
+//
+// Neither is drift and neither is a failed step: a gated Access application is a
+// DNS prerequisite, so refusing one over an icon would leave a service
+// unpublished. Both report a note and leave the tile exactly as it is.
+func TestEnsure_AnUnresolvableLogoLeavesTheLiveOneAlone(t *testing.T) {
+	const live = "https://cdn.example/existing-mark.png"
+
+	cases := []struct {
+		name  string
+		logos LogoResolver
+		note  string
+	}{
+		{
+			// Placard answered and has nothing for this slug. Ordinary: its
+			// registry covers seven services, chronicle is not one of them, and
+			// a brand-new service is stood up before its mark is drawn.
+			name:  "Placard has no mark for the slug",
+			logos: &fakeLogos{marks: map[string]string{"somethingelse": "https://x/y.png"}},
+			note:  "no mark",
+		},
+		{
+			// Placard is down. Emphatically not evidence the icon is wrong.
+			name:  "Placard could not be asked",
+			logos: &fakeLogos{err: errors.New("connection refused")},
+			note:  "could not be asked",
+		},
+		{
+			// This deployment has no Placard at all.
+			name:  "no resolver is configured",
+			logos: nil,
+			note:  "PURSER_PLACARD_URL",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logo := logoServer(t, http.StatusOK, "image/png")
+			app := liveGatedApp(live)
+			api := &accessAPI{apps: []map[string]any{app}}
+			p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client(), Logos: tc.logos})
+
+			spec := gatedSpec(t, "")
+
+			// The plan says so, and says it as a note rather than as drift: an
+			// --apply will not touch the icon, and a plan that reported one
+			// would be promising a change that will not happen.
+			st, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+			if err != nil {
+				t.Fatalf("inspect: %v", err)
+			}
+			if !strings.Contains(st.Detail, tc.note) {
+				t.Errorf("the plan should explain why no icon was resolved; %q missing from %q", tc.note, st.Detail)
+			}
+			if strings.Contains(st.Detail, "spec sets none") {
+				t.Errorf("an unresolvable logo must not be reported as a spec that asked for none: %q", st.Detail)
+			}
+
+			if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+				t.Fatalf("ensure: %v", err)
+			}
+			if got := api.lastBody["logo_url"]; got != live {
+				t.Errorf("logo_url = %v, want the live icon kept (%q) — an unreachable registry is not evidence the icon is wrong", got, live)
+			}
+		})
+	}
+}
+
+// An explicit URL still wins, and Placard is not consulted at all.
+//
+// The escape hatch matters: a service whose mark Placard has not been given yet
+// can still be pointed at one by hand, and a spec that names a URL is naming it
+// on purpose.
+func TestEnsure_AnExplicitLogoURLBypassesPlacard(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	logos := &fakeLogos{marks: map[string]string{"argosy": "https://cdn.example/placard-would-say-this.png"}}
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client(), Logos: logos})
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if logos.calls != 0 {
+		t.Errorf("a spec naming a url must not consult Placard, got %d calls", logos.calls)
+	}
+	if got := api.lastBody["logo_url"]; got != logo.URL {
+		t.Errorf("logo_url = %v, want the url the spec named", got)
+	}
+}
+
+// An application that has no icon yet must not be told, for ever, that one is
+// about to be set on it.
+//
+// The smaller sibling of TestEnsure_ABrokenSpecLogoDoesNotClearTheWorkingLiveOne,
+// and the case an earlier fix's `live != ""` guard skipped. That guard reads like
+// it is short-circuiting the create path; it is not, because logoDiff runs only
+// when the application exists — so an empty live logo is an *existing*
+// application with no icon, which was seven of the ten PRSR-38 audited.
+//
+// Nothing is destroyed here. What happens is that the plan names a URL it never
+// checked and says it will set it, the apply fetches it, finds it dead and writes
+// nothing, and the next run says exactly the same thing — with every --apply
+// doing a full-replacement PUT of a gated application for a change that will not
+// happen. It does not converge.
+func TestInspect_ABrokenCandidateOnAnIconlessAppIsNotReportedAsDrift(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer dead.Close()
+
+	api := &accessAPI{apps: []map[string]any{liveGatedApp("")}} // exists, no icon
+	logos := &fakeLogos{marks: map[string]string{"argosy": dead.URL + "/mark.png"}}
+	p := newAccessProv(t, api, AccessConfig{
+		GroupID: testGroup, LogoClient: dead.Client(), Logos: logos,
+	})
+	spec := gatedSpec(t, "")
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if strings.Contains(st.Detail, "spec wants") {
+		t.Errorf("the plan promised an icon the apply will not write: %q", st.Detail)
+	}
+	if !st.Matches {
+		t.Errorf("an icon that cannot be written is not drift --apply would fix: %q", st.Detail)
+	}
+	if !strings.Contains(st.Detail, "shows the service's initials") {
+		t.Errorf("the plan should say why no icon is written: %q", st.Detail)
+	}
+
+	// And the apply agrees: nothing to write, so nothing changes.
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if got := api.lastBody["logo_url"]; got != "" {
+		t.Errorf("logo_url = %v, want the empty string the plan implied", got)
+	}
+}
+
+// A rotted icon is still reported when nothing was resolved to replace it.
+//
+// The keep note says the launcher shows the service's initials. If a dead URL is
+// configured that sentence is wrong and the dead URL is invisible — which is the
+// condition switchyard's tile sat in for months, and exactly what this whole area
+// exists to surface. chronicle is the live case: a gated application Placard has
+// never heard of, so every run takes this branch.
+//
+// A note rather than drift, because nothing will be written either way. It
+// restores the detector without promising an action.
+func TestInspect_AnUnresolvedLogoStillReportsARottedLiveOne(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer dead.Close()
+
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(dead.URL)}}
+	logos := &fakeLogos{} // Placard has nothing for this slug
+	p := newAccessProv(t, api, AccessConfig{
+		GroupID: testGroup, LogoClient: dead.Client(), Logos: logos,
+	})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, "")})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !strings.Contains(st.Detail, "not a servable image") {
+		t.Errorf("a dead live logo must still be reported when nothing replaced it: %q", st.Detail)
+	}
+	// Still not drift: --apply will not touch it, and a plan that said otherwise
+	// would promise a change that never comes.
+	if !st.Matches {
+		t.Errorf("nothing will be written, so this is a note rather than drift: %q", st.Detail)
+	}
+}
+
+// A spec naming an icon that does not serve must not clear the working one that
+// is already there, and the plan must not promise that it will set it.
+//
+// The destructive shape, before the fix: live tile carries a working icon A, the
+// spec resolves to B, B 404s. logoDiff reported `logo is A, spec wants B` without
+// ever fetching B — so the plan said `update` naming B — and resolveLogo's
+// logoBroken case discarded `current` and returned "", which desiredApp writes as
+// an empty logo_url and PRSR-40 confirmed live really does remove the icon. Net:
+// the tile ended with no icon and the plan had promised the opposite.
+//
+// logoUnknown two cases below was already making the opposite choice on the same
+// question, which is the tell: "we could not check it" and "we checked and it is
+// dead" want the same answer whenever there is something to lose.
+//
+// Reachable rather than theoretical: Placard reports a file `in_repo` from the
+// repo's own contents, and jsDelivr serving a 404 for it — propagation lag after
+// a rename is the obvious way — is a definite non-image answer, not a transport
+// failure, so it lands on logoBroken and not logoUnknown.
+func TestEnsure_ABrokenSpecLogoDoesNotClearTheWorkingLiveOne(t *testing.T) {
+	const live = "https://cdn.example/working-mark.png"
+
+	// Serves the live icon, 404s the one the spec asks for.
+	const broken = "/broken-mark.png"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == broken {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	app := liveGatedApp(live)
+	api := &accessAPI{apps: []map[string]any{app}}
+	logos := &fakeLogos{marks: map[string]string{"argosy": srv.URL + broken}}
+	p := newAccessProv(t, api, AccessConfig{
+		GroupID: testGroup, LogoClient: srv.Client(), Logos: logos,
+	})
+	spec := gatedSpec(t, "") // resolves via Placard to the broken mark
+
+	// The plan must not promise to set an icon that cannot be set.
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if strings.Contains(st.Detail, "spec wants") {
+		t.Errorf("the plan promised an icon the apply will not set: %q", st.Detail)
+	}
+	if !strings.Contains(st.Detail, "is kept") {
+		t.Errorf("the plan should say the existing icon is kept: %q", st.Detail)
+	}
+
+	// And the apply must not clear the working one.
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if got := api.lastBody["logo_url"]; got != live {
+		t.Errorf("logo_url = %v, want the working icon %q kept — a spec asking for a different icon did not ask for this one to be removed", got, live)
+	}
+}
+
+// When the live icon *is* the rotted URL the spec asks for, the apply clears it,
+// so the drift the plan reports can actually be cleared.
+//
+// The keep added for "a spec named a different icon and it does not serve" was
+// over-broad by exactly one condition. Where `current == want`, `current` is not
+// a working tile to protect — it is the URL checkLogo just proved dead — and
+// writing it back makes the drift permanent: the plan reports "set correctly but
+// not a servable image" for ever, NeedsAttention never clears, and every --apply
+// is a full-replacement PUT of a gated application for a change that cannot
+// happen.
+//
+// This is the state argosy and switchyard were both actually in, which is why it
+// is the case the load check exists for: a hand-written URL that rotted after it
+// was written. TestInspect_LogoUrlMatchesButDoesNotLoad pins the plan half; this
+// is its missing Ensure counterpart.
+func TestEnsure_ARottedLogoTheSpecStillAsksForIsCleared(t *testing.T) {
+	dead := logoServer(t, http.StatusNotFound, "")
+	rotted := dead.URL + "/sy_mark.svg"
+
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(rotted)}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: dead.Client()})
+	spec := gatedSpec(t, rotted) // the spec names the very url that rotted
+
+	// The plan reports it, and reports it as drift rather than a note: unlike an
+	// unresolvable candidate, this one --apply really will act on.
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if st.Matches {
+		t.Fatalf("a dead logo the spec asks for is drift the apply can fix: %q", st.Detail)
+	}
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if got := api.lastBody["logo_url"]; got != "" {
+		t.Fatalf("logo_url = %v, want it cleared — writing the dead url back makes the drift permanent", got)
+	}
+
+	// And now it converges: with the icon cleared, the next plan reports a note
+	// rather than drift, so NeedsAttention stops firing on a change that cannot
+	// happen.
+	api.apps = []map[string]any{liveGatedApp("")}
+	again, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+	if err != nil {
+		t.Fatalf("re-inspect: %v", err)
+	}
+	if !again.Matches {
+		t.Errorf("the second plan should have nothing left to act on, got %q", again.Detail)
 	}
 }
