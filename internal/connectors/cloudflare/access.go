@@ -606,12 +606,26 @@ func (p *AccessProvisioner) logoDiff(ctx context.Context, live string, spec spin
 		// saying "logo is A, spec wants B" would be followed by an apply that
 		// changed nothing, or, before the fix above, by one that cleared A.
 		//
-		// A preview is the first half of an apply, not a guess at it. Both now
-		// read the same fetch.
-		if live != "" {
-			if verdict, err := p.checkLogo(ctx, want); verdict == logoBroken {
+		// A preview is the first half of an apply, not a guess at it. Both read
+		// the same fetch, unconditionally — an earlier version guarded this on
+		// `live != ""`, on the reasoning that the fetch only matters when there
+		// is an icon to lose. That reads like the create path and is not: this
+		// function runs only when the application exists, so `live == ""` is an
+		// existing application that has no icon yet, which was **seven of the
+		// ten** PRSR-38 audited.
+		//
+		// Skipping it there does not destroy anything, which is why it is the
+		// smaller sibling of the bug above rather than a repeat of it. What it
+		// does is fail to converge: the plan names a URL it never checked and
+		// says it will set it, the apply fetches it, finds it dead and writes
+		// nothing, and the next run says exactly the same — with each --apply
+		// performing a full-replacement PUT of a gated application for a change
+		// that will not happen.
+		if verdict, err := p.checkLogo(ctx, want); verdict == logoBroken {
+			if live != "" {
 				return nil, []string{fmt.Sprintf("the icon this spec asks for (%s) is not a servable image (%v), so the one already set is kept", want, err)}
 			}
+			return nil, []string{fmt.Sprintf("the icon this spec asks for (%s) is not a servable image (%v), so none is written — the launcher shows the service's initials", want, err)}
 		}
 		return []string{fmt.Sprintf("logo is %q, spec wants %q", live, want)}, nil
 	}

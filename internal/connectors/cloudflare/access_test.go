@@ -1306,6 +1306,56 @@ func TestEnsure_AnExplicitLogoURLBypassesPlacard(t *testing.T) {
 	}
 }
 
+// An application that has no icon yet must not be told, for ever, that one is
+// about to be set on it.
+//
+// The smaller sibling of TestEnsure_ABrokenSpecLogoDoesNotClearTheWorkingLiveOne,
+// and the case an earlier fix's `live != ""` guard skipped. That guard reads like
+// it is short-circuiting the create path; it is not, because logoDiff runs only
+// when the application exists — so an empty live logo is an *existing*
+// application with no icon, which was seven of the ten PRSR-38 audited.
+//
+// Nothing is destroyed here. What happens is that the plan names a URL it never
+// checked and says it will set it, the apply fetches it, finds it dead and writes
+// nothing, and the next run says exactly the same thing — with every --apply
+// doing a full-replacement PUT of a gated application for a change that will not
+// happen. It does not converge.
+func TestInspect_ABrokenCandidateOnAnIconlessAppIsNotReportedAsDrift(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer dead.Close()
+
+	api := &accessAPI{apps: []map[string]any{liveGatedApp("")}} // exists, no icon
+	logos := &fakeLogos{marks: map[string]string{"argosy": dead.URL + "/mark.png"}}
+	p := newAccessProv(t, api, AccessConfig{
+		GroupID: testGroup, LogoClient: dead.Client(), Logos: logos,
+	})
+	spec := gatedSpec(t, "")
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if strings.Contains(st.Detail, "spec wants") {
+		t.Errorf("the plan promised an icon the apply will not write: %q", st.Detail)
+	}
+	if !st.Matches {
+		t.Errorf("an icon that cannot be written is not drift --apply would fix: %q", st.Detail)
+	}
+	if !strings.Contains(st.Detail, "shows the service's initials") {
+		t.Errorf("the plan should say why no icon is written: %q", st.Detail)
+	}
+
+	// And the apply agrees: nothing to write, so nothing changes.
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if got := api.lastBody["logo_url"]; got != "" {
+		t.Errorf("logo_url = %v, want the empty string the plan implied", got)
+	}
+}
+
 // A rotted icon is still reported when nothing was resolved to replace it.
 //
 // The keep note says the launcher shows the service's initials. If a dead URL is

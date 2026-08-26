@@ -577,10 +577,16 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   for a different icon did not ask for this one to be removed, and losing a
   working tile is strictly worse than not gaining the new one. Only
   `spinup.LogoNone` clears, which is the same rule the ref itself encodes.
-  **The plan fetches the candidate too**, in `logoDiff`'s `live != want` branch.
-  Without it the preview reports drift on a URL it never checked, so plan and
-  apply disagree by construction — a preview is the first half of an apply, not a
-  guess at it, and both now read the same fetch. Reachable rather than
+  **The plan fetches the candidate too**, in `logoDiff`'s `live != want` branch,
+  and **unconditionally**. Without it the preview reports drift on a URL it never
+  checked, so plan and apply disagree by construction — a preview is the first
+  half of an apply, not a guess at it. Guarding the fetch on `live != ""` looks
+  like an optimisation for the create path and is not one: `logoDiff` runs only
+  when the application exists, so an empty `live` is an existing application with
+  no icon yet — seven of the ten PRSR-38 audited. That case destroys nothing but
+  never converges, printing `update` for a URL the apply then declines to write,
+  for ever, with each `--apply` doing a full-replacement PUT for a change that
+  will not happen. Reachable rather than
   theoretical: Placard reports a file `in_repo` from the repo's contents, and
   jsDelivr 404ing it (propagation lag after a rename) is a definite non-image
   answer, so it lands on `logoBroken` and not `logoUnknown`. Pinned by
