@@ -599,6 +599,20 @@ func (p *AccessProvisioner) logoDiff(ctx context.Context, live string, spec spin
 	case want == "" && live != "":
 		return []string{fmt.Sprintf("has a logo (%s), spec sets none", live)}, nil
 	case live != want:
+		// Check the candidate before calling this drift. Reporting `update`
+		// here without fetching `want` is how the plan came to promise the
+		// opposite of what the apply does: resolveLogo fetches it, and on a
+		// definite non-image it keeps whatever is already there — so a plan
+		// saying "logo is A, spec wants B" would be followed by an apply that
+		// changed nothing, or, before the fix above, by one that cleared A.
+		//
+		// A preview is the first half of an apply, not a guess at it. Both now
+		// read the same fetch.
+		if live != "" {
+			if verdict, err := p.checkLogo(ctx, want); verdict == logoBroken {
+				return nil, []string{fmt.Sprintf("the icon this spec asks for (%s) is not a servable image (%v), so the one already set is kept", want, err)}
+			}
+		}
 		return []string{fmt.Sprintf("logo is %q, spec wants %q", live, want)}, nil
 	}
 	// Same URL on both sides — but is it serving?
@@ -868,6 +882,22 @@ func (p *AccessProvisioner) resolveLogo(ctx context.Context, spec spinup.Service
 	case logoOK:
 		return want, ""
 	case logoBroken:
+		if current != "" {
+			// The spec named an icon that does not serve, and something that
+			// does is already on the tile. Keeping it is not a fallback, it is
+			// the only non-destructive answer: writing "" here clears a working
+			// icon, which PRSR-40 confirmed live really does remove it, and the
+			// plan that authorised this run said "set this url" rather than
+			// "remove the one you have". Losing a working tile is a strictly
+			// worse outcome than not gaining the new one.
+			//
+			// This used to fall through to the empty string with logoUnknown two
+			// cases below already making the opposite choice on the same
+			// question, which is the tell: "we could not check it" and "we
+			// checked and it is dead" want the same answer whenever there is
+			// something to lose.
+			return current, fmt.Sprintf("logo left as it was: %s is not a servable image (%v), and clearing a working icon is not what a spec asking for a different one meant", want, err)
+		}
 		return "", fmt.Sprintf("logo omitted: %s is not a servable image (%v) — the launcher shows the service's initials either way, and writing a dead url would claim an icon that isn't there", want, err)
 	default: // logoUnknown
 		if current != "" {

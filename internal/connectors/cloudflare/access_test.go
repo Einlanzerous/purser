@@ -1341,3 +1341,65 @@ func TestInspect_AnUnresolvedLogoStillReportsARottedLiveOne(t *testing.T) {
 		t.Errorf("nothing will be written, so this is a note rather than drift: %q", st.Detail)
 	}
 }
+
+// A spec naming an icon that does not serve must not clear the working one that
+// is already there, and the plan must not promise that it will set it.
+//
+// The destructive shape, before the fix: live tile carries a working icon A, the
+// spec resolves to B, B 404s. logoDiff reported `logo is A, spec wants B` without
+// ever fetching B — so the plan said `update` naming B — and resolveLogo's
+// logoBroken case discarded `current` and returned "", which desiredApp writes as
+// an empty logo_url and PRSR-40 confirmed live really does remove the icon. Net:
+// the tile ended with no icon and the plan had promised the opposite.
+//
+// logoUnknown two cases below was already making the opposite choice on the same
+// question, which is the tell: "we could not check it" and "we checked and it is
+// dead" want the same answer whenever there is something to lose.
+//
+// Reachable rather than theoretical: Placard reports a file `in_repo` from the
+// repo's own contents, and jsDelivr serving a 404 for it — propagation lag after
+// a rename is the obvious way — is a definite non-image answer, not a transport
+// failure, so it lands on logoBroken and not logoUnknown.
+func TestEnsure_ABrokenSpecLogoDoesNotClearTheWorkingLiveOne(t *testing.T) {
+	const live = "https://cdn.example/working-mark.png"
+
+	// Serves the live icon, 404s the one the spec asks for.
+	const broken = "/broken-mark.png"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == broken {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	app := liveGatedApp(live)
+	api := &accessAPI{apps: []map[string]any{app}}
+	logos := &fakeLogos{marks: map[string]string{"argosy": srv.URL + broken}}
+	p := newAccessProv(t, api, AccessConfig{
+		GroupID: testGroup, LogoClient: srv.Client(), Logos: logos,
+	})
+	spec := gatedSpec(t, "") // resolves via Placard to the broken mark
+
+	// The plan must not promise to set an icon that cannot be set.
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: spec})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if strings.Contains(st.Detail, "spec wants") {
+		t.Errorf("the plan promised an icon the apply will not set: %q", st.Detail)
+	}
+	if !strings.Contains(st.Detail, "is kept") {
+		t.Errorf("the plan should say the existing icon is kept: %q", st.Detail)
+	}
+
+	// And the apply must not clear the working one.
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: spec}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if got := api.lastBody["logo_url"]; got != live {
+		t.Errorf("logo_url = %v, want the working icon %q kept — a spec asking for a different icon did not ask for this one to be removed", got, live)
+	}
+}

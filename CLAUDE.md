@@ -540,8 +540,8 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   unset one — one of six live apps had a working icon before this axis.
   `checkLogo` fetches it **as the sessionless public** (an Access-gated asset
   answers `200 text/html`, which a status-only check would pass) and returns
-  `logoOK`, `logoBroken` — a definite non-image answer, so write nothing — or
-  `logoUnknown` — a transport failure or 5xx, so **change nothing**. Collapsing
+  `logoOK`, `logoBroken` — a definite non-image answer — or `logoUnknown` — a
+  transport failure or 5xx, so **change nothing**. Collapsing
   unknown into broken clears a working icon every time a CDN blinks, and on
   `Inspect` it is a note rather than drift, because an update here is that
   full-replacement PUT. Never fatal either way: a gated app is a DNS
@@ -568,6 +568,23 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   Pinned by `TestArgosy_AnOmittedLogoNoLongerClearsTheLiveOne`,
   `TestArgosy_LogoNoneStillClearsTheLiveOne` and
   `TestEnsure_AnUnresolvableLogoLeavesTheLiveOneAlone`.
+- **`logoBroken` and `logoUnknown` differ about what to *write*, and not about
+  what to keep.** Both leave an existing icon alone; only the note differs. The
+  broken case used to discard `current` and return `""`, which `desiredApp`
+  writes as an empty `logo_url` and PRSR-40 confirmed live really does remove the
+  icon — so a spec naming a mark that 404s **cleared the working one already on
+  the tile**, and the plan had said `update`, naming the new URL. A spec asking
+  for a different icon did not ask for this one to be removed, and losing a
+  working tile is strictly worse than not gaining the new one. Only
+  `spinup.LogoNone` clears, which is the same rule the ref itself encodes.
+  **The plan fetches the candidate too**, in `logoDiff`'s `live != want` branch.
+  Without it the preview reports drift on a URL it never checked, so plan and
+  apply disagree by construction — a preview is the first half of an apply, not a
+  guess at it, and both now read the same fetch. Reachable rather than
+  theoretical: Placard reports a file `in_repo` from the repo's contents, and
+  jsDelivr 404ing it (propagation lag after a rename) is a definite non-image
+  answer, so it lands on `logoBroken` and not `logoUnknown`. Pinned by
+  `TestEnsure_ABrokenSpecLogoDoesNotClearTheWorkingLiveOne`.
 - **Placard picks the URL; the write-time fetch decides** (PRSR-37).
   `internal/placard` resolves a mark by service key, behind a one-method
   `cloudflare.LogoResolver` so the Access provisioner does not import a second
