@@ -270,41 +270,58 @@ func TestInspect_NoApplication(t *testing.T) {
 }
 
 // liveGatedApp is a gated application in the shape the live API actually
-// returns — read off the estate on 2026-08-26 (PRSR-38), reduced only in its
-// ids so the existing assertions still address "app-1".
+// returns — read off the estate on 2026-08-26 (PRSR-38, extended by PRSR-40),
+// reduced only in its ids so the existing assertions still address "app-1".
 //
-// Eight of its keys are modelled nowhere in this package: self_hosted_domains,
-// allowed_idps, tags, auto_redirect_to_identity, session_duration,
-// enable_binding_cookie, http_only_cookie_attribute, options_preflight_bypass.
-// An update is a full-replacement PUT, so each one is a setting a struct
-// round-trip would silently delete. session_duration is the legible example —
-// dropping it does not error, it resets how long a person stays signed in.
+// Ten of its keys are modelled nowhere in this package: self_hosted_domains,
+// destinations, allowed_idps, tags, auto_redirect_to_identity,
+// session_duration, enable_binding_cookie, http_only_cookie_attribute,
+// options_preflight_bypass, eager_redirect_cookie_setting. An update is a
+// full-replacement PUT, so each one is a setting a struct round-trip would
+// silently delete. session_duration is the legible example — dropping it does
+// not error, it resets how long a person stays signed in.
+//
+// destinations and eager_redirect_cookie_setting were the two this fixture
+// missed until PRSR-40 went looking, and every self_hosted application on the
+// estate carries both. destinations is the one with teeth: it is the modern
+// spelling of what the application sits in front of, so a body that keeps
+// `domain` and drops it is not obviously wrong to read and is a gate pointed at
+// nothing. Purser never edits a live application's hostname — findApp matches on
+// it, so a changed hostname is a create — but the fixture should model what
+// upstream sends rather than what this package happens to touch. That is the
+// whole PRSR-38 lesson, and it recurred here in the same shape.
 //
 // The policy is the estate's real one: reusable, shared across six
 // applications, admitting the members group *and* an email domain. The bare
 // decision/include pair that stood here before could not show that appending to
-// this list means handing Cloudflare back somebody else's shared policy, which
-// is the open question on PRSR-40.
+// this list means handing Cloudflare back somebody else's shared policy — which
+// PRSR-40 then measured: a reusable policy in an application write is read as a
+// *reference*, id only, and its body is ignored. See
+// TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten.
 func liveGatedApp(logo string) map[string]any {
 	return map[string]any{
-		"id":                         "app-1",
-		"uid":                        "app-1",
-		"aud":                        "d3404fc362067f48ff1fd6c9a7fc9a1fd723510c2681feed15e35159649963de",
-		"type":                       "self_hosted",
-		"name":                       "Argosy",
-		"created_at":                 "2026-07-05T23:55:28Z",
-		"updated_at":                 "2026-07-20T04:32:19Z",
-		"domain":                     testHost,
-		"self_hosted_domains":        []any{testHost},
-		"app_launcher_visible":       true,
-		"logo_url":                   logo,
-		"allowed_idps":               []any{},
-		"tags":                       []any{},
-		"auto_redirect_to_identity":  false,
-		"session_duration":           "730h",
-		"enable_binding_cookie":      false,
-		"http_only_cookie_attribute": false,
-		"options_preflight_bypass":   false,
+		"id":                  "app-1",
+		"uid":                 "app-1",
+		"aud":                 "d3404fc362067f48ff1fd6c9a7fc9a1fd723510c2681feed15e35159649963de",
+		"type":                "self_hosted",
+		"name":                "Argosy",
+		"created_at":          "2026-07-05T23:55:28Z",
+		"updated_at":          "2026-07-20T04:32:19Z",
+		"domain":              testHost,
+		"self_hosted_domains": []any{testHost},
+		"destinations": []any{
+			map[string]any{"type": "public", "uri": testHost},
+		},
+		"app_launcher_visible":          true,
+		"logo_url":                      logo,
+		"allowed_idps":                  []any{},
+		"tags":                          []any{},
+		"auto_redirect_to_identity":     false,
+		"session_duration":              "730h",
+		"enable_binding_cookie":         false,
+		"http_only_cookie_attribute":    false,
+		"options_preflight_bypass":      false,
+		"eager_redirect_cookie_setting": true,
 		"policies": []any{map[string]any{
 			"id":         "e9054499-3680-40e3-a03b-96e8eff3f3e5",
 			"uid":        "e9054499-3680-40e3-a03b-96e8eff3f3e5",
@@ -876,17 +893,18 @@ func TestEnsure_GatedUpdateCarriesTheObservedKeySetThrough(t *testing.T) {
 	// Every key observed on the live application that this package models
 	// nowhere. Each is a real setting; the PUT replaces the whole object.
 	for k, want := range map[string]any{
-		"session_duration":           "730h",
-		"auto_redirect_to_identity":  false,
-		"enable_binding_cookie":      false,
-		"http_only_cookie_attribute": false,
-		"options_preflight_bypass":   false,
+		"session_duration":              "730h",
+		"auto_redirect_to_identity":     false,
+		"enable_binding_cookie":         false,
+		"http_only_cookie_attribute":    false,
+		"options_preflight_bypass":      false,
+		"eager_redirect_cookie_setting": true,
 	} {
 		if got, ok := api.lastBody[k]; !ok || got != want {
 			t.Errorf("%q was dropped or altered by the PUT: got %v (present=%v), want %v", k, got, ok, want)
 		}
 	}
-	for _, k := range []string{"self_hosted_domains", "allowed_idps", "tags"} {
+	for _, k := range []string{"self_hosted_domains", "destinations", "allowed_idps", "tags"} {
 		if _, ok := api.lastBody[k]; !ok {
 			t.Errorf("%q was dropped by the full-replacement PUT — rawApp exists so unmodelled keys survive", k)
 		}
@@ -900,8 +918,9 @@ func TestEnsure_GatedUpdateCarriesTheObservedKeySetThrough(t *testing.T) {
 	// The gate itself. The estate's policy is reusable and shared across six
 	// applications, so it must go back exactly as it came: this app already
 	// admits the members group, so nothing is appended, and nothing about
-	// somebody else's shared policy is rewritten. PRSR-40 carries the question
-	// of whether Cloudflare even accepts a reusable policy echoed back inline.
+	// somebody else's shared policy is rewritten. PRSR-40 settled what Cloudflare
+	// does with it — the body is ignored and only the id is read — which is why
+	// the id assertion below is the load-bearing one.
 	pols, ok := api.lastBody["policies"].([]any)
 	if !ok || len(pols) != 1 {
 		t.Fatalf("the app already admits the members group, so its policy list must be unchanged, got %v", api.lastBody["policies"])
@@ -918,5 +937,156 @@ func TestEnsure_GatedUpdateCarriesTheObservedKeySetThrough(t *testing.T) {
 	}
 	if got := api.lastBody["logo_url"]; got != logo.URL {
 		t.Errorf("the drift this update exists to fix was not written: logo_url = %v", got)
+	}
+}
+
+// A carried-through policy keeps its id, because on a reusable policy the id is
+// the only field Cloudflare reads.
+//
+// PRSR-40 measured this against the live API on 2026-08-26, on a disposable
+// application and a disposable reusable policy shared by two disposable apps.
+// An application write carrying a `reusable: true` policy inline was accepted,
+// and every field of that policy other than `id` was **ignored**: the probe sent
+// `name: "MUTATED BY PROBE"` and `decision: "deny"`, Cloudflare answered 200 and
+// echoed back the policy's real name and `decision: "allow"`, the standalone
+// policy's updated_at did not move, and the second application sharing it was
+// untouched. A reusable policy in an application body is a reference.
+//
+// That retires the outcome PRSR-40 was filed to rule out — one service's logo
+// fix silently editing the gate on the six applications sharing the estate's
+// `Standard` policy. It cannot happen, and the reason it cannot is the id.
+//
+// So the id is what this pins. Strip it — by adding "id" to serverOwned, say,
+// which is exactly the kind of tidying that looks right at the callsite — and
+// the policy stops being a reference and becomes an inline definition
+// Cloudflare has never seen. It would create a *second* policy rather than
+// reusing the shared one, and the application would end up gated by a private
+// copy that no longer tracks the group everyone else's does. Nothing would
+// error, and the plan would say "fix a logo".
+//
+// The non-reusable half of the same measurement is why this is not merely
+// defensive: an app-scoped (`reusable: false`) policy's body **is** honoured on
+// an application write. The probe flipped one to `decision: "deny"` and the
+// read-back confirmed it. Purser only ever echoes back what it read moments
+// earlier — Ensure takes its own fresh read immediately before desiredApp — so
+// that is safe, but it does mean a gated update is a real write of the policy
+// content and not a no-op.
+func TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten(t *testing.T) {
+	// A reusable policy that does NOT admit the members group, so the append
+	// branch is the one under test. Every application on the estate today
+	// already admits the group, which is why this shape has to be built rather
+	// than read: it is the state a *new* gated service arrives in.
+	foreign := map[string]any{
+		"id":         "033c9a30-8011-4362-b9f4-50adcdbc7206",
+		"uid":        "033c9a30-8011-4362-b9f4-50adcdbc7206",
+		"name":       "Standard",
+		"decision":   "allow",
+		"precedence": float64(1),
+		"reusable":   true,
+		"include": []any{
+			map[string]any{"email_domain": map[string]any{"domain": "dodson.mozmail.com"}},
+		},
+	}
+
+	cases := []struct {
+		name     string
+		policies []any
+		wantLen  int
+	}{
+		{
+			// Already gated: the list goes back untouched, ids and all.
+			name:     "carried through",
+			policies: liveGatedApp("")["policies"].([]any),
+			wantLen:  1,
+		},
+		{
+			// Not gated yet: membersPolicy is appended and the existing policy
+			// must survive alongside it, still carrying its id.
+			name:     "appended alongside",
+			policies: []any{foreign},
+			wantLen:  2,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logo := logoServer(t, http.StatusOK, "image/png")
+			app := liveGatedApp("")
+			app["policies"] = tc.policies
+			api := &accessAPI{apps: []map[string]any{app}}
+			p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+			if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)}); err != nil {
+				t.Fatalf("ensure: %v", err)
+			}
+
+			pols, ok := api.lastBody["policies"].([]any)
+			if !ok || len(pols) != tc.wantLen {
+				t.Fatalf("policies = %v, want %d of them", api.lastBody["policies"], tc.wantLen)
+			}
+			// Every policy that arrived with an id must leave with it. The one
+			// membersPolicy adds has none, and must not acquire one.
+			for i, raw := range pols {
+				pol, ok := raw.(map[string]any)
+				if !ok {
+					continue // a bare reference is already the reference form
+				}
+				id, _ := pol["id"].(string)
+				isNew := pol["name"] == "Allow members"
+				switch {
+				case isNew && id != "":
+					t.Errorf("the appended policy does not exist yet, so it must carry no id: %v", pol)
+				case !isNew && id == "":
+					t.Errorf("policy %d went back without its id; a reusable policy is matched on id alone, so this creates a duplicate private copy instead of reusing the shared one: %v", i, pol)
+				}
+			}
+		})
+	}
+}
+
+// The create path builds its policy from nothing, and that one has no id to
+// keep — it is an inline definition, and Cloudflare turns it into an
+// application-scoped policy.
+//
+// Observed on the live create (PRSR-40): POSTing an application whose body
+// carried membersPolicy's exact output was accepted, and the response echoed
+// the policy back expanded with a fresh id, `reusable: false`, `precedence: 1`,
+// and empty `exclude`/`require` lists. It does not appear in
+// /accounts/{a}/access/policies, which lists only the reusable ones. So a gated
+// service Purser stands up gets its own private gate rather than joining the
+// estate's shared `Standard` policy — which is the safe direction, and worth
+// knowing rather than assuming.
+func TestEnsure_CreateSendsTheInlinePolicyWithNoID(t *testing.T) {
+	logo := logoServer(t, http.StatusOK, "image/png")
+	api := &accessAPI{} // nothing there: the create path
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: logo.Client()})
+
+	if _, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, logo.URL)}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if api.lastMethod != http.MethodPost {
+		t.Fatalf("a missing app is created with POST, got %s", api.lastMethod)
+	}
+	pols, ok := api.lastBody["policies"].([]any)
+	if !ok || len(pols) != 1 {
+		t.Fatalf("a gated create carries exactly its own policy, got %v", api.lastBody["policies"])
+	}
+	pol, ok := pols[0].(map[string]any)
+	if !ok {
+		t.Fatalf("policy came back as %T", pols[0])
+	}
+	if _, present := pol["id"]; present {
+		t.Errorf("a created policy has no id yet — sending one names a policy that does not exist: %v", pol)
+	}
+	if pol["decision"] != "allow" {
+		t.Errorf("decision = %v, want allow", pol["decision"])
+	}
+	inc, ok := pol["include"].([]any)
+	if !ok || len(inc) != 1 {
+		t.Fatalf("include = %v", pol["include"])
+	}
+	grp, _ := inc[0].(map[string]any)["group"].(map[string]any)
+	if grp == nil || grp["id"] != testGroup {
+		t.Errorf("the policy must admit the configured members group, got %v", inc[0])
 	}
 }

@@ -355,6 +355,22 @@ func (p *AccessProvisioner) desiredApp(base rawApp, spec spinup.ServiceSpec, log
 		// The spec says this service is gated by the members group. It does not
 		// say the members group is the only thing that may reach it, and the
 		// difference is somebody else's access.
+		//
+		// What goes back matters less than it looks, and PRSR-40 measured which
+		// half is which. A `reusable: true` policy in an application body is read
+		// as a **reference**: Cloudflare takes the id and ignores every other
+		// field. The probe sent one back with `name` rewritten and `decision`
+		// flipped to "deny"; the write returned 200 echoing the policy's real
+		// name and decision, the standalone policy's updated_at did not move, and
+		// a second application sharing it was untouched. So echoing the estate's
+		// shared `Standard` policy back cannot edit it — the outcome PRSR-40 was
+		// filed to rule out is structurally impossible, and the id is why.
+		//
+		// A `reusable: false` policy is the opposite: its body *is* honoured, so
+		// carrying one through is a real write of the policy's content. Safe
+		// here only because Ensure takes its own fresh read immediately above,
+		// which is the same read-then-write discipline the tunnel's docMu
+		// enforces for the shared ingress document.
 		switch groupPolicy(base, p.cfg.GroupID) {
 		case policyMissingGroup:
 			out["policies"] = append(livePolicies(base), p.membersPolicy())
@@ -386,9 +402,18 @@ func livePolicies(app rawApp) []any {
 // membersPolicy is the allow-the-members-group policy a gated app carries.
 //
 // Inline on the application object, which is the shape the live audit recorded
-// (PRSR-29). Cloudflare also exposes /accounts/{a}/access/apps/{id}/policies;
-// if the inline form turns out to be rejected, that endpoint is the fallback and
-// this is the one function that would move.
+// (PRSR-29) and which PRSR-40 then confirmed is *accepted* on write, not merely
+// returned on read: a POST carrying exactly this object was taken, and the
+// response echoed it back with a fresh id, `reusable: false` and `precedence: 1`.
+// It does not appear in /accounts/{a}/access/policies, which lists only the
+// reusable ones — so a gated service Purser stands up gets its own private gate
+// rather than joining the estate's shared `Standard` policy. That is the safe
+// direction, and it was worth measuring rather than assuming.
+//
+// No id here, deliberately: the policy does not exist yet, and on the update
+// path an id is the whole of what Cloudflare reads (see desiredApp).
+// /accounts/{a}/access/apps/{id}/policies remains available and is no longer
+// needed as a fallback.
 func (p *AccessProvisioner) membersPolicy() map[string]any {
 	name := p.cfg.GroupName
 	if name == "" {
@@ -515,8 +540,14 @@ const (
 	// policyUnreadable — the list holds something this cannot interpret, so
 	// whether the group is admitted is unknown. Cloudflare is documented to
 	// return bare policy *references* on applications whose policies are managed
-	// through /apps/{id}/policies — not a shape this repo has observed, which is
-	// exactly why an unreadable list is left alone rather than replaced.
+	// through /apps/{id}/policies. PRSR-40 looked: this estate's API always
+	// answers with full objects, including for a reusable policy shared by six
+	// applications, so the branch is unreached here rather than wrong. It is kept
+	// because the reference form is demonstrably a shape the API *accepts* —
+	// `{"id": …}` in an application body was taken and expanded on read-back — so
+	// it is a shape it may one day send, and an unreadable list left alone is the
+	// same rule as a logo that could not be fetched: never treat unverifiable as
+	// absent.
 	policyUnreadable
 )
 

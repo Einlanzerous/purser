@@ -834,12 +834,11 @@ an envelope is the one nobody will think to re-check.
   claim is verified against Cloudflare's own `modified_on` / `updated_at`, not
   against Purser's summary of itself.
 
-  **What that does not establish**: the exercise was adopt-only, so **no write
-  verb this axis owns has run against Cloudflare** — not the Access
-  full-replacement `PUT`, not the DNS create/update, not `putConfig`, and not
-  any `Teardown`. The premises below were settled by **raw API calls**, which
-  confirm Cloudflare and not the bodies `desiredApp`/`putConfig` build. The
-  read paths are what this run verified.
+  **What that does not establish**: the exercise was adopt-only, so no write
+  verb this axis owns ran against Cloudflare, and the premises below were
+  settled by **raw API calls**, which confirm Cloudflare and not the bodies
+  `desiredApp`/`putConfig` build. The read paths are what this run verified.
+  PRSR-40 has since closed that gap for Access; see below.
 
   Every premise that was true only because a fixture said so is now measured:
   the tunnel `version` moves by **exactly one per content-changing PUT** (and
@@ -855,6 +854,52 @@ an envelope is the one nobody will think to re-check.
   than `adopt`: the live tile carries a logo the fixture did not, so an `--apply`
   would have stripped a working icon. Five green tests could not see it because
   the fixture had been built to match the spec instead of the API.
+- ~~**PRSR-40 — do the Access write verbs work?**~~ **Done, 2026-08-26.** It ran
+  the real `AccessProvisioner` against the live API on a disposable hostname, so
+  the bytes on the wire were `desiredApp`'s own rather than curl's approximation
+  of them — which is precisely what PRSR-38 could not claim.
+
+  Executed live and correct: the gated **create**, the full-replacement
+  **update** on both of its branches, the logo **clear**, and **`Teardown`**
+  (twice, the second on an already-gone app, where `confirmGone`'s re-read
+  correctly reported success rather than an error). The estate was byte-identical
+  to its pre-probe snapshot afterwards, `updated_at` included.
+
+  The question it was filed for — whether echoing a `reusable: true` policy back
+  inline edits the shared object — is answered **no, structurally**:
+
+  | policy | what an application write does with its body |
+  |---|---|
+  | `reusable: true` | **ignored.** Only `id` is read; it is a reference. A probe sending `name: "MUTATED BY PROBE"` and `decision: "deny"` got a 200 echoing the policy's real name and `allow`, with the standalone policy and a second app sharing it both untouched |
+  | `reusable: false` | **honoured.** The same probe flipped one to `deny` and the read-back confirmed it |
+
+  So the estate's `Standard` policy cannot be edited by one service's logo fix,
+  and the field that makes that true is the `id`. Strip it — by adding `"id"` to
+  `serverOwned`, the tidy-looking edit — and the policy stops being a reference:
+  Cloudflare would mint a private copy, the app would be gated by something that
+  no longer tracks the shared group, nothing would error, and the plan would
+  still say "fix a logo". That is what
+  `TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten` guards, on the
+  append path, since the carry-through path cannot fail this way.
+
+  Two smaller answers on the same trip: a policy created inline comes back
+  `reusable: false` with a fresh id, so a gated service Purser stands up gets its
+  own private gate rather than joining `Standard`; and `logo_url: ""` really does
+  clear a logo, with the key absent from the read-back — with the plan naming the
+  clearing first, which is the only thing standing between a forgotten `--logo`
+  and a deleted icon.
+
+  It also caught the PRSR-38 fixture lesson **recurring**: `liveGatedApp` was
+  missing `destinations` and `eager_redirect_cookie_setting`, which every
+  `self_hosted` application on the estate carries. `destinations` is the one with
+  teeth — the modern spelling of what the application sits in front of.
+
+  **Still fake-only after this: the DNS and tunnel write verbs.**
+  `DNSProvisioner`'s create/update/delete and `TunnelProvisioner.putConfig` have
+  never executed. PRSR-38 probed the DNS delete with raw curl, which is not the
+  same as running the provisioner, and the tunnel write is a read-modify-write of
+  a document holding every other service's routes — the worst candidate for a
+  casual probe and the one most worth a disposable-tunnel exercise.
 - **PRSR-33** — the `dev` tunnel ref, which resolves to a refusal today rather
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod
