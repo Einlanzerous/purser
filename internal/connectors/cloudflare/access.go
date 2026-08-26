@@ -44,13 +44,27 @@ package cloudflare
 // that does not resolve as drift rather than as a reason to refuse the gate —
 // see verifyLogo and desiredApp for why that asymmetry is deliberate.
 //
-// Placard (IDEA-22) is where a working URL comes from now:
-// https://cdn.jsdelivr.net/gh/Einlanzerous/placard@main/<service>/<service>-mark-light.png
-// against a public repo. This package verifies whatever URL the spec carries; it
-// does not work out what that URL should be, so a spec author still types the
-// jsDelivr path by hand — which is the same class of thing as the rotted paths
-// this exists to catch. **PRSR-37** holds resolving it from Placard's
-// /api/services index instead.
+// Placard (IDEA-22) is where a working URL comes from, and since PRSR-37 this
+// package no longer asks a spec author to type one. A spec names a *ref* —
+// spinup.LogoPlacard, spinup.LogoNone, or an explicit https URL — and
+// wantedLogo resolves the first of those through the LogoResolver interface,
+// implemented by internal/placard. A spec that says nothing about its icon means
+// LogoPlacard, so the ordinary case is that a service gets the right mark by
+// being named.
+//
+// Two things that look like details and are not. Placard is asked which asset is
+// the *tile* asset, which no fetch check can answer: argosy's old URL resolved
+// 200 image/png and was the 3.6:1 wordmark, illegible at tile size, and Placard
+// publishes the ship glyph alone precisely for that reason — so a working
+// logo_url is not a correct one. And resolution never *decides*: Placard's own
+// per-file check is a periodic monitor carrying a checked_at and can be stale, so
+// it picks the URL and this package's own sessionless fetch is still what runs at
+// the moment of writing.
+//
+// Every answer other than "here is the mark" leaves the icon alone — Placard has
+// none for the slug, Placard could not be asked, no Placard configured. Only
+// spinup.LogoNone removes one, which is what makes a deletion something an
+// operator asked for by name rather than something a forgotten flag did.
 //
 // # Every test here is a fake; the write verbs themselves have run live
 //
@@ -109,6 +123,29 @@ type AccessConfig struct {
 	// Cloudflare, so it wants its own, shorter timeout: a slow CDN must not
 	// consume the budget for the call that actually creates the gate.
 	LogoClient *http.Client
+	// Logos resolves a service key to its launcher mark, for a spec that says
+	// spinup.LogoPlacard rather than naming a URL (PRSR-37).
+	//
+	// An interface rather than *placard.Resolver so this package does not import
+	// a second upstream to decorate a tile, and so a test can answer all three
+	// of its outcomes without a server. A nil Logos is the unconfigured
+	// deployment: resolution reports that it could not be done, which leaves
+	// every icon exactly as it is. Never a failed step — see resolveLogo.
+	Logos LogoResolver
+}
+
+// LogoResolver turns a service key into the canonical URL of its launcher mark.
+//
+// found is false when the source answered and has no usable mark for that key —
+// a service it has never heard of, or one whose file it records as missing. A
+// non-nil error means it could not be asked, which is a different answer and
+// must not be collapsed into the first: "there is no icon for this service" is a
+// fact worth acting on, while "the registry is down" is not, and treating the
+// second as the first clears working icons across the estate on every blip.
+//
+// Implemented by *placard.Resolver.
+type LogoResolver interface {
+	Mark(ctx context.Context, key string) (url string, found bool, err error)
 }
 
 // AccessProvisioner manages the Cloudflare Access application for a hostname.
@@ -210,7 +247,7 @@ func (p *AccessProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 	// The current value matters: it is what an unreadable check falls back to,
 	// so a CDN blip carries the existing icon forward instead of clearing it.
 	// str tolerates a nil found, which is the create path — nothing to carry.
-	logo, logoNote := p.resolveLogo(ctx, t.Spec.LogoURL, appStr(found, "logo_url"))
+	logo, logoNote := p.resolveLogo(ctx, t.Spec, appStr(found, "logo_url"))
 
 	if found == nil {
 		created, err := p.createApp(ctx, p.desiredApp(nil, t.Spec, logo))
@@ -500,7 +537,7 @@ func (p *AccessProvisioner) diff(ctx context.Context, live rawApp, spec spinup.S
 		}
 	}
 
-	logoDiffs, logoNotes := p.logoDiff(ctx, appStr(live, "logo_url"), spec.LogoURL)
+	logoDiffs, logoNotes := p.logoDiff(ctx, appStr(live, "logo_url"), spec)
 	return append(diffs, logoDiffs...), append(notes, logoNotes...)
 }
 
@@ -517,7 +554,45 @@ func (p *AccessProvisioner) diff(ctx context.Context, live rawApp, spec spinup.S
 // would mark the step StepUpdate over a network blip, and an update here is a
 // full-replacement PUT of the whole application — not something to trigger on
 // evidence this thin.
-func (p *AccessProvisioner) logoDiff(ctx context.Context, live, want string) (diffs, notes []string) {
+func (p *AccessProvisioner) logoDiff(ctx context.Context, live string, spec spinup.ServiceSpec) (diffs, notes []string) {
+	want, src, note := p.wantedLogo(ctx, spec)
+	switch src {
+	case logoSourceClear:
+		if live == "" {
+			return nil, nil
+		}
+		// Named as drift, deliberately and loudly. An --apply really will delete
+		// a working icon here, and the plan naming it is the only thing between
+		// that and a surprise — PRSR-38 reported exactly this line against
+		// argosy's live tile, and it was correct to.
+		return []string{fmt.Sprintf("has a logo (%s), spec sets none", live)}, nil
+	case logoSourceKeep:
+		// A note rather than drift: there is nothing to compare the live value
+		// against, and --apply will not touch it. Reporting "logo is X, spec
+		// wants ''" here would be a plan promising a deletion that will not
+		// happen, which is the same broken promise CanDeprovision exists to stop
+		// making on offboard.
+		if note != "" {
+			notes = append(notes, note)
+		}
+		// Whatever is already there is still worth checking, and this is the
+		// only branch where forgetting to would matter. The keep note says the
+		// launcher will show the service's initials; if a rotted URL is
+		// configured that sentence is wrong, and the rotted URL is invisible —
+		// which is precisely the condition switchyard's tile sat in for months.
+		// chronicle is the live example: a gated application Placard has never
+		// heard of, so every run of this command takes this branch.
+		//
+		// Still a note and not drift, because nothing will be written either
+		// way. It restores the detector without promising an action.
+		if live != "" {
+			if verdict, err := p.checkLogo(ctx, live); verdict == logoBroken {
+				notes = append(notes, fmt.Sprintf("the logo already set (%s) is not a servable image (%v) — the launcher is showing initials, and no icon was resolved to replace it", live, err))
+			}
+		}
+		return nil, notes
+	}
+
 	switch {
 	case want == "" && live == "":
 		return nil, nil
@@ -652,6 +727,61 @@ const (
 	logoUnknown
 )
 
+// logoSource says what kind of answer wantedLogo produced. Three values, for the
+// reason logoVerdict has three and policyVerdict has three: "use this url",
+// "remove the icon" and "we could not work out what the icon should be" want
+// different actions, and the last one must never be executed as the middle one.
+type logoSource int
+
+const (
+	// logoSourceURL — a concrete URL to verify and write.
+	logoSourceURL logoSource = iota
+	// logoSourceClear — the spec named spinup.LogoNone. Write the empty string.
+	logoSourceClear
+	// logoSourceKeep — nothing was resolved. Leave whatever is there.
+	logoSourceKeep
+)
+
+// wantedLogo turns the spec's LogoRef into a candidate URL.
+//
+// Both the plan and the apply read it, which is what keeps them agreeing: a
+// preview is the first half of an apply, not a guess at it. It is the only place
+// that calls the resolver, so a spin-up asks Placard once for the plan and once
+// for the apply and no more.
+func (p *AccessProvisioner) wantedLogo(ctx context.Context, spec spinup.ServiceSpec) (string, logoSource, string) {
+	switch spec.Logo {
+	case spinup.LogoNone:
+		return "", logoSourceClear, ""
+
+	case spinup.LogoPlacard:
+		if p.cfg.Logos == nil {
+			// Unconfigured, which is Purser's own gap rather than anything about
+			// this service. It is deliberately not a failed step and not an
+			// unavailable one: the Access application is a DNS prerequisite when
+			// it is gated, so refusing here would leave a service unpublished
+			// over an icon. The same argument the logo has always made.
+			return "", logoSourceKeep, fmt.Sprintf("logo left as it is: %s asks for the icon to come from Placard, and PURSER_PLACARD_URL is not set", spinup.LogoPlacard)
+		}
+		url, found, err := p.cfg.Logos.Mark(ctx, spec.Key)
+		switch {
+		case err != nil:
+			return "", logoSourceKeep, fmt.Sprintf("logo left as it is: Placard could not be asked for %q (%v) — an unreachable registry is not evidence the icon is wrong", spec.Key, err)
+		case !found:
+			// Placard answered, and it has nothing for this slug. An ordinary
+			// state rather than a fault: its registry covers seven services, and
+			// a spin-up necessarily runs before a brand-new service's mark is
+			// drawn. The launcher rendering the service's initials is the honest
+			// picture of "there is no icon yet".
+			return "", logoSourceKeep, fmt.Sprintf("no icon: Placard has no mark for %q, so the launcher shows the service's initials and anything already set is left alone", spec.Key)
+		}
+		return url, logoSourceURL, ""
+
+	default:
+		// An explicit https URL, already shape-checked by Validate.
+		return string(spec.Logo), logoSourceURL, ""
+	}
+}
+
 // checkLogo fetches the URL and classifies it.
 //
 // GET rather than HEAD: HEAD is not universally implemented, and a 405 would
@@ -715,11 +845,24 @@ func (p *AccessProvisioner) checkLogo(ctx context.Context, url string) (logoVerd
 // because the spec still asks for a logo, the next Inspect keeps reporting drift
 // until the asset really is published: a visible, converging "still not right"
 // rather than a silent permanent wrong value.
-func (p *AccessProvisioner) resolveLogo(ctx context.Context, want, current string) (string, string) {
-	if want == "" {
-		// The spec asks for no icon. Clearing is intended, not a fallback.
+func (p *AccessProvisioner) resolveLogo(ctx context.Context, spec spinup.ServiceSpec, current string) (string, string) {
+	want, src, note := p.wantedLogo(ctx, spec)
+	switch src {
+	case logoSourceClear:
+		// The spec asks for no icon, by name. Clearing is intended, not a
+		// fallback — which is the whole reason spinup.LogoNone exists as a
+		// separate value from an unspecified logo.
 		return "", ""
+	case logoSourceKeep:
+		// Nothing could be resolved, and that is not evidence the icon is
+		// wrong. Returning the current value writes it straight back, so an
+		// existing tile survives a Placard outage, an unconfigured deployment,
+		// and a slug Placard has never been given a mark for. On a create there
+		// is nothing to carry and this is the empty string, which is the honest
+		// rendering of "no icon yet": the launcher shows the initials.
+		return current, note
 	}
+
 	verdict, err := p.checkLogo(ctx, want)
 	switch verdict {
 	case logoOK:

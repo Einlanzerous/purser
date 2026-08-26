@@ -190,7 +190,21 @@ func TestSpinup_BadSpecIs400WithTheReason(t *testing.T) {
 		{"an http logo the launcher would block", map[string]any{
 			"service": "argosy", "hostname": "argosy.zerogravity.industries",
 			"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
-			"logo_url": "http://example.com/a.png"}, "https://"},
+			"logo": "http://example.com/a.png"}, "https://"},
+		{
+			// PRSR-37 renamed logo_url to logo and changed what it holds.
+			// encoding/json drops unknown fields, so without this a caller
+			// written against the previous release loses its explicit icon
+			// silently and the spec defaults to "placard" — nothing is
+			// destroyed, but the instruction vanishes with no error and nothing
+			// in the response saying so.
+			"the field renamed in PRSR-37 is refused rather than ignored",
+			map[string]any{
+				"service": "argosy", "hostname": "argosy.zerogravity.industries",
+				"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+				"logo_url": "https://cdn.example/argosy.png"},
+			`"logo_url" was renamed`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -21,6 +21,7 @@ type Config struct {
 	Cloudflare CloudflareConfig
 	Lyceum     LyceumConfig
 	Argosy     ArgosyConfig
+	Placard    PlacardConfig
 	SMTP       SMTPConfig
 	Bundles    BundleConfig
 }
@@ -141,6 +142,26 @@ type ArgosyConfig struct {
 
 // Configured reports whether the Argosy connector can run.
 func (c ArgosyConfig) Configured() bool { return c.BaseURL != "" && c.ProvisionToken != "" }
+
+// PlacardConfig points the spin-up axis at Placard, the estate's mark registry
+// (IDEA-22), so a service spec can name a service and get the right launcher
+// icon instead of carrying a hand-typed CDN path (PRSR-37).
+//
+// It is not a connector: Placard is never an invite target and has no person
+// axis. It is a lookup the Access provisioner makes while deciding what a tile's
+// icon should be, which is why there is a base URL and no token — /api/services
+// is a public read.
+//
+// BaseURL is defaulted, like Argosy's and Lyceum's, so the ordinary deployment
+// resolves icons without a new variable. An unreachable Placard is not a
+// failure: the Access step reports that the icon could not be resolved and
+// leaves whatever is there alone.
+type PlacardConfig struct {
+	BaseURL string // PURSER_PLACARD_URL (internal API base)
+}
+
+// Configured reports whether icons can be resolved by service key.
+func (c PlacardConfig) Configured() bool { return c.BaseURL != "" }
 
 // LyceumConfig configures the Lyceum connector.
 type LyceumConfig struct {
@@ -277,6 +298,9 @@ func Load() Config {
 			BaseURL:        envOr("PURSER_ARGOSY_BASE_URL", "http://argosy:8096"),
 			ProvisionToken: os.Getenv("PURSER_ARGOSY_PROVISION_TOKEN"),
 			AppURL:         envOr("PURSER_ARGOSY_URL", "https://argosy.zerogravity.industries"),
+		},
+		Placard: PlacardConfig{
+			BaseURL: envOr("PURSER_PLACARD_URL", "http://placard:4009"),
 		},
 		Bundles: loadBundles(),
 		SMTP: SMTPConfig{

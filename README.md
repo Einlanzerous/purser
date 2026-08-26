@@ -221,7 +221,7 @@ purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--a
 purser person list [--to svc1,svc2] [--type human|agent] [--all] [--json]   # the roster
 purser person show --email EMAIL [--json]                  # one person in full
 purser offboard --email EMAIL [--to svc1,svc2] [--apply]   # revoke access; previews by default
-purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo URL] [--apply]
+purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply]
 purser audit [--email EMAIL] [--to svc1,svc2]              # report drift, read-only
 purser reconcile --email EMAIL | --all [--to svc1,svc2]    # repair records
 purser migrate               # apply DB migrations and exit
@@ -632,8 +632,12 @@ construct_net/Tailscale isolation).
   `email` are required and a request without either is a `400`)
 - `GET  /v1/invites/{id}` — status
 - `POST /v1/spinups` — `{ "service", "hostname", "mode", "upstream", "access",
-  "display_name", "logo_url", "tunnel", "apply" }` — stand up a service's edge.
-  Omitting `apply` returns a plan and writes nothing.
+  "display_name", "logo", "tunnel", "apply" }` — stand up a service's edge.
+  Omitting `apply` returns a plan and writes nothing. `logo` is a ref rather than
+  a URL — `"placard"` (the default; resolve the mark by service key), `"none"`
+  (clear the icon), or an explicit `https://` URL. The old `logo_url` is refused
+  with a `400` naming the replacement rather than ignored, since a dropped field
+  would silently discard the caller's icon.
 
   Each entry in `findings` carries a `status` (see the table under [Standing a
   service up](#standing-a-service-up)) and, occasionally, a `warning` — trouble

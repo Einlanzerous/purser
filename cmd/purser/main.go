@@ -38,6 +38,7 @@ import (
 	"github.com/Einlanzerous/purser/internal/connectors/switchyard"
 	"github.com/Einlanzerous/purser/internal/delivery"
 	"github.com/Einlanzerous/purser/internal/invite"
+	"github.com/Einlanzerous/purser/internal/placard"
 	"github.com/Einlanzerous/purser/internal/spinup"
 	"github.com/Einlanzerous/purser/internal/store"
 	"github.com/Einlanzerous/purser/internal/version"
@@ -184,6 +185,7 @@ func spinupRegistry(cfg config.Config) *spinup.Registry {
 			AccountID: cfg.Cloudflare.AccountID,
 			GroupID:   cfg.Cloudflare.GroupID,
 			GroupName: cfg.Cloudflare.GroupName,
+			Logos:     placardResolver(cfg),
 		}),
 		cloudflare.NewTunnel(cloudflare.TunnelConfig{
 			APIToken:  cfg.Cloudflare.APIToken,
@@ -294,4 +296,29 @@ func runMigrate() {
 		log.Fatalf("migrate: %v", err)
 	}
 	log.Printf("migrations applied")
+}
+
+// placardResolver builds the launcher-icon resolver, or nil when this
+// deployment has none.
+//
+// nil rather than a stub that always fails, because the Access provisioner
+// treats a nil resolver as "the icon could not be worked out" and leaves the
+// tile exactly as it is — which is the same answer an unreachable Placard gets,
+// and the answer that cannot destroy anything. That is the opposite of
+// spinupRegistry's rule one level up, where an unconfigured provisioner is
+// registered so it can name the variable it wants: a missing *step* has to be
+// visible in the report, but a missing icon must not be.
+//
+// Config.Load defaults PURSER_PLACARD_URL, and envOr reads an empty value as
+// unset, so a deployment cannot reach the nil branch by blanking the variable —
+// it gets a resolver pointed at http://placard:4009 and, if nothing answers
+// there, the same leave-it-alone note. That is deliberate: there is no global
+// off switch because a spec that wants no resolution says so itself, with
+// --logo none or an explicit URL. The branch is still live for a Config built
+// directly rather than through Load, which is what the tests do.
+func placardResolver(cfg config.Config) cloudflare.LogoResolver {
+	if !cfg.Placard.Configured() {
+		return nil
+	}
+	return placard.New(placard.Config{BaseURL: cfg.Placard.BaseURL})
 }

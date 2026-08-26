@@ -198,9 +198,23 @@ type spinupRequest struct {
 	Mode        string `json:"mode"`
 	Upstream    string `json:"upstream"`
 	Access      string `json:"access"`
-	LogoURL     string `json:"logo_url"`
-	Tunnel      string `json:"tunnel"`
-	Apply       bool   `json:"apply"`
+	// Logo is a ref, not a URL: "placard", "none", or an https URL. Renamed
+	// from logo_url with the field's meaning in PRSR-37 — a name that still said
+	// URL would invite one, and the commonest value is now a keyword.
+	Logo string `json:"logo"`
+	// LogoURL only exists to refuse. encoding/json drops unknown fields, so a
+	// caller written against the previous release would have had its explicit
+	// icon silently discarded and the spec silently defaulted to "placard" —
+	// non-destructive, since no unresolved answer clears an icon, but the
+	// caller's instruction would vanish with no error and nothing in the
+	// response to say so. POST /v1/spinups shipped one release ago (PRSR-31),
+	// so the population that could send it is small and worth telling rather
+	// than guessing for: the value is still legal as a Logo ref, but "carry it
+	// across" and "you probably want placard now" are different intentions and
+	// this is not the layer to pick between them.
+	LogoURL string `json:"logo_url"`
+	Tunnel  string `json:"tunnel"`
+	Apply   bool   `json:"apply"`
 }
 
 func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
@@ -213,6 +227,11 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
+	if req.LogoURL != "" {
+		writeError(w, http.StatusBadRequest,
+			`"logo_url" was renamed to "logo" in PRSR-37 and is now a ref rather than a url: "placard" resolves the mark by service key, "none" clears the icon, or pass an https url to keep naming one yourself`)
+		return
+	}
 	spec := spinup.ServiceSpec{
 		Key:         req.Service,
 		DisplayName: req.DisplayName,
@@ -220,7 +239,7 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 		Mode:        spinup.Mode(req.Mode),
 		Upstream:    req.Upstream,
 		Access:      spinup.AccessShape(req.Access),
-		LogoURL:     req.LogoURL,
+		Logo:        spinup.LogoRef(req.Logo),
 		Tunnel:      spinup.TunnelRef(req.Tunnel),
 	}
 	// Validated here so a malformed spec is a 400 rather than a 500. Ensure
