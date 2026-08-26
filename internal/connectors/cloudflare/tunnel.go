@@ -766,15 +766,20 @@ func confirmRoute(rules []ingressRule, host, service string) error {
 // because the obvious check cannot: confirming our own route always passes,
 // since our write necessarily contains everything our own read did.
 //
-// **The +1 is an assumption about Cloudflare, and nothing here is evidence for
-// it.** The fake in the tests bumps by one because the test author decided it
-// does. So the guard is written to fail quiet rather than loud: it is skipped
-// when either version is absent, and it only fires on a version that moved by
-// *more* than one — a read that lagged our own write (`after <= before`) tells
-// us nothing about another writer, and would otherwise cry wolf on the one
-// message that most needs to be believed when it is real. One live
-// GET → PUT → GET against construct-server settles it; noted on PRSR-31, which
-// is where a CLI first points this at the real API.
+// **The +1 was an assumption; PRSR-38 measured it** (2026-08-26, on a tunnel
+// created and deleted for the purpose — both live tunnels carry traffic, so
+// neither is a place to run an experiment). A content-changing PUT moves the
+// version by exactly one: 0→1→2→3→4 across four writes. So our own
+// route-adding write can never trip this guard, and the false alarm it was
+// written to fear does not exist. An *identical* PUT moves it not at all
+// (2→2→2), which `after <= before+1` already covers — the version counts
+// revisions, not requests, so don't reach for it as a write counter.
+//
+// The guard stays written to fail quiet rather than loud: skipped when either
+// version is absent, and firing only on a jump of *more* than one, since a read
+// that lagged our own write (`after <= before`) tells us nothing about another
+// writer and would otherwise cry wolf on the one message that most needs to be
+// believed when it is real.
 func concurrentWriteNote(before, after int, tunnelID string) string {
 	if before <= 0 || after <= 0 || after <= before+1 {
 		return ""

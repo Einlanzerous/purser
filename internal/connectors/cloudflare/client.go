@@ -78,13 +78,21 @@ func (c *client) do(ctx context.Context, method, path string, body any) ([]byte,
 		// A pointer, so "the field was absent" is distinguishable from
 		// "success was false".
 		//
-		// Not every v4 route answers with the envelope. `DELETE
-		// /zones/{zone}/dns_records/{id}` returns a bare {"result":{"id":…}} —
-		// no success, no errors — and a plain bool would read that as failure,
-		// reporting a deletion that happened as one that didn't. That is the
-		// PRSR-17 lie pointed backwards: `Teardown` would leave a row active for
-		// a record it had just removed. It went unnoticed until now because that
-		// delete is the first DELETE this client has ever sent.
+		// Not every v4 route need answer with the envelope, and a plain bool
+		// would read an absent `success` as failure — reporting a deletion that
+		// happened as one that didn't. That is the PRSR-17 lie pointed
+		// backwards: `Teardown` would leave a row active for a record it had
+		// just removed.
+		//
+		// The route this was written for turned out not to need it. This comment
+		// used to assert as fact that `DELETE /zones/{zone}/dns_records/{id}`
+		// answers with a bare {"result":{"id":…}}; that was read off the
+		// published schema, and PRSR-38 probed the live API on 2026-08-26 and
+		// found the full envelope —
+		// {"result":{"id":…},"success":true,"errors":[],"messages":[]}. So the
+		// premise was wrong and the pointer is merely defensive here. Keep it:
+		// it costs one dereference, and a route that *does* omit the envelope is
+		// by definition the one nobody will think to re-check.
 		Success *bool `json:"success"`
 		Errors  []struct {
 			Code    int    `json:"code"`
@@ -95,9 +103,11 @@ func (c *client) do(ctx context.Context, method, path string, body any) ([]byte,
 	// further out, and it has to be answered before the decode rather than after
 	// — json.Unmarshal fails on "" and would take the error branch below,
 	// reporting a 204 as a failure. That is the bug the *bool above fixes,
-	// arriving through the door the *bool cannot cover, and it lands on the same
-	// route: a delete whose response shape is still unobserved (PRSR-36). A
-	// deletion that happened, reported as one that didn't.
+	// arriving through the door the *bool cannot cover. No route this client
+	// calls has actually been seen to answer empty — PRSR-38 got a body from
+	// every one it probed, the DNS delete included — so this is kept for the
+	// same reason as the pointer above, not because it is known to fire: a
+	// deletion that happened, reported as one that didn't, is worth a branch.
 	if len(bytes.TrimSpace(raw)) == 0 {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return raw, nil

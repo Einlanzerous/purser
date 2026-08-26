@@ -764,9 +764,12 @@ const (
 // two applications can then drift apart, one admitting the members group and one
 // not, with nothing reporting it until a run happens to read the other page.
 //
-// Pagination is driven by `result_info.total_pages`, which is Cloudflare's
-// documented v4 list envelope — **inferred from the schema, not observed**, like
-// the rest of this package (see PRSR-36). That is also why the loop keys on
+// Pagination is driven by `result_info.total_pages`, Cloudflare's documented v4
+// list envelope, and PRSR-38 confirmed the live list really sends it:
+// {"page":1,"per_page":1000,"count":10,"total_count":10,"total_pages":1}. The
+// default page size is **1000**, so this account's ten applications will never
+// paginate in practice — the loop is correct rather than exercised, which is
+// worth knowing before anybody deletes it as dead. That is also why it keys on
 // `total_pages` being present and greater than one rather than on "the page came
 // back full": an endpoint that ignores the page parameter would return the same
 // full page for ever, and a loop that trusted fullness would never terminate.

@@ -811,28 +811,50 @@ What it decides, and why:
   check each new route's real response shape rather than the fake's — the fake
   wrapping the DNS delete in an envelope is how this got as far as review.
 
-Two premises those rest on come from Cloudflare's **published schema and have
-not been confirmed against the live API**: that `DELETE
-/zones/{zone}/dns_records/{id}` answers with a bare `{"result":{"id":…}}`, and
-that a "could not route" error is a 404. Both fixes hold under either answer —
-the envelope change is a widening that a route sending one never reaches, and
-requiring the error code trades a silent lie for a visible retry — so this is a
-caveat on the *claims*, not on the code. **PRSR-36** carries the probe.
+Two premises those rested on came from Cloudflare's published schema. **PRSR-38
+probed them on 2026-08-26** and one was wrong:
+
+| premise | observed |
+|---|---|
+| `DELETE /zones/{zone}/dns_records/{id}` answers with a bare `{"result":{"id":…}}` | **False.** It sends the full envelope: `{"result":{"id":…},"success":true,"errors":[],"messages":[]}` |
+| a "could not route" error is a 404 | **Not reproduced.** A well-formed id that is absent gives **404 / 81044**; a *malformed* id gives **405 / 10405** |
+
+Both fixes held under the real answer, which was the point of writing them the
+safe way: the `*bool` is simply defensive on a route that does send an envelope,
+and keying absence on 81044 rather than on the status is what stops the 405 from
+ever reading as "already gone". Keep the `*bool` anyway — the route that omits
+an envelope is the one nobody will think to re-check.
 
 ### What is left
 
-- **PRSR-38 — Argosy end to end, against the live API.** PRSR-31 shipped the
-  command and the test — `spinup_argosy_test.go` runs all three real
-  provisioners through the real orchestrator against an already-up edge and
-  asserts three no-ops with zero upstream writes — but no test in this repo has
-  ever contacted Cloudflare, so the first real `provision-service` run is still
-  an exercise nobody has performed. It needs an operator's credentials, not a
-  code change. It has a key rather than this bullet for the reason this file
-  keeps repeating: the remaining half of a piece of work does not survive being
-  a note in a doc. It **blocks PRSR-34**, and carries the premises that are
-  currently true only because a fixture says so — the tunnel `version` moving by
-  exactly one per PUT, PRSR-36's two shapes, a bookmark app's live JSON, and
-  whether policy references come back as strings or objects.
+- ~~**PRSR-38 — Argosy end to end, against the live API.**~~ **Done, 2026-08-26.**
+  The axis has now contacted Cloudflare. All three runs behaved: plan →
+  `adopt`/`adopt`/`skipped`, `--apply` → two rows with zero upstream calls,
+  re-plan → `ok`/`ok`/`skipped`, `Pending()==0`, exit 0 throughout. The no-write
+  claim is verified against Cloudflare's own `modified_on` / `updated_at`, not
+  against Purser's summary of itself.
+
+  **What that does not establish**: the exercise was adopt-only, so **no write
+  verb this axis owns has run against Cloudflare** — not the Access
+  full-replacement `PUT`, not the DNS create/update, not `putConfig`, and not
+  any `Teardown`. The premises below were settled by **raw API calls**, which
+  confirm Cloudflare and not the bodies `desiredApp`/`putConfig` build. The
+  read paths are what this run verified.
+
+  Every premise that was true only because a fixture said so is now measured:
+  the tunnel `version` moves by **exactly one per content-changing PUT** (and
+  not at all for an identical one); the DNS delete **does** carry the
+  `{success, errors}` envelope, contradicting PRSR-36's reading of the schema;
+  81044 arrives with a 404 while a malformed id answers 405/10405; a bookmark's
+  live JSON carries `tags` and `policies`, neither of which this package models;
+  and policies come back as **full objects with `decision`**, not bare
+  references — the estate's is `reusable: true` and shared by six apps, and
+  `groupPolicy` reads it correctly.
+
+  The exercise earned its keep on the first plan, which reported `update` rather
+  than `adopt`: the live tile carries a logo the fixture did not, so an `--apply`
+  would have stripped a working icon. Five green tests could not see it because
+  the fixture had been built to match the spec instead of the API.
 - **PRSR-33** — the `dev` tunnel ref, which resolves to a refusal today rather
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod

@@ -417,6 +417,17 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   passes, since our write necessarily contains everything our own read did. A
   version jump is a warning on a step that succeeded, not a failure of it; what
   may have been lost is another service's route.
+  **The `+1` is measured now, not assumed** (PRSR-38, on a disposable tunnel
+  created and deleted for the purpose — neither live tunnel is a place to run
+  an experiment). A content-changing PUT moves `version` by exactly one
+  (0→1→2→3→4 across four writes), so our own route-adding write can never
+  trip the guard and the false alarm this was worried about does not exist. The
+  refinement: an **identical** PUT does not move it at all (2→2→2). That is the
+  right behaviour rather than a gap — a writer who changed nothing lost nobody's
+  route — but it does mean `version` counts *revisions*, not requests, so don't
+  reach for it as a write counter. The PUT response also returns the new
+  version directly, so the read-back is earning its keep by confirming the route
+  landed, not by fetching the number.
 - **Never treat unverifiable as absent**, here too. A failed `Inspect` is
   `unknown`, and `--apply` does not act on an unknown step: acting on a state
   that couldn't be read creates a second copy of something, or rebuilds a shared
@@ -503,6 +514,18 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `Inspect` it is a note rather than drift, because an update here is that
   full-replacement PUT. Never fatal either way: a gated app is a DNS
   prerequisite, so refusing it would leave a service unpublished over an icon.
+  **A spec that names no logo is an instruction, not silence.** `resolveLogo("")`
+  returns `""` — "clearing is intended, not a fallback" — and `desiredApp`
+  writes the empty string rather than omitting the key, so that a rotted URL can
+  be cleared at all. Against a live application carrying a working icon those
+  two compose into an `--apply` that strips it, which is what PRSR-38's first
+  live plan reported (`update`, "has a logo (…), spec sets none"). That is
+  correct for a spec that really means "no icon", so the invariant is not about
+  the clearing: it is that the *plan* must name it, because preview-by-default
+  is the only thing standing between a forgotten `--logo` and a deleted icon.
+  Pinned by `TestArgosy_ASpecWithNoLogoWouldClearTheLiveOne`. When PRSR-37 makes
+  a logo Placard-resolved, "the spec named nothing" and "Placard has no mark for
+  this slug" must both stay distinguishable from "the spec asked for no icon".
 - **The Access teardown confirms absence by reading, not by an error code.**
   `dnsRecordNotFound` works because 81044 was observed; there is no observed
   Access equivalent, and the rule above forbids guessing one. So a failed delete
@@ -511,23 +534,38 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   unverifiable — which is never absent. That is stronger than a code test, not a
   substitute for one: it asserts what `Teardown` actually claims, and it also
   catches a delete that failed at the transport after Cloudflare applied it.
-- **Two premises behind those are read from Cloudflare's published schema and
-  have not been confirmed against the live API** (PRSR-36): that the DNS delete
-  answers with a bare `{"result":{"id":…}}`, and that a "could not route" error
-  comes back as a 404. Both fixes are the safe direction under *either* answer —
-  the envelope change is a widening a route that sends one never reaches, and
-  requiring the code trades a silent lie for a visible retry — so the **code**
-  needs no caveat and the **claims about Cloudflare** do. This file has been
-  wrong in both directions about an unverified premise before (see PRSR-25,
-  below); don't harden either sentence into fact without a probe.
+- **Those two premises are observed now, and one of them was wrong** (PRSR-38,
+  probed 2026-08-26). The sentence that stood here said not to harden either
+  into fact without a probe; this is the probe. The DNS delete does **not**
+  answer with a bare `{"result":{"id":…}}` — it carries the full envelope,
+  `{"result":{"id":…},"success":true,"errors":[],"messages":[]}`. So `do()`'s
+  `*bool` is defensive rather than load-bearing *on this route*; keep it, since
+  it costs nothing and the route that omits an envelope is exactly the one
+  nobody will think to check. The 404 half is confirmed in the shape that
+  matters: deleting a well-formed id that is not there answers **404 with code
+  81044**, which is the observation `dnsRecordNotFound` was waiting for and the
+  licence to keep that code listed. What was *not* reproduced is a "could not
+  route" 404 — a **malformed** id answers **405, code 10405** ("Method not
+  allowed for this authentication scheme"), which is neither absence nor a clean
+  failure, and is handled correctly for precisely the reason the predicate keys
+  on the code rather than the status: 10405 is not 81044, so it can never read
+  as "already gone". That asymmetry now has a live counter-example behind it
+  instead of an argument.
 - **Cloudflare appends the zone to a name it doesn't recognise.** A hostname from
   another domain becomes `svc.example.org.zerogravity.industries` with no error
   anywhere. `ServiceSpec` can't catch it (it validates the shape of a hostname,
-  not which zone the token points at) and a Zone→DNS→Edit token can't read the
-  zone object to find out first — so the *created* record's name is checked
+  not which zone the token points at), so the *created* record's name is checked
   against what was asked for, and a mismatch deletes it. Cleanup runs on the
   create path only: on an update the record predates Purser, and removing it
   would destroy something nobody asked to have removed.
+  **The reason this file used to give for checking it afterwards was wrong**
+  (PRSR-38). It said a Zone→DNS→Edit token "can't read the zone object to find
+  out first"; the production token answers `GET /zones` with exactly
+  `["zerogravity.industries"]`. A pre-flight against the token's own zone is
+  available and would refuse an out-of-zone hostname in the *plan*, before
+  anything exists to delete — PRSR-39. The create-then-delete stays as the
+  backstop either way: it catches a normalisation surprise a pre-flight cannot
+  predict, and it is the half that has actually been reasoned about.
 - **A refusal is not a failed read** (PRSR-31). `StepUnknown` covers a read that
   did not complete — re-running is the whole fix. `StepRefused` covers a read
   that *succeeded* and came back with something no provisioner may write to: a
@@ -696,29 +734,63 @@ PRSR-31 wired all three into `setup()` and gave the axis its entry points:
 split from `unknown`, and the concurrent-write warning reported once — and it
 added `spinup_argosy_test.go`, which runs all three real provisioners through
 the real orchestrator against an already-up edge and asserts three no-ops with
-zero upstream writes. **What it has not done is contact Cloudflare.** No test in
-this repo ever has; the first real `provision-service` run needs an operator's
-credentials and is the exercise the epic actually asks for. Until somebody runs
-it, "Argosy end to end" is a claim about a fake. That half has its own key,
-**PRSR-38** — a docs bullet is exactly how this project has lost the remaining
-half of a piece of work twice — and it **blocks PRSR-34**, since `Teardown` is
-where a wrong absence-predicate starts marking rows removed for records that
-still resolve.
+zero upstream writes — against a fake, which is the caveat **PRSR-38 retired on
+2026-08-26 by running the binary against the real Cloudflare API for the first
+time in this project's history.** The three runs the ticket asked for all pass:
+plan → `adopt`/`adopt`/`skipped`, `--apply` → two rows and *zero* upstream
+calls, re-plan → `ok`/`ok`/`skipped` with `Pending()==0`. "An adopt is a row and
+nothing else" is now checked against Cloudflare's own `modified_on` and
+`updated_at`, which did not move, rather than against Purser's self-report.
+
+**What the first run actually found is the part worth keeping.** The Access step
+came back `update`, not `adopt`: the live tile carries a logo and the ticket's
+spec named none, so `--apply` would have cleared a working icon. The cause was
+`liveBookmark()` — a fixture built to match the spec rather than the API, so the
+suite asserted `adopt` on a shape Cloudflare does not return. That is the
+"a fake models the shape you assumed" trap reached through fixture *data*
+instead of a wire shape, and it is the argument for this ticket existing at all:
+five green tests could not see it, and one live plan could. The fixture is now
+the observed response, `tags` and `policies` included.
+
+Still true, and **wider than "Teardown hasn't run"** — which is what this
+paragraph said first, and it read as exhaustive when it was not. **No write verb
+this axis owns has ever executed against Cloudflare.** The exercise was
+adopt-only by construction: the plan wrote nothing, `--apply` produced two rows
+and zero upstream calls, the re-run was `ok`/`ok`. So what PRSR-38 established is
+a claim about the **read** paths — `Inspect`, the matchers, the reconcile logic
+and the statuses they produce. `AccessProvisioner`'s full-replacement `PUT`, the
+DNS create/update, `TunnelProvisioner.putConfig`, and every `Teardown` are all
+still fake-only.
+PRSR-38's probes do not close that gap and must not be read as if they did: they
+were **raw API calls**, so they confirm Cloudflare's behaviour, not the bodies
+`desiredApp` and `putConfig` construct. Confirming that a PUT bumps a version is
+not confirming that the document we would PUT is one Cloudflare accepts.
+The first live execution of the Access `PUT` will most likely be a PRSR-37 logo
+fix on a **gated** app, and that body carries back the `policies` list — observed
+to be full objects with `reusable: true`, shared by six applications — plus
+`tags`, which nothing here models. Whether Cloudflare takes a reusable policy
+echoed inline rather than as a reference is **PRSR-40**, and the field that
+disappears if the answer is no is the one that gates the service.
 
 **PRSR-33** wires the `dev` tunnel ref
 that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
 spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
-the `Teardown` walk, **PRSR-36** the Cloudflare response shapes still read from
-the published schema rather than observed, and **PRSR-37** resolving a service's
-logo from Placard instead of hand-writing the URL into a spec.
+the `Teardown` walk, **PRSR-37** resolving a service's logo from Placard instead
+of hand-writing the URL into a spec — which PRSR-38's launcher audit turned from
+a tidiness ticket into a real one, since switchyard's stored `logo_url` is a live
+404 and argosy's is the 3.6:1 wordmark rather than the tile mark — and
+**PRSR-39** the zone pre-flight that PRSR-38's probe showed was available all
+along. **PRSR-36** is settled by PRSR-38 and can close.
 
-**PRSR-36** confirms two Cloudflare response shapes that PRSR-28's fixes are
-currently reasoning about from the published schema rather than from a response
-anybody has seen — whether the DNS delete carries the `{success, errors}`
-envelope, and what status accompanies a "could not route" error. It blocks
-PRSR-34: both fixes are safe under either answer, but `Teardown` being
-orchestrated is the point at which a wrong one starts marking rows removed for
-records that still resolve.
+**PRSR-36** asked for two Cloudflare response shapes that PRSR-28's fixes were
+reasoning about from the published schema rather than from a response anybody
+had seen. **PRSR-38 observed both** — see the DNS bullet above: the delete
+*does* send the envelope (so that premise was wrong and the code was defensively
+right anyway), 81044 arrives with a 404 as hoped, and a malformed id answers
+405/10405 rather than any "could not route" 404. The reason it blocked PRSR-34
+is discharged with it: `Teardown` is where a wrong absence-predicate starts
+marking rows removed for records that still resolve, and the predicate is now
+keyed on a code somebody has actually seen.
 
 Also open: nothing runs the audit on a schedule (PRSR-18). Argosy has no delete
 or disable endpoint, so it is the one service `offboard` cannot close (ARGY
