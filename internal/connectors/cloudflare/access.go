@@ -87,13 +87,24 @@ package cloudflare
 // spec instead of the API and hid a live bug behind five passing tests.
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	// Registered for image.DecodeConfig, which sniffs the format from the bytes
+	// rather than trusting Content-Type. PNG is what Placard publishes and the
+	// only one this was written for; the other two come free with the same call
+	// and cost a decoder each. An SVG has no header of this kind and simply does
+	// not decode, which is the right answer — see logoShape.
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 
 	"github.com/Einlanzerous/purser/internal/model"
 	"github.com/Einlanzerous/purser/internal/spinup"
@@ -682,8 +693,14 @@ func (p *AccessProvisioner) logoDiff(ctx context.Context, live string, spec spin
 		// Still a note and not drift, because nothing will be written either
 		// way. It restores the detector without promising an action.
 		if live != "" {
-			if verdict, err := p.checkLogo(ctx, live); verdict == logoBroken {
+			switch verdict, shape, err := p.checkLogo(ctx, live); verdict {
+			case logoBroken:
 				notes = append(notes, fmt.Sprintf("the logo already set (%s) is not a servable image (%v) — the launcher is showing initials, and no icon was resolved to replace it", live, err))
+			default:
+				// It serves; say so if it will not survive the tile. Nothing is
+				// resolved on this branch, so this is the only chance anybody
+				// gets to hear about the shape of what is already up.
+				notes = appendShapeNote(notes, shape, live)
 			}
 		}
 		return nil, notes
@@ -717,22 +734,31 @@ func (p *AccessProvisioner) logoDiff(ctx context.Context, live string, spec spin
 		// nothing, and the next run says exactly the same — with each --apply
 		// performing a full-replacement PUT of a gated application for a change
 		// that will not happen.
-		if verdict, err := p.checkLogo(ctx, want); verdict == logoBroken {
+		verdict, shape, err := p.checkLogo(ctx, want)
+		if verdict == logoBroken {
 			if live != "" {
 				return nil, []string{fmt.Sprintf("the icon this spec asks for (%s) is not a servable image (%v), so the one already set is kept", want, err)}
 			}
 			return nil, []string{fmt.Sprintf("the icon this spec asks for (%s) is not a servable image (%v), so none is written — the launcher shows the service's initials", want, err)}
 		}
-		return []string{fmt.Sprintf("logo is %q, spec wants %q", live, want)}, nil
+		// Drift, plus — separately — what the operator is about to get. The
+		// shape is a note and never part of the drift: it is not a reason to
+		// write and not a reason not to, so folding it in would have the plan
+		// report an update it would still report once the update had landed.
+		return []string{fmt.Sprintf("logo is %q, spec wants %q", live, want)}, appendShapeNote(nil, shape, want)
 	}
-	// Same URL on both sides — but is it serving?
-	switch verdict, err := p.checkLogo(ctx, live); verdict {
+	// Same URL on both sides — but is it serving, and will it survive the tile?
+	switch verdict, shape, err := p.checkLogo(ctx, live); verdict {
 	case logoBroken:
 		return []string{fmt.Sprintf("logo url is set correctly but is not a servable image (%v) — the launcher is showing initials", err)}, nil
 	case logoUnknown:
 		return nil, []string{fmt.Sprintf("logo could not be checked (%v)", err)}
+	default:
+		// The steady state, and the one this check is for: a spin-up that is
+		// otherwise entirely `ok` is where a cropped tile would otherwise go on
+		// being invisible for ever. A note keeps the step ok.
+		return nil, appendShapeNote(nil, shape, live)
 	}
-	return nil, nil
 }
 
 // policyVerdict is what an application's policy list says about the members
@@ -851,6 +877,111 @@ const (
 	logoUnknown
 )
 
+// The band a launcher mark has to sit in to survive a square tile, as width ÷
+// height. 0.8 is 1/1.25 rather than a second judgement: Cloudflare's tile is
+// square, so a portrait mark is cropped exactly as badly as a landscape one and
+// the band has to be symmetric in the ratio.
+//
+// The width was chosen from the marks that exist. Placard's registry publishes
+// switchyard at 0.94:1 and lyceum and placard at 1.00:1, so ±25% clears every
+// real mark with room for a designer to letterbox a glyph slightly rather than
+// crop it. Argosy's — the one this check exists for — was 1169×512, or 2.28:1,
+// which is not a near miss in anybody's reading.
+//
+// Deliberately generous. The penalty for a false positive is one line of noise
+// in a plan; the penalty for a false negative is a cropped tile nobody notices
+// for months, which is the failure this whole section keeps meeting.
+const (
+	minLogoAspect = 0.8
+	maxLogoAspect = 1.25
+)
+
+// logoSniffLimit bounds how much of an image is read to find its dimensions.
+// A PNG's IHDR is the first ~24 bytes; a JPEG's SOF can be further in but never
+// this far. The body is discarded past this either way.
+const logoSniffLimit = 64 << 10
+
+// logoShape is a fetched mark's pixel dimensions, zero when they could not be
+// read.
+//
+// It is the third variant of one failure this package keeps meeting, and it is
+// worth naming all three together because each defeats the check before it:
+//
+//   - A stored logo_url can be a lie. Cloudflare validates nothing and the
+//     launcher falls back to two grey initials, so a wrong URL is
+//     indistinguishable from an unset one — answered by checkLogo's sessionless
+//     fetch (PRSR-29).
+//   - A working URL is not a correct one. Argosy's old mark answered 200
+//     image/png and was the 3.6:1 wordmark, illegible at tile size. No fetch can
+//     tell that from the tile mark — answered by asking Placard which asset is
+//     the tile asset (PRSR-37).
+//   - A correct URL is not a correctly-shaped asset. Placard's canonical argosy
+//     mark was 1169×512, and Cloudflare's App Launcher tile is square and
+//     *fills* rather than fits, so it cropped the outer ships off the glyph.
+//     Placard's own page fits, so the same file looked right there and wrong in
+//     the launcher, with nothing anywhere reporting a problem (PRSR-43).
+//
+// The asymmetry with the two above is that this one is never grounds for an
+// update and never grounds for a failure. Purser knows the *surface* — that the
+// tile is square is a fact about Cloudflare, and this is the package that talks
+// to Cloudflare — so it is the last place that can say so cheaply; but a
+// letterboxed icon still beats two grey initials, and a gated application is a
+// DNS prerequisite, so refusing here would leave a service unpublished over an
+// icon. It reports and writes anyway. Fixing the asset is Placard's job
+// (placard#6 padded argosy's viewBox to 1:1 rather than cropping tight).
+type logoShape struct{ w, h int }
+
+// measured reports whether dimensions were actually read. False for an SVG, for
+// a format no registered decoder knows, and for a body that ended before the
+// header did — all of which are "we could not tell", which this file never
+// executes as an answer.
+func (s logoShape) measured() bool { return s.w > 0 && s.h > 0 }
+
+// squarish reports whether the mark survives a square tile. Ask measured()
+// first: an unmeasured shape is neither squarish nor off-square, and reading
+// this alone would report every SVG as badly proportioned.
+func (s logoShape) squarish() bool {
+	if !s.measured() {
+		return false
+	}
+	r := float64(s.w) / float64(s.h)
+	return r >= minLogoAspect && r <= maxLogoAspect
+}
+
+// aspect renders the ratio the way somebody would say it aloud — "2.28:1" for a
+// wide mark, "1:2.28" for a tall one — so the number is always the long side
+// and the colon says which way round it is.
+func (s logoShape) aspect() string {
+	if s.w >= s.h {
+		return fmt.Sprintf("%.2f:1", float64(s.w)/float64(s.h))
+	}
+	return fmt.Sprintf("1:%.2f", float64(s.h)/float64(s.w))
+}
+
+// note is the sentence the plan prints about this mark's proportions, empty when
+// there is nothing to say.
+//
+// Empty for a squarish mark and empty for an unmeasured one, which is the only
+// place in this file where those two collapse — and they collapse safely,
+// because "say nothing" is the whole of what either outcome does. Nothing
+// downstream branches on it, so an SVG cannot be mistaken for a square PNG by
+// anything that reads this.
+func (s logoShape) note(url string) string {
+	if !s.measured() || s.squarish() {
+		return ""
+	}
+	return fmt.Sprintf("the mark at %s is %d×%d (%s) and Cloudflare's launcher tile is square and fills rather than fits, so it will be cropped to its centre — the icon is still written, and the fix is a squarer asset",
+		url, s.w, s.h, s.aspect())
+}
+
+// appendShapeNote adds shape's note about url to notes, if it has one.
+func appendShapeNote(notes []string, shape logoShape, url string) []string {
+	if n := shape.note(url); n != "" {
+		return append(notes, n)
+	}
+	return notes
+}
+
 // logoSource says what kind of answer wantedLogo produced. Three values, for the
 // reason logoVerdict has three and policyVerdict has three: "use this url",
 // "remove the icon" and "we could not work out what the icon should be" want
@@ -906,28 +1037,35 @@ func (p *AccessProvisioner) wantedLogo(ctx context.Context, spec spinup.ServiceS
 	}
 }
 
-// checkLogo fetches the URL and classifies it.
+// checkLogo fetches the URL and classifies it, and measures it on the way past.
 //
 // GET rather than HEAD: HEAD is not universally implemented, and a 405 would
-// read as a broken asset. The body is read only far enough to release the
-// connection — the status and content type are the whole answer.
+// read as a broken asset. The body was already being read far enough to release
+// the connection, so the dimensions come out of the response this call was
+// making anyway — no second request, and no reason for the plan and the apply to
+// disagree about the shape any more than they do about the status.
 //
 // No credentials are sent, deliberately. The launcher renders this as an <img>
 // in the *viewer's* browser, so the only check that means anything is the one
 // made as the sessionless public. An asset behind an Access gate answers with an
 // HTML login page, which is a 200 — the content-type test is what catches it.
-func (p *AccessProvisioner) checkLogo(ctx context.Context, url string) (logoVerdict, error) {
+//
+// The shape is only ever read alongside logoOK. A broken or unfetchable asset
+// has no meaningful dimensions, and reporting the proportions of something that
+// 404s would be the same category error as reporting that an unreadable policy
+// list does not admit the group.
+func (p *AccessProvisioner) checkLogo(ctx context.Context, url string) (logoVerdict, logoShape, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		// Not a URL that can ever be fetched. Definite.
-		return logoBroken, fmt.Errorf("not a fetchable url: %w", err)
+		return logoBroken, logoShape{}, fmt.Errorf("not a fetchable url: %w", err)
 	}
 	req.Header.Set("Accept", "image/*")
 	resp, err := p.logo.Do(req)
 	if err != nil {
 		// Transport-level: refused, timed out, TLS, DNS. Nothing was learned
 		// about the asset.
-		return logoUnknown, err
+		return logoUnknown, logoShape{}, err
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
@@ -936,15 +1074,35 @@ func (p *AccessProvisioner) checkLogo(ctx context.Context, url string) (logoVerd
 	switch {
 	case resp.StatusCode >= 500:
 		// The origin is unwell, which is not the same as the asset being wrong.
-		return logoUnknown, fmt.Errorf("http %d", resp.StatusCode)
+		return logoUnknown, logoShape{}, fmt.Errorf("http %d", resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
-		return logoBroken, fmt.Errorf("http %d", resp.StatusCode)
+		return logoBroken, logoShape{}, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	ct := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
 	if !strings.HasPrefix(ct, "image/") {
-		return logoBroken, fmt.Errorf("content-type is %q, not an image", resp.Header.Get("Content-Type"))
+		return logoBroken, logoShape{}, fmt.Errorf("content-type is %q, not an image", resp.Header.Get("Content-Type"))
 	}
-	return logoOK, nil
+	return logoOK, measure(resp.Body), nil
+}
+
+// measure reads an image's dimensions from the front of its body.
+//
+// Sniffs the format from the bytes rather than from Content-Type, which is what
+// makes "we could not tell" honest: a header claiming image/png over an SVG, a
+// truncated response, or a format nothing here decodes all fail to decode and
+// come back unmeasured, which prints nothing. The alternative — inferring from
+// the declared type — would report a shape for a file it never read.
+//
+// A decode error is discarded rather than returned. There is exactly one
+// consumer, logoShape.note, and it treats unmeasured and squarish alike; handing
+// a caller an error it must remember to ignore is the modifier-beside-a-status
+// shape PRSR-21 removed from the person axis.
+func measure(body io.Reader) logoShape {
+	cfg, _, err := image.DecodeConfig(bufio.NewReader(io.LimitReader(body, logoSniffLimit)))
+	if err != nil {
+		return logoShape{}
+	}
+	return logoShape{w: cfg.Width, h: cfg.Height}
 }
 
 // resolveLogo decides what to write into logo_url, given what the spec wants and
@@ -987,10 +1145,13 @@ func (p *AccessProvisioner) resolveLogo(ctx context.Context, spec spinup.Service
 		return current, note
 	}
 
-	verdict, err := p.checkLogo(ctx, want)
+	verdict, shape, err := p.checkLogo(ctx, want)
 	switch verdict {
 	case logoOK:
-		return want, ""
+		// Written regardless of its proportions — the note says so in as many
+		// words, because a line reporting a problem next to a line reporting a
+		// write invites the reading that the write was withheld.
+		return want, shape.note(want)
 	case logoBroken:
 		// `current != want` is the whole of the condition this keep was reasoned
 		// about, and leaving it off made the fix over-broad by exactly one case.

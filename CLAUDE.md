@@ -752,6 +752,38 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   Placard reports where a file *would* live — so reading the URL without reading
   the state writes a guaranteed 404, which is the exact condition switchyard's
   tile was in.
+- **A correct URL is not a correctly-shaped asset** (PRSR-43). Third variant of
+  one failure, and each defeats the check before it: a stored `logo_url` can be a
+  lie (answered by the fetch, PRSR-29); a *working* URL can be the wrong asset
+  (answered by asking Placard which one is the tile mark, PRSR-37); and a
+  *correct* URL can be the right asset in the wrong proportions. Placard's
+  canonical argosy mark was 1169×512 — the only non-square one in the repo,
+  against 0.94:1 for switchyard and 1.00:1 for lyceum and placard — and
+  Cloudflare's App Launcher tile is square and **fills** rather than fits, so it
+  cropped the outer ships off the glyph. Placard's own page *fits*, so the same
+  file looked right there and wrong in the launcher, with nothing anywhere
+  reporting a problem.
+  `checkLogo` reads the dimensions off the response it was already making —
+  `measure` sniffs the format from the bytes rather than trusting `Content-Type`,
+  so a header that lies produces no measurement instead of a wrong one — and
+  `logoShape.note` prints when width ÷ height leaves 0.8–1.25. That band is
+  symmetric because the tile has no preference about which way a mark is wrong;
+  0.8 is `1/1.25` and `TestLogoShape_TheBandIsSymmetric` says so rather than
+  leaving it to look like a second judgement.
+  **It is emphatically not a fourth outcome of `logoVerdict`.** It is never
+  drift, because there is nothing `--apply` could write that would fix it — a
+  plan calling it drift would promise an update that changes nothing, for ever —
+  and never fatal, because a gated app is a DNS prerequisite and a letterboxed
+  icon still beats two grey initials. The icon is written and the plan says what
+  the tile will do to it. An **unmeasured** mark (an SVG, a truncated body, a
+  format nothing decodes) reports nothing: never treat unmeasurable as bad, which
+  is `logoUnknown`'s rule one field over. Fixing the asset is Placard's job —
+  placard#6 padded argosy's viewBox to 1:1 rather than cropping tight; **an
+  aspect check in Placard's own `checker` would guard the estate at the authoring
+  end and has not been done.**
+  The reason it belongs here *as well* is that Purser knows the **surface**. That
+  the tile is square is a fact about Cloudflare, this is the package that talks to
+  Cloudflare, and this is the last point before the URL is written.
 - **The Access teardown confirms absence by reading, not by an error code.**
   `dnsRecordNotFound` works because 81044 was observed; there is no observed
   Access equivalent, and the rule above forbids guessing one. So a failed delete
@@ -1091,6 +1123,14 @@ cannot see.
 **PRSR-41 was found by running the binary** — the third time on this axis that
 has caught something reading could not (PRSR-31's outcome line, PRSR-38's
 fixture, and now this), and it is fixed. See the invariant above.
+
+**PRSR-43** closed the loop PRSR-37 opened, and was found by *looking at the
+launcher* after the repoint landed: argosy's tile was still wrong, because
+Placard's canonical mark was 1169×512 and the tile is square and fills. The
+shape is now measured off the fetch `checkLogo` already makes and reported as a
+note — never drift, never fatal. The Placard-side half the ticket calls "worth
+doing on the same trip" — an aspect check in its own `checker`, which would
+catch a bad mark at authoring time for every consumer — is **not done**.
 
 **PRSR-36** asked for two Cloudflare response shapes that PRSR-28's fixes were
 reasoning about from the published schema rather than from a response anybody
