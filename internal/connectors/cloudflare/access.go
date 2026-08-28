@@ -897,8 +897,14 @@ const (
 )
 
 // logoSniffLimit bounds how much of an image is read to find its dimensions.
-// A PNG's IHDR is the first ~24 bytes; a JPEG's SOF can be further in but never
-// this far. The body is discarded past this either way.
+//
+// A budget, not a proof. A PNG's IHDR is the first ~24 bytes, which is the case
+// that matters — Placard publishes PNG. A JPEG's SOF sits behind whatever
+// metadata precedes it, and that is not bounded by anything: an embedded ICC
+// profile is split across APP2 segments of up to ~64KB each, and an EXIF APP1
+// can be ~64KB on its own, so a JPEG whose header lies past this limit is
+// entirely constructible. Such a file measures as logoShape{} and prints
+// nothing, which is the safe direction and the same answer an SVG gets.
 const logoSniffLimit = 64 << 10
 
 // logoShape is a fetched mark's pixel dimensions, zero when they could not be
@@ -1142,6 +1148,22 @@ func (p *AccessProvisioner) resolveLogo(ctx context.Context, spec spinup.Service
 		// and a slug Placard has never been given a mark for. On a create there
 		// is nothing to carry and this is the empty string, which is the honest
 		// rendering of "no icon yet": the launcher shows the initials.
+		//
+		// The tile being carried forward is still measured, because logoDiff
+		// measures it on this same branch and the two must not say different
+		// things about the same URL. Nothing is decided by it — the value
+		// written is `current` either way — so this is the apply's account
+		// catching up with the preview's, not a second decision. It is also the
+		// only branch where the shape has no other route to an operator: a spec
+		// that resolves nothing produces no drift line, so an --apply's Detail
+		// is the last thing that could mention it.
+		if current != "" {
+			if verdict, shape, _ := p.checkLogo(ctx, current); verdict == logoOK {
+				if n := shape.note(current); n != "" {
+					note = joinNote(note, n)
+				}
+			}
+		}
 		return current, note
 	}
 

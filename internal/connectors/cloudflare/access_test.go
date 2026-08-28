@@ -2236,3 +2236,30 @@ func TestInspect_AnUnresolvedLogoStillReportsTheLiveMarksShape(t *testing.T) {
 		t.Errorf("the live mark's shape should still be reported, got %q", st.Detail)
 	}
 }
+
+// The apply says what the plan said. `logoDiff` measures the live mark on the
+// keep branch (TestInspect_AnUnresolvedLogoStillReportsTheLiveMarksShape); so
+// must `resolveLogo`, or an operator who runs --apply and reads its output
+// learns less than one who read the plan — and on this branch there is no drift
+// line, so the apply's Detail is the last thing that could mention it.
+func TestEnsure_AnUnresolvedLogoStillReportsTheLiveMarksShape(t *testing.T) {
+	srv := imageServer(t, "image/png", pngOfSize(t, 1169, 512))
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(srv.URL)}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: srv.Client()})
+
+	res, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, string(spinup.LogoPlacard))})
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	// Unchanged, which is the point: nothing was resolved, so the tile is
+	// carried forward exactly as it was and only the account of it changes.
+	if got := api.lastBody["logo_url"]; got != srv.URL {
+		t.Fatalf("the live tile must be carried forward, want %q, got %v", srv.URL, got)
+	}
+	if !strings.Contains(res.Detail, "could not be asked") && !strings.Contains(res.Detail, "not set") {
+		t.Errorf("the keep note should survive, got %q", res.Detail)
+	}
+	if !strings.Contains(res.Detail, "cropped") {
+		t.Errorf("the apply should report the shape the plan reported, got %q", res.Detail)
+	}
+}

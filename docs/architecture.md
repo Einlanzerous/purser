@@ -995,7 +995,10 @@ an envelope is the one nobody will think to re-check.
   It belongs here as well as in Placard because Purser knows the **surface**:
   that the tile is square is a fact about Cloudflare, and this is the last point
   before the URL is written. The authoring-end half — an aspect check in
-  Placard's own `checker` — is still open.
+  Placard's own `checker`, which would catch a bad mark once for every consumer
+  rather than one at a time at the point of use — is **PRSR-44**, and open. It
+  has a key rather than a sentence here because this project has twice lost the
+  remaining half of a piece of work by closing the ticket that described it.
 - ~~**PRSR-41 — `findApp` matched on hostname alone.**~~ **Fixed, 2026-08-26.**
   Two applications serve `switchyard.zerogravity.industries`: the service, and a
   path-scoped one on `/v1/external/github` whose only policy is `decision:
@@ -1092,6 +1095,9 @@ an envelope is the one nobody will think to re-check.
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod
   Access group.
+- **PRSR-44** — the aspect check in Placard's own `checker`, PRSR-43's
+  authoring-end half. Purser reports a mark a square tile will crop; Placard is
+  where a bad mark could be caught before any consumer points at it.
 - **PRSR-34** — orchestrating `Teardown`. The interface method exists and the
   resource table exists to give it concrete ids to target rather than a hostname
   to guess from, but nothing walks it. Its ordering is almost certainly the

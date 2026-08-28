@@ -778,9 +778,11 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   the tile will do to it. An **unmeasured** mark (an SVG, a truncated body, a
   format nothing decodes) reports nothing: never treat unmeasurable as bad, which
   is `logoUnknown`'s rule one field over. Fixing the asset is Placard's job —
-  placard#6 padded argosy's viewBox to 1:1 rather than cropping tight; **an
-  aspect check in Placard's own `checker` would guard the estate at the authoring
-  end and has not been done.**
+  placard#6 padded argosy's viewBox to 1:1 rather than cropping tight; **the
+  authoring-end guard, an aspect check in Placard's own `checker`, is
+  PRSR-44** and is not done. It has a key rather than this sentence for the
+  reason `Teardown` does: prose in the repo that isn't going to do the work,
+  attached to a ticket about to close, is how the remaining half gets lost.
   The reason it belongs here *as well* is that Purser knows the **surface**. That
   the tile is square is a fact about Cloudflare, this is the package that talks to
   Cloudflare, and this is the last point before the URL is written.
@@ -1114,9 +1116,10 @@ that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
 spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
 the `Teardown` walk — its orchestration, that is; the Access provisioner's own
 `Teardown` has now run live (PRSR-40), so what is left there is the ordering and
-the "is this hostname still someone's?" question. **PRSR-36**, **PRSR-37**,
-**PRSR-39** and **PRSR-40** are all closed — PRSR-39 built the zone pre-flight
-that PRSR-38's probe showed was available all along, and left the
+the "is this hostname still someone's?" question. **PRSR-44** is PRSR-43's
+authoring-end half — the aspect check in Placard's own checker. **PRSR-36**,
+**PRSR-37**, **PRSR-39** and **PRSR-40** are all closed — PRSR-39 built the zone
+pre-flight that PRSR-38's probe showed was available all along, and left the
 create-then-delete in place behind it as the backstop for the case a pre-flight
 cannot see.
 
@@ -1130,7 +1133,8 @@ Placard's canonical mark was 1169×512 and the tile is square and fills. The
 shape is now measured off the fetch `checkLogo` already makes and reported as a
 note — never drift, never fatal. The Placard-side half the ticket calls "worth
 doing on the same trip" — an aspect check in its own `checker`, which would
-catch a bad mark at authoring time for every consumer — is **not done**.
+catch a bad mark at authoring time for every consumer — is **not done, and is
+PRSR-44**.
 
 **PRSR-36** asked for two Cloudflare response shapes that PRSR-28's fixes were
 reasoning about from the published schema rather than from a response anybody
