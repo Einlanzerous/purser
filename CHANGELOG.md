@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.0](https://github.com/Einlanzerous/purser/compare/v0.16.0...v0.17.0) (2026-08-28)
+
+
+### Features
+
+* **cfaccess:** report a launcher mark that a square tile will crop (PRSR-43) ([#54](https://github.com/Einlanzerous/purser/issues/54)) ([c2a8a7f](https://github.com/Einlanzerous/purser/commit/c2a8a7f834022a69d2b0b245ef748d41ca25801e))
+* **cfdns:** refuse an out-of-zone hostname before creating anything (PRSR-39) ([#53](https://github.com/Einlanzerous/purser/issues/53)) ([6e6d4f5](https://github.com/Einlanzerous/purser/commit/6e6d4f5d19ebe524d4f18d29d58e7dd0b0e4e5b0))
+
 ## [0.16.0](https://github.com/Einlanzerous/purser/compare/v0.15.0...v0.16.0) (2026-08-26)
 
 
