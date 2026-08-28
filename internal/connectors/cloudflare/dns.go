@@ -367,10 +367,12 @@ func (p *DNSProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Re
 //     an out-of-zone hostname in the *plan*, before anything exists to delete.
 //     That is PRSR-39.
 //   - "only the records in it, which carry its name" — also false, and PRSR-42
-//     measured it: neither a create response nor a GET carries `zone_name` or
-//     `zone_id` on this API version. dnsRecord decodes both and both are always
-//     empty, so the branch below that names the zone never fires and the
-//     "configured zone" fallback is the only text this ever prints.
+//     measured it on all three routes this package reads records from: a create
+//     response, a get-by-id, and the **list** that records() uses on every
+//     Inspect. None carries `zone_name` or `zone_id` on this API version.
+//     dnsRecord decodes both and both are always empty, so the branch below that
+//     names the zone never fires and the "configured zone" fallback is the only
+//     text this ever prints.
 //
 // The check stays regardless, and the reason is unchanged by either correction:
 // it catches a normalisation surprise a pre-flight cannot predict, and it is the
@@ -619,15 +621,16 @@ func (p *DNSProvisioner) resource(r dnsRecord) spinup.Resource {
 	return spinup.Resource{ExternalID: r.ID, ParentID: p.zoneOf(r), Detail: describeRecord(r)}
 }
 
-// zoneOf prefers the zone Cloudflare reported over the configured one, so the
-// recorded parent describes where the record actually is.
 // zoneOf is the zone a record lives in — the record's own, falling back to the
 // configured one.
 //
-// In practice always the fallback: PRSR-42 measured that neither a create
-// response nor a GET carries `zone_id` on this API version, so r.ZoneID is
-// invariably empty. That is why the stray-removal path works at all, and it is
-// worth knowing before anyone reads the first operand as load-bearing.
+// In practice always the fallback. PRSR-42 measured all three routes this
+// package reads records from — create, get-by-id, and the **list** that records()
+// uses on every Inspect — and none carries `zone_id` on this API version, so
+// r.ZoneID is invariably empty. That is why the stray-removal path works at all,
+// and it is worth knowing before anyone reads the first operand as load-bearing:
+// the sentence that stood here said zoneOf "prefers the zone Cloudflare
+// reported", which is exactly the misreading.
 func (p *DNSProvisioner) zoneOf(r dnsRecord) string {
 	return firstNonEmpty(r.ZoneID, p.cfg.ZoneID)
 }

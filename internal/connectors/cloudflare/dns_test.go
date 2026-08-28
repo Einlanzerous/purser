@@ -950,9 +950,14 @@ func TestDNS_Teardown_UnroutableRequestIsNotAbsence(t *testing.T) {
 // A record as the live API actually returns it carries no zone fields, and the
 // code paths that read them fall back correctly.
 //
-// PRSR-42 measured the responses: neither a create nor a GET populates
-// `zone_id` or `zone_name`. dnsRecord decodes both, so both are always empty in
-// production, and two call sites read them:
+// PRSR-42 measured all three routes this package reads records from — a create,
+// a get-by-id, and the **list** that records() uses on every Inspect. None
+// populates `zone_id` or `zone_name`. The list matters most and was the one
+// review caught me generalising past: it is what every plan and every --apply
+// calls, so it is the response resource() and zoneOf() actually see.
+//
+// dnsRecord decodes both fields, so both are always empty in production, and two
+// call sites read them:
 //
 //   - zoneOf, whose first operand is therefore never taken. The stray-removal
 //     path depends on the fallback, which is why it works at all.
@@ -977,16 +982,45 @@ func TestDNS_RealResponsesCarryNoZoneFields(t *testing.T) {
 		"comment":null,"tags":[],"meta":{},"proxiable":true,"settings":{}
 	},"success":true,"errors":[],"messages":[]}`
 
+	// And the key set observed on a live LIST response — the route records()
+	// uses. Note `comment_modified_on`, which the create response does not carry:
+	// the two routes are not the same shape, which is the reason to pin both.
+	const liveList = `{"result":[{
+		"id":"c1a0b1e2d3f4a5b6c7d8e9f0a1b2c3d4",
+		"type":"CNAME",
+		"name":"lyceum.zerogravity.industries",
+		"content":"aef21667-03ce-45d3-b83c-d634822661cd.cfargotunnel.com",
+		"proxied":true,
+		"ttl":1,
+		"created_on":"2026-07-20T15:03:32Z",
+		"modified_on":"2026-07-20T15:03:32Z",
+		"comment":null,"comment_modified_on":null,
+		"tags":[],"meta":{},"proxiable":true,"settings":{}
+	}],"success":true,"errors":[],"messages":[]}`
+
 	var env struct {
 		Result dnsRecord `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(liveCreate), &env); err != nil {
-		t.Fatalf("decode: %v", err)
+		t.Fatalf("decode create: %v", err)
 	}
 	got := env.Result
 
 	if got.ZoneID != "" || got.ZoneName != "" {
-		t.Fatalf("the live API sends neither zone field; fixture drift: zone_id=%q zone_name=%q", got.ZoneID, got.ZoneName)
+		t.Fatalf("the live create sends neither zone field; fixture drift: zone_id=%q zone_name=%q", got.ZoneID, got.ZoneName)
+	}
+
+	var listEnv struct {
+		Result []dnsRecord `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(liveList), &listEnv); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(listEnv.Result) != 1 {
+		t.Fatalf("list decoded %d records", len(listEnv.Result))
+	}
+	if l := listEnv.Result[0]; l.ZoneID != "" || l.ZoneName != "" {
+		t.Errorf("the live list sends neither zone field either; this is the route every Inspect reads: zone_id=%q zone_name=%q", l.ZoneID, l.ZoneName)
 	}
 
 	// zoneOf must therefore reach the configured zone, which is what makes

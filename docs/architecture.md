@@ -795,10 +795,17 @@ What it decides, and why:
 - **A hostname outside the zone is caught after the write.** Cloudflare treats
   such a name as *relative* and silently appends the zone, producing
   `svc.example.org.zerogravity.industries`. `ServiceSpec` can't catch it (it
-  validates the shape of a hostname, not which zone the token points at), and a
-  token scoped to Zone → DNS → Edit cannot read the zone object to find out
-  beforehand — so the created record is checked and removed when its name is
-  wrong.
+  validates the shape of a hostname, not which zone the token points at) — so the
+  created record is checked and removed when its name is wrong.
+
+  This paragraph used to justify checking *afterwards* by saying a token scoped
+  to Zone → DNS → Edit "cannot read the zone object to find out beforehand".
+  That is false: PRSR-38 found the production token answers `GET /zones` with
+  exactly `["zerogravity.industries"]`, so a pre-flight is available and would
+  refuse an out-of-zone hostname in the plan, before anything exists to delete —
+  **PRSR-39**. The create-then-delete stays regardless, as the backstop for a
+  normalisation surprise a pre-flight cannot predict, and it is the half that has
+  actually been exercised (PRSR-42 ran it end to end).
 - **Teardown targets the recorded id** and refuses without one, confirms the id
   still names this hostname before deleting, and treats an already-absent record
   as success — where "absent" means Cloudflare's record code (81044) and *not* a
