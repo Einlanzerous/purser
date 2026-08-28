@@ -261,15 +261,42 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   That is why the Makefile strips the `v` off `git describe`, and why `Get()`
   reports verbatim instead of sanitising: a prefix is a bug in the *build*, and
   silently stripping it at the reporter hides it from the only place it shows.
-- **`VERSION` is passed only on a tag build.** On a push to main
-  `steps.meta.outputs.version` is the literal `latest` — a moving target, and
-  storing it as an identity means comparing it against the image label and
-  disagreeing for ever. `publish.yml` passes blank there instead, which maps to
-  `dev`. `GIT_SHA` goes on **both** paths: a main build has a real commit and
+- **`VERSION` is passed only on a tag that carries a version**, and it is the
+  same condition that decides whether the image gets a version *label* — that
+  equivalence is the invariant, not the tag list it happens to produce.
+  `publish.yml`'s `ver` step resolves one output, `stamp`, and both the binary
+  (`build-args: VERSION`) and the label (`type=semver`) key off it, so /healthz
+  and `org.opencontainers.image.version` agree by construction rather than by
+  two conditions being kept in step by hand. A push to main yields blank, which
+  maps to `dev`.
+  **Never stamp `steps.meta.outputs.version`.** That output is only the
+  highest-*priority* tag that matched, so it silently becomes `latest` or
+  `sha-<short>` depending on which entries fired, and storing a moving tag as an
+  identity means comparing it against the label and disagreeing for ever. It was
+  read here until SERV-108.
+  A prerelease is stamped for exactly this reason: `type=semver` matches
+  `v0.17.0-rc.1` and labels the image `0.17.0-rc.1`, so refusing to stamp it
+  would put `dev` in a binary inside an image the ledger reads as versioned.
+  `GIT_SHA` goes on **both** paths: a main build has a real commit and
   should say so, it just has no release to name. The sha is the full 40
   characters, because the cross-service comparison is an equality test and not
   a prefix match, and an absent one marshals to JSON `null` rather than `""` —
   "recorded no commit" is a different claim from "built at the empty commit".
+- **`:latest` is main's tip, and has exactly one writer** (SERV-108).
+  `flavor: latest=false` is load-bearing: `docker/metadata-action` defaults to
+  `latest=auto`, which emits `:latest` on any `type=semver` match *independently*
+  of the `type=raw` entry — so a release commit published `:latest` twice, from
+  its push to main and from its tag build, and whichever runner finished last
+  won. On 2026-08-28 the main build won `v0.16.0` by 30 seconds, leaving
+  `:latest` labelled `version=latest` with a binary reporting `dev`.
+  construct-server's dev tier pins `latest`, so that coin flip decided what dev
+  purser claimed to be.
+  **The estate has not settled which way `:latest` should point.** Lyceum fixed
+  the identical race the other way (LYCM-121): there `:latest` means the last
+  release and main gets only `:sha-<short>`. Both are internally consistent and
+  they cannot both be right while dev pins `latest` for every service and is
+  supposed to run what just merged. Tracked as an open decision on SERV-108 —
+  check it before changing this file's `enable=` conditions.
 - **The Makefile's `dev` fallback lives inside the subshell, before the pipe.**
   `git describe ... | sed 's/^v//' || echo dev` never fires: `||` binds to the
   *pipeline*, whose status is `sed`'s, and `sed` exits 0 on empty input. An

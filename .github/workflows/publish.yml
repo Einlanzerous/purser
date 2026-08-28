@@ -12,6 +12,16 @@ permissions:
   contents: read
   packages: write
 
+# `:latest` has one writer after this file's `flavor: latest=false`, but one writer
+# is not an ordering. Merge two PRs a minute apart and both main builds run: layer
+# caching makes finish order independent of start order, so the older commit's run
+# can finish last and overwrite :latest with the older image. Dev pulls :latest, and
+# nothing anywhere goes red. Queue instead — `cancel-in-progress: false`, because a
+# cancelled run can have already pushed some of its tags.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   image:
     runs-on: ubuntu-latest
@@ -24,21 +34,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: ver
-        # Resolve the release version ONCE, from the ref, and validate it.
-        # Lifted from lyceum's publish.yml (LYCM-121), which hit the two-writer
-        # bug below first; the shape is deliberately identical so the two files
-        # can be diffed.
+        # Resolve, ONCE and from the ref, the version this build may claim.
+        # Adapted from lyceum's publish.yml (LYCM-121), which hit the two-writer
+        # bug below first.
+        #
+        # `stamp` is the version `type=semver` below will put in the image's
+        # `org.opencontainers.image.version` label, or the empty string when
+        # there will be no such label. That equivalence is the whole point: the
+        # binary is stamped from this and the label comes from the same
+        # condition, so /healthz and the label agree by construction. CLAUDE.md's
+        # PRSR-32 rule compares them with STRICT EQUALITY, and a disagreement is
+        # a permanently unresolvable row in the delivery ledger.
         #
         # `on.push.tags: ["v*"]` accepts more than releases, so `ref_type ==
-        # 'tag'` is NOT the same test as "this is a release":
+        # 'tag'` is not the same test as "this has a version":
         #
-        #   v0.16.0        -> 0.16.0   a release. Semver tags, stamped binary.
-        #   v0.17.0-rc.1   -> ""       prerelease. Gets its own semver image
-        #                              tag, but claims no release identity.
-        #   vnext          -> ""       not semver at all.
+        #   (push to main)  -> ""              no version to claim -> `dev`
+        #   v0.16.0         -> 0.16.0          a release
+        #   v0.17.0-rc.1    -> 0.17.0-rc.1     prerelease. type=semver DOES match
+        #                                      and labels the image, so the
+        #                                      binary must say the same thing.
+        #                                      Rejecting it here would stamp
+        #                                      `dev` into an image labelled
+        #                                      0.17.0-rc.1 — the exact
+        #                                      disagreement above.
+        #   vnext           -> ""              not semver; type=semver does not
+        #                                      match, so there is no label to
+        #                                      agree with.
         #
-        # release-please cuts neither of the last two today, but the failure
-        # they produce is silent and permanent, and the guard is four lines.
+        # release-please cuts neither of the last two today, but the failure they
+        # produce is silent and permanent, and the guard is a few lines.
         #
         # Inputs arrive by env, not by ${{ }} interpolation into the script: a
         # run block that pastes a ref name inline executes whatever it contains.
@@ -47,16 +72,23 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          semver=""
+          stamp=""
           if [ "$REF_TYPE" = tag ]; then
             candidate="${REF_NAME#v}"
-            if printf '%s' "$candidate" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-              semver="$candidate"
+            if printf '%s' "$candidate" \
+              | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+              # Build metadata is dropped rather than stamped. A Docker tag cannot
+              # contain `+`, so metadata-action emits `1.2.3` for `v1.2.3+build.5`
+              # — stamping the `+build.5` form would disagree with the label it is
+              # compared against. Stripping keeps the equivalence this step exists
+              # to guarantee. release-please emits no build metadata; this is here
+              # so the regex above cannot match something it then mis-stamps.
+              stamp="${candidate%%+*}"
             else
-              echo "::warning::tag $REF_NAME is not a bare semver; stamping no version"
+              echo "::warning::tag $REF_NAME is not semver; publishing :sha-<short> and stamping no version"
             fi
           fi
-          echo "semver=$semver" >> "$GITHUB_OUTPUT"
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -90,19 +122,21 @@ jobs:
           # track; the estate-wide answer is still open on SERV-108.
           flavor: latest=false
           #
-          # `type=sha` is gated off for a release, and that is the same
-          # two-writer bug wearing a different hat: `type=sha` derives from
-          # `github.sha`, which is the SAME commit in both runs of a release, so
-          # main and tag each wrote :sha-<short> with a different digest and a
-          # different build identity.
+          # `type=sha` is gated off for any tag that carries a version, and that
+          # is the same two-writer bug wearing a different hat: `type=sha`
+          # derives from `github.sha`, which is the SAME commit in both runs of a
+          # release, so main and tag each wrote :sha-<short> with a different
+          # digest and a different build identity.
           #
-          # Gated on `semver == ''` rather than on `ref_type != 'tag'`
+          # Gated on `stamp == ''` rather than on `ref_type != 'tag'`
           # deliberately: the latter leaves a hand-cut `vnext` with NO tags at
           # all (no :latest, no :sha, and type=semver does not match), and
           # build-push-action cannot push an image with an empty tag list.
+          # Keyed off `stamp` it falls out correctly for all four cases — a
+          # versionless tag keeps :sha-<short>, a versioned one does not.
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short,enable=${{ steps.ver.outputs.semver == '' }}
+            type=sha,format=short,enable=${{ steps.ver.outputs.stamp == '' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
       - uses: docker/build-push-action@v6
@@ -114,23 +148,23 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # Build identity for /healthz (PRSR-32) — see deploy/Dockerfile.
           #
-          # VERSION is the VALIDATED semver from the `ver` step, not
+          # VERSION is the validated `stamp` from the `ver` step, not
           # `steps.meta.outputs.version`. That output is just the highest-
           # priority tag that matched, so it silently becomes `latest` or
           # `sha-<short>` depending on which entries above fired — and stamping
           # either into the binary puts a moving tag into the delivery ledger as
-          # an identity. On a push to main it resolves to the empty string,
-          # which `internal/version` maps to "dev".
+          # an identity. On a push to main `stamp` is the empty string, which
+          # `internal/version` maps to "dev".
           #
-          # On a release it is the BARE semver (`0.16.0`), matching the image
-          # label character for character. That agreement is the whole point:
-          # the reconciler observes this string and the deploy reporter reports
-          # the label, and the matrix compares the two as identities.
+          # On a versioned tag it is the BARE semver (`0.16.0`), matching the
+          # image label character for character. That agreement is the whole
+          # point: the reconciler observes this string and the deploy reporter
+          # reports the label, and the matrix compares the two as identities.
           #
           # GIT_SHA is passed on both paths. A main build has a real commit and
           # should say so; it just has no release to name.
           build-args: |
-            VERSION=${{ steps.ver.outputs.semver }}
+            VERSION=${{ steps.ver.outputs.stamp }}
             GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -152,6 +186,14 @@ jobs:
       # one would file this merge against a version it is not. With `version`
       # absent that branch stays off and the run reports whatever it actually
       # moved, which is the honest answer. `image` is the ledger's service name.
+      #
+      # `repo` and `sha` are read by deploy-dev.yml's `run-name` (SERV-108,
+      # construct-server#173), which is what makes a dispatched run say what it
+      # is deploying — the ledger's `sha` reader sits behind the enrichment
+      # branch that `version`'s absence keeps switched off, so without that
+      # run-name these two fields would reach nothing. `repo` is separate from
+      # `image` because they are not the same axis: `image` names the ledger
+      # service and a repo publishing two images would send two of them.
       - name: Mint construct-server dispatch token
         id: dispatch-token
         if: github.ref == 'refs/heads/main'
