@@ -23,13 +23,86 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: ver
+        # Resolve the release version ONCE, from the ref, and validate it.
+        # Lifted from lyceum's publish.yml (LYCM-121), which hit the two-writer
+        # bug below first; the shape is deliberately identical so the two files
+        # can be diffed.
+        #
+        # `on.push.tags: ["v*"]` accepts more than releases, so `ref_type ==
+        # 'tag'` is NOT the same test as "this is a release":
+        #
+        #   v0.16.0        -> 0.16.0   a release. Semver tags, stamped binary.
+        #   v0.17.0-rc.1   -> ""       prerelease. Gets its own semver image
+        #                              tag, but claims no release identity.
+        #   vnext          -> ""       not semver at all.
+        #
+        # release-please cuts neither of the last two today, but the failure
+        # they produce is silent and permanent, and the guard is four lines.
+        #
+        # Inputs arrive by env, not by ${{ }} interpolation into the script: a
+        # run block that pastes a ref name inline executes whatever it contains.
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          semver=""
+          if [ "$REF_TYPE" = tag ]; then
+            candidate="${REF_NAME#v}"
+            if printf '%s' "$candidate" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              semver="$candidate"
+            else
+              echo "::warning::tag $REF_NAME is not a bare semver; stamping no version"
+            fi
+          fi
+          echo "semver=$semver" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/einlanzerous/purser
+          # `latest=false` is load-bearing, not tidying — the same bug LYCM-121
+          # fixed in lyceum, still live here (SERV-108).
+          #
+          # The default is `latest=auto`, which emits :latest BY ITSELF on any
+          # type=semver match, independently of the type=raw entry below. A
+          # release commit is pushed to main AND then tagged, so BOTH runs of
+          # this workflow published :latest — the main build (VERSION blank,
+          # binary reporting `dev`) and the tag build (VERSION the bare semver).
+          # Two runs, two digests, one moving tag, no ordering between them.
+          #
+          # Whichever runner finished last won. construct-server's DEV tier
+          # pulls :latest, so that coin flip decided whether dev purser reported
+          # a real version or the literal string `dev` to the delivery ledger.
+          #
+          # This file's header has always said what the contract is — "main
+          # publishes :latest; release-please tags (v*) publish the semver
+          # tags" — so `latest=auto` was a deviation from the documented
+          # behaviour rather than a second opinion about it. One writer now: the
+          # main build, always.
+          #
+          # NOTE FOR THE ESTATE: lyceum resolved its identical race the OTHER
+          # way, making :latest mean "the last release" and giving main only
+          # :sha-<short>. Both are internally consistent and they cannot both be
+          # right, because construct-server's dev tier pins `latest` for every
+          # service and its job is to run what just merged (SERV-97). Purser is
+          # pointed at main here because that is what SERV-108 asks dev to
+          # track; the estate-wide answer is still open on SERV-108.
+          flavor: latest=false
+          #
+          # `type=sha` is gated off for a release, and that is the same
+          # two-writer bug wearing a different hat: `type=sha` derives from
+          # `github.sha`, which is the SAME commit in both runs of a release, so
+          # main and tag each wrote :sha-<short> with a different digest and a
+          # different build identity.
+          #
+          # Gated on `semver == ''` rather than on `ref_type != 'tag'`
+          # deliberately: the latter leaves a hand-cut `vnext` with NO tags at
+          # all (no :latest, no :sha, and type=semver does not match), and
+          # build-push-action cannot push an image with an empty tag list.
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short
+            type=sha,format=short,enable=${{ steps.ver.outputs.semver == '' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
       - uses: docker/build-push-action@v6
@@ -41,25 +114,66 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # Build identity for /healthz (PRSR-32) — see deploy/Dockerfile.
           #
-          # VERSION is passed ONLY on a tag build. On a push to main
-          # `steps.meta.outputs.version` is `latest`, and `latest` names a
-          # moving target rather than a build: it was already being linked into
-          # the binary before this change and was harmless only because nothing
-          # read it. Now that /healthz reports it, passing it through would have
-          # purser claim to run a version called "latest" — stored as an
-          # identity, compared against the image label, disagreeing for ever.
-          # Blank instead, which `internal/version` maps to "dev".
+          # VERSION is the VALIDATED semver from the `ver` step, not
+          # `steps.meta.outputs.version`. That output is just the highest-
+          # priority tag that matched, so it silently becomes `latest` or
+          # `sha-<short>` depending on which entries above fired — and stamping
+          # either into the binary puts a moving tag into the delivery ledger as
+          # an identity. On a push to main it resolves to the empty string,
+          # which `internal/version` maps to "dev".
           #
-          # On a tag build metadata-action's `version` output is already the
-          # BARE semver (`0.14.0`), matching the image label character for
-          # character. That agreement is the whole point: the reconciler
-          # observes this string and the deploy reporter reports the label, and
-          # the matrix compares the two as identities.
+          # On a release it is the BARE semver (`0.16.0`), matching the image
+          # label character for character. That agreement is the whole point:
+          # the reconciler observes this string and the deploy reporter reports
+          # the label, and the matrix compares the two as identities.
           #
           # GIT_SHA is passed on both paths. A main build has a real commit and
           # should say so; it just has no release to name.
           build-args: |
-            VERSION=${{ github.ref_type == 'tag' && steps.meta.outputs.version || '' }}
+            VERSION=${{ steps.ver.outputs.semver }}
             GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ── Tell construct-server that dev has something new to pull (SERV-108) ──
+      #
+      # Dev's job is to run what just merged, and until now nothing said so: the
+      # only thing that moved dev was an hourly cron in construct-server's
+      # deploy-dev.yml, so a merge took up to an hour to appear and the runner
+      # spent 24 minutes a day asking. This makes it prompt.
+      #
+      # MAIN ONLY, and the condition is the point. A release tag build publishes
+      # no :latest (see `flavor` above), so dev has nothing to pull from one —
+      # a dispatch there would deploy the image dev is already running.
+      #
+      # NO `version` IN THE PAYLOAD, deliberately. construct-server keys its
+      # ledger enrichment on `{image, version}` together and reports a claim
+      # with that provenance; a main build has no release to name, and sending
+      # one would file this merge against a version it is not. With `version`
+      # absent that branch stays off and the run reports whatever it actually
+      # moved, which is the honest answer. `image` is the ledger's service name.
+      - name: Mint construct-server dispatch token
+        id: dispatch-token
+        if: github.ref == 'refs/heads/main'
+        # Short-lived and least-privilege rather than a hand-managed PAT: the
+        # release bot App is already installed on construct-server with
+        # Contents: write, which is what repository_dispatch needs, and the
+        # token minted here is scoped to that one repository. Same pattern as
+        # switchyard's release.yml, whose PAT predecessor kept expiring and
+        # 401'ing the dispatch.
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: Einlanzerous
+          repositories: construct-server
+
+      - name: Notify construct-server
+        if: github.ref == 'refs/heads/main'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: Einlanzerous/construct-server
+          event-type: deploy-dev
+          client-payload: |
+            {"image": "purser", "repo": "purser", "sha": "${{ github.sha }}"}
