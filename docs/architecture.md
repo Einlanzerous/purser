@@ -792,20 +792,33 @@ What it decides, and why:
   the exact match is re-applied locally, but a hundred records back means the
   filter narrowed nothing — and reading page one of the zone as "nothing here"
   creates a duplicate. Unreadable is not absent, here as everywhere.
-- **A hostname outside the zone is caught after the write.** Cloudflare treats
-  such a name as *relative* and silently appends the zone, producing
-  `svc.example.org.zerogravity.industries`. `ServiceSpec` can't catch it (it
-  validates the shape of a hostname, not which zone the token points at) — so the
-  created record is checked and removed when its name is wrong.
+- **A hostname outside the zone is refused before the write, and caught again
+  after it.** Cloudflare treats such a name as *relative* and silently appends
+  the zone, producing `svc.example.org.zerogravity.industries`. `ServiceSpec`
+  can't catch it — it validates the shape of a hostname, not which zone the token
+  points at.
 
-  This paragraph used to justify checking *afterwards* by saying a token scoped
-  to Zone → DNS → Edit "cannot read the zone object to find out beforehand".
-  That is false: PRSR-38 found the production token answers `GET /zones` with
-  exactly `["zerogravity.industries"]`, so a pre-flight is available and would
-  refuse an out-of-zone hostname in the plan, before anything exists to delete —
-  **PRSR-39**. The create-then-delete stays regardless, as the backstop for a
-  normalisation surprise a pre-flight cannot predict, and it is the half that has
-  actually been exercised (PRSR-42 ran it end to end).
+  This paragraph used to justify checking *only afterwards* by saying a token
+  scoped to Zone → DNS → Edit "cannot read the zone object to find out
+  beforehand". That is false: PRSR-38 found the production token answers
+  `GET /zones` with exactly `["zerogravity.industries"]`, and **PRSR-39** built
+  the pre-flight on it. `preflight` resolves `PURSER_CF_ZONE_ID` to the zone name
+  and refuses an out-of-zone hostname on both `Inspect` and `Ensure`, ahead of the
+  record lookup, so the operator sees it in the plan and nothing is ever written.
+  It is `refused` rather than `unknown` — the read succeeded, so re-running
+  changes nothing and only the refusal's message names the actual fix.
+
+  The create-then-delete stays behind it, because the two answer different
+  questions: the pre-flight asks what the *spec* said, `wrongName` asks what
+  *Cloudflare did*. It is therefore still the guard for a normalisation surprise
+  a pre-flight cannot predict, still the half exercised live (PRSR-42 ran it end
+  to end), and the only guard at all in the one state the pre-flight waves
+  through — a zone that could not be read, which is never evidence about the
+  hostname. Only successful zone reads are memoised (one timeout must not
+  disable the check for a whole `purser serve`), a 200 naming no zone counts as
+  a failed read rather than as a zone everything is inside, and the zone name is
+  derived from the id rather than configured beside it, since two settings that
+  can disagree merely relocate the mismatch.
 - **Teardown targets the recorded id** and refuses without one, confirms the id
   still names this hostname before deleting, and treats an already-absent record
   as success — where "absent" means Cloudflare's record code (81044) and *not* a
@@ -1045,9 +1058,9 @@ an envelope is the one nobody will think to re-check.
   echoes back" — the PRSR-38 trap in its inverse direction, a fixture inventing
   what the API withholds, and the third time this package has met that shape.
   `wrongName`'s doc block also still claimed a Zone→DNS→Edit token "cannot read
-  the zone object itself", which PRSR-38 had already disproved (that is PRSR-39).
-  All three claims corrected; the fallbacks kept, since they cost one branch and
-  are what make the paths work.
+  the zone object itself", which PRSR-38 had already disproved and PRSR-39 has
+  since built on. All three claims corrected; the fallbacks kept, since they cost
+  one branch and are what make the paths work.
 - **PRSR-33** — the `dev` tunnel ref, which resolves to a refusal today rather
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod

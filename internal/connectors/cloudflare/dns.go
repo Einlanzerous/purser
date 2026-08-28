@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/Einlanzerous/purser/internal/model"
 	"github.com/Einlanzerous/purser/internal/spinup"
@@ -54,6 +55,14 @@ type DNSConfig struct {
 type DNSProvisioner struct {
 	cfg DNSConfig
 	api *client
+
+	// zoneMu guards zoneName, and is held across the read so a burst of steps
+	// asks Cloudflare once rather than once each.
+	zoneMu sync.Mutex
+	// zoneName is the zone id resolved to its name, memoised after the first
+	// successful read. See zone() for why only successes are kept, and why this
+	// is not a DNSConfig field.
+	zoneName string
 }
 
 // Compile-time proof this is the shape the orchestrator walks. Without it a
@@ -251,6 +260,11 @@ func (p *DNSProvisioner) Inspect(ctx context.Context, t spinup.Target) (spinup.S
 	if err != nil {
 		return spinup.State{}, err
 	}
+	// Before the lookup, not after: an out-of-zone hostname has no records to
+	// read and the plan should say why rather than report "create".
+	if err := p.preflight(ctx, want.Name); err != nil {
+		return spinup.State{}, err
+	}
 	found, err := p.records(ctx, want.Name)
 	if err != nil {
 		return spinup.State{}, err
@@ -292,6 +306,12 @@ func (p *DNSProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Re
 	}
 	want, err := desiredRecord(t)
 	if err != nil {
+		return spinup.Resource{}, err
+	}
+	// Ensure asks for itself rather than trusting Inspect's answer, exactly as
+	// it re-runs the lookup below: an apply must refuse on its own account, and
+	// the zone name is memoised, so on the ordinary path this is free.
+	if err := p.preflight(ctx, want.Name); err != nil {
 		return spinup.Resource{}, err
 	}
 	found, err := p.records(ctx, want.Name)
@@ -348,6 +368,104 @@ func (p *DNSProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Re
 	return p.resource(created), nil
 }
 
+// --- the zone pre-flight ----------------------------------------------------
+
+// preflight refuses a hostname that is not inside the token's own zone, before
+// anything is looked up and long before anything is created (PRSR-39).
+//
+// Cloudflare treats a record name it does not recognise as *relative* to the
+// zone and silently appends it, so a spec naming some other domain produces
+// svc.example.org.zerogravity.industries with no error anywhere. Until now the
+// only guard was wrongName, which reads the name off a record that has already
+// been created and then deletes it. That backstop stays — see wrongName — but
+// it is second-best three ways over: the operator learns about it after an
+// apply rather than in the plan, a wrong record resolves for the length of two
+// API calls, and "Purser deleted a record it had just made" is the most
+// alarming line this provisioner can print.
+//
+// This is available at all only because the premise CLAUDE.md gave for *not*
+// doing it was false. It said a Zone → DNS → Edit token cannot read the zone
+// object; PRSR-38 probed the production token and GET /zones answers
+// ["zerogravity.industries"] quite happily. It is /user/tokens/verify that this
+// token cannot call, which is a different endpoint.
+//
+// **A zone that could not be read is not evidence the hostname is wrong**, so a
+// failed read falls through to today's behaviour rather than refusing. That is
+// the same rule as everywhere else on this axis, and it costs less here than it
+// looks: anything that hides the zone read also fails the records() lookup two
+// lines later, so the step reports `unknown` on its own account, and if it
+// somehow does not, the create-path backstop is still there.
+func (p *DNSProvisioner) preflight(ctx context.Context, hostname string) error {
+	zone, err := p.zone(ctx)
+	if err != nil {
+		return nil
+	}
+	if inZone(hostname, zone) {
+		return nil
+	}
+	// Refused rather than unknown: the read *succeeded*, and re-running will say
+	// this for ever. What needs fixing is neither upstream nor a Purser
+	// credential but the spec itself, which is a third thing — but of the three
+	// statuses available it is the only one whose sentence to the operator is
+	// right, since `unknown` says "re-run" and `unavailable` says "set an env
+	// var". The message names the fix.
+	return fmt.Errorf("%w: cloudflare: %s is not in %s, the zone PURSER_CF_ZONE_ID points at — Cloudflare would take the name as relative to the zone and create %s.%s instead",
+		spinup.ErrRefused, hostname, zone, hostname, zone)
+}
+
+// zone resolves the configured zone id to the zone's name, once.
+//
+// Memoised because a deployment's zone id is fixed and the answer cannot change
+// under it, so `purser serve` asks at most once for its lifetime and the CLI at
+// most once per run. Only a *success* is cached: a failed read is not an answer,
+// and caching it would disable the pre-flight for the rest of the process on the
+// strength of one timeout.
+//
+// Deliberately not a DNSConfig field. The zone *name* must be derived from the
+// zone id and never configured alongside it, because two settings that can
+// disagree just move the mismatch this exists to catch — a hand-set
+// PURSER_CF_ZONE_NAME pointing somewhere the id does not would make the
+// pre-flight confidently wrong in both directions.
+func (p *DNSProvisioner) zone(ctx context.Context) (string, error) {
+	p.zoneMu.Lock()
+	defer p.zoneMu.Unlock()
+	if p.zoneName != "" {
+		return p.zoneName, nil
+	}
+	raw, err := p.api.do(ctx, http.MethodGet, "/zones/"+p.cfg.ZoneID, nil)
+	if err != nil {
+		return "", err
+	}
+	var env struct {
+		Result struct {
+			Name string `json:"name"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return "", fmt.Errorf("cloudflare: decode zone %s: %w", p.cfg.ZoneID, err)
+	}
+	name := trimDot(env.Result.Name)
+	if name == "" {
+		// A 200 that named no zone. Treated as a failed read rather than as an
+		// empty zone name, which inZone would otherwise match every hostname
+		// against the suffix ".".
+		return "", fmt.Errorf("cloudflare: zone %s came back with no name", p.cfg.ZoneID)
+	}
+	p.zoneName = name
+	return name, nil
+}
+
+// inZone reports whether hostname is the zone or sits inside it.
+//
+// The apex counts: a spec may legitimately claim zerogravity.industries itself.
+// The suffix test keeps its dot, so "notzerogravity.industries" is outside
+// "zerogravity.industries" rather than a match — the same care hostnameTakes
+// takes over cloudflared's wildcards, for the same reason.
+func inZone(hostname, zone string) bool {
+	h, z := strings.ToLower(trimDot(hostname)), strings.ToLower(trimDot(zone))
+	return h == z || strings.HasSuffix(h, "."+z)
+}
+
 // wrongName reports that what Cloudflare wrote does not answer for the hostname
 // that was asked for.
 //
@@ -365,7 +483,9 @@ func (p *DNSProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Re
 //     false. PRSR-38 found the production token answers GET /zones with exactly
 //     ["zerogravity.industries"], so a pre-flight is available and would refuse
 //     an out-of-zone hostname in the *plan*, before anything exists to delete.
-//     That is PRSR-39.
+//     PRSR-39 built it: see preflight above, which now runs on both paths and
+//     catches the ordinary case — a spec naming another domain — without
+//     anything being written.
 //   - "only the records in it, which carry its name" — also false, and PRSR-42
 //     measured it on all three routes this package reads records from: a create
 //     response, a get-by-id, and the **list** that records() uses on every
@@ -374,11 +494,14 @@ func (p *DNSProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Re
 //     names the zone never fires and the "configured zone" fallback is the only
 //     text this ever prints.
 //
-// The check stays regardless, and the reason is unchanged by either correction:
-// it catches a normalisation surprise a pre-flight cannot predict, and it is the
-// half that has actually been exercised. PRSR-42 ran it — asking for
-// prsr42-probe.example.org produced
-// prsr42-probe.example.org.zerogravity.industries, wrongName caught it, and
+// The check stays regardless, and the reason is unchanged by the pre-flight
+// landing in front of it. It answers a different question: preflight asks what
+// the spec said, this asks what Cloudflare *did*, so it still catches a
+// normalisation surprise a pre-flight cannot predict, and it is the only guard
+// left when the zone read fails — which is precisely when preflight waves the
+// hostname through. It is also the half that has actually been exercised
+// against the live API: PRSR-42 asked for prsr42-probe.example.org, got
+// prsr42-probe.example.org.zerogravity.industries, and wrongName caught it and
 // removeStray deleted it, leaving the zone byte-identical to its snapshot.
 func wrongName(got, want dnsRecord) error {
 	if strings.EqualFold(trimDot(got.Name), trimDot(want.Name)) {

@@ -227,7 +227,10 @@ func TestSpinup_TunnelledDNSIsBlockedByItsPrerequisites(t *testing.T) {
 // re-running is the whole fix — so it stays `unknown`. Reporting it `refused`
 // would send someone to the dashboard to fix a zone that is fine.
 func TestSpinup_AFullPageIsUnknownNotRefused(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		out := make([]dnsRecord, perPage)
 		for i := range out {
 			out[i] = dnsRecord{ID: fmt.Sprint(i), Type: "A", Name: fmt.Sprintf("other%d.%s", i, testZoneName), Content: "10.0.0.1"}
@@ -249,5 +252,46 @@ func TestSpinup_AFullPageIsUnknownNotRefused(t *testing.T) {
 	}
 	if len(st.rows) != 0 {
 		t.Error("nothing happened, so nothing should be recorded")
+	}
+}
+
+// The third case on that same line, and the one PRSR-39 added: a hostname the
+// zone cannot hold.
+//
+// It sits with the ambiguous-name refusal rather than with the full page. The
+// zone read *succeeded* and its answer settles the question for good, so
+// `unknown`'s "re-run" is the wrong sentence — nothing changes until somebody
+// edits the spec. What the operator must not see is `create`, which is what a
+// plan said before this existed, followed by an --apply that made a record for
+// a name nobody asked about and deleted it again.
+func TestSpinup_OutOfZoneHostnameIsRefusedNotCreated(t *testing.T) {
+	z := newZone()
+	svc, st := spinupFor(t, z)
+	spec := directTarget("100.64.0.7").Spec
+	spec.Hostname = "argosy.example.org"
+
+	res, err := svc.Ensure(context.Background(), spinup.Request{Spec: spec, Apply: true})
+	if err != nil {
+		t.Fatalf("a step that will not be acted on is a finding, not a failed run: %v", err)
+	}
+	f := dnsFinding(t, res)
+	if f.Status != spinup.StepRefused {
+		t.Fatalf("want refused, got %s (%s)", f.Status, f.Err)
+	}
+	if !strings.Contains(f.Err, testZoneName) {
+		t.Errorf("the finding should name the zone the token points at, got %q", f.Err)
+	}
+	if z.writes() != 0 {
+		t.Errorf("--apply must not act on a refused step, made %d write(s): %v", z.writes(), z.callLog())
+	}
+	if len(st.rows) != 0 {
+		t.Error("nothing happened, so nothing should be recorded")
+	}
+	// NeedsAttention is the verdict, not the pending count: `refused` is
+	// deliberately not something --apply would act on, so Pending() reads zero
+	// here and reading that as success would sign off a hostname that will
+	// never resolve.
+	if len(res.NeedsAttention()) == 0 {
+		t.Error("a hostname that cannot be created must not report as fine")
 	}
 }
