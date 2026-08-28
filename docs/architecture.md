@@ -911,12 +911,8 @@ an envelope is the one nobody will think to re-check.
   `self_hosted` application on the estate carries. `destinations` is the one with
   teeth — the modern spelling of what the application sits in front of.
 
-  **Still fake-only after this: the DNS and tunnel write verbs.**
-  `DNSProvisioner`'s create/update/delete and `TunnelProvisioner.putConfig` have
-  never executed. PRSR-38 probed the DNS delete with raw curl, which is not the
-  same as running the provisioner, and the tunnel write is a read-modify-write of
-  a document holding every other service's routes — the worst candidate for a
-  casual probe and the one most worth a disposable-tunnel exercise.
+  **Closed by PRSR-42 (2026-08-28).** `DNSProvisioner`'s create/update/delete and
+  `TunnelProvisioner.putConfig` have now executed too — see below.
 - ~~**PRSR-37 — resolve the launcher icon from Placard.**~~ **Done, 2026-08-26.**
   `ServiceSpec.Logo` is now a ref — `placard` | `none` | an https URL — defaulted
   to `placard` in `Normalized`, so a spec names a *service* and gets the right
@@ -1003,6 +999,48 @@ an envelope is the one nobody will think to re-check.
 
   Found by running the binary while verifying PRSR-37 — the third time on this
   axis that has caught something `go test` could not. Nothing was ever applied.
+- ~~**PRSR-42 — the DNS and tunnel write verbs.**~~ **Done, 2026-08-28.** Every
+  write verb this axis owns has now executed against Cloudflare through the
+  provisioner that owns it. Nothing needed fixing; what it produced is the
+  confirmation that the fakes modelled the right thing, plus one fixture
+  correction and three retracted claims.
+
+  **DNS**, on a disposable hostname: create in both shapes — a direct spec comes
+  out **unproxied** with automatic TTL, a tunnelled one **proxied** (SERV-45,
+  since an unproxied CNAME to `cfargotunnel.com` reaches nothing) — the no-op on
+  a match, an **A → CNAME type change in place** on the same record id,
+  `Teardown`, and the already-gone path. The two update invariants that had only
+  ever been asserted against a fake are now measured: a direct-spec update
+  carried a hand-set **TTL of 300** and a hand-set **`proxied: true`** across
+  rather than resetting them to create-time defaults. The zone-append backstop
+  ran end to end: `prsr42-probe.example.org` became
+  `prsr42-probe.example.org.zerogravity.industries`, `wrongName` caught it,
+  `removeStray` deleted it, and the zone diffed byte-identical to its snapshot.
+
+  **The tunnel** ran on a **disposable tunnel seeded with a verbatim copy of
+  production's ingress document** — same six rules, same `warp-routing`, same
+  sha256 — so the bytes round-tripped were real while the blast radius stayed at
+  zero. `putConfig` inserted before the terminal catch-all; `version` moved
+  **1 → 2, exactly one**; `warp-routing` survived byte-for-byte; all six original
+  rules returned unchanged and in order. A re-run wrote nothing. `Teardown`
+  restored the document byte-identical to the seed. Then the case production
+  cannot exercise: with a `*.zerogravity.industries` holding-page rule present,
+  the route was inserted **before the wildcard** and the plan named it — the
+  shadowing case, which without `scanRoute` lands in the dead region behind it
+  and still passes its own read-back. Production's document was untouched
+  throughout, `version` 5 and identical sha either side.
+
+  **What it corrected.** Neither a create response nor a GET carries `zone_id` or
+  `zone_name` on this API version, so `dnsRecord` decodes two fields that are
+  always empty: `zoneOf` always takes its fallback (which is why stray removal
+  works at all) and `wrongName`'s zone-naming branch cannot fire. The fake zone
+  had been *supplying* both under a comment calling them "the zone fields the API
+  echoes back" — the PRSR-38 trap in its inverse direction, a fixture inventing
+  what the API withholds, and the third time this package has met that shape.
+  `wrongName`'s doc block also still claimed a Zone→DNS→Edit token "cannot read
+  the zone object itself", which PRSR-38 had already disproved (that is PRSR-39).
+  All three claims corrected; the fallbacks kept, since they cost one branch and
+  are what make the paths work.
 - **PRSR-33** — the `dev` tunnel ref, which resolves to a refusal today rather
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod

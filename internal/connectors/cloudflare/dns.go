@@ -356,13 +356,36 @@ func (p *DNSProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Re
 // belongs to some other domain produces `svc.example.org.zerogravity.industries`
 // — a live record for a name nobody asked about, and no error anywhere.
 // ServiceSpec.validHostname cannot catch it: that checks the shape of a
-// hostname, not which zone the token points at. This is the first moment the
-// real zone is knowable, because a token scoped to Zone → DNS → Edit cannot read
-// the zone object itself — only the records in it, which carry its name.
+// hostname, not which zone the token points at.
+//
+// The justification this comment used to give for checking *afterwards* was
+// wrong twice over, and both halves are now measured rather than argued.
+//
+//   - "a token scoped to Zone → DNS → Edit cannot read the zone object itself" —
+//     false. PRSR-38 found the production token answers GET /zones with exactly
+//     ["zerogravity.industries"], so a pre-flight is available and would refuse
+//     an out-of-zone hostname in the *plan*, before anything exists to delete.
+//     That is PRSR-39.
+//   - "only the records in it, which carry its name" — also false, and PRSR-42
+//     measured it: neither a create response nor a GET carries `zone_name` or
+//     `zone_id` on this API version. dnsRecord decodes both and both are always
+//     empty, so the branch below that names the zone never fires and the
+//     "configured zone" fallback is the only text this ever prints.
+//
+// The check stays regardless, and the reason is unchanged by either correction:
+// it catches a normalisation surprise a pre-flight cannot predict, and it is the
+// half that has actually been exercised. PRSR-42 ran it — asking for
+// prsr42-probe.example.org produced
+// prsr42-probe.example.org.zerogravity.industries, wrongName caught it, and
+// removeStray deleted it, leaving the zone byte-identical to its snapshot.
 func wrongName(got, want dnsRecord) error {
 	if strings.EqualFold(trimDot(got.Name), trimDot(want.Name)) {
 		return nil
 	}
+	// Always the fallback today: see the note above — no response on this API
+	// version populates zone_name. Kept rather than simplified away, because a
+	// field Cloudflare stops omitting should improve this message rather than
+	// need it rewritten, and the cost is one branch.
 	zone := got.ZoneName
 	if zone == "" {
 		zone = "the configured zone"
@@ -598,6 +621,13 @@ func (p *DNSProvisioner) resource(r dnsRecord) spinup.Resource {
 
 // zoneOf prefers the zone Cloudflare reported over the configured one, so the
 // recorded parent describes where the record actually is.
+// zoneOf is the zone a record lives in — the record's own, falling back to the
+// configured one.
+//
+// In practice always the fallback: PRSR-42 measured that neither a create
+// response nor a GET carries `zone_id` on this API version, so r.ZoneID is
+// invariably empty. That is why the stray-removal path works at all, and it is
+// worth knowing before anyone reads the first operand as load-bearing.
 func (p *DNSProvisioner) zoneOf(r dnsRecord) string {
 	return firstNonEmpty(r.ZoneID, p.cfg.ZoneID)
 }

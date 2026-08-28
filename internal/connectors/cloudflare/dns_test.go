@@ -73,14 +73,24 @@ func newZone(seed ...dnsRecord) *fakeZone {
 	return z
 }
 
-// put stores a record, assigning an id and filling the zone fields the API
-// echoes back.
+// put stores a record and assigns an id.
+//
+// It deliberately does NOT fill ZoneID or ZoneName. It used to, with a comment
+// calling them "the zone fields the API echoes back" — and PRSR-42 measured the
+// live API and found it echoes back neither, on a create response or a GET.
+// dnsRecord decodes both and both are always empty in production.
+//
+// That matters because a fixture supplying a field the API withholds is the
+// PRSR-38 trap in its inverse direction: the suite would exercise wrongName's
+// zone-naming branch, which cannot fire against Cloudflare, and would leave
+// zoneOf's first operand looking load-bearing when it never is. Third time this
+// package has met this — PRSR-38 through fixture data, PRSR-40 through missing
+// keys, and now through extra ones.
 func (z *fakeZone) put(r dnsRecord) dnsRecord {
 	if r.ID == "" {
 		z.next++
 		r.ID = fmt.Sprintf("rec%d", z.next)
 	}
-	r.ZoneID, r.ZoneName = testZoneID, testZoneName
 	z.records[r.ID] = r
 	return r
 }
@@ -934,5 +944,77 @@ func TestDNS_Teardown_UnroutableRequestIsNotAbsence(t *testing.T) {
 	}
 	if deletes != 0 {
 		t.Error("it should not have gone on to delete anything")
+	}
+}
+
+// A record as the live API actually returns it carries no zone fields, and the
+// code paths that read them fall back correctly.
+//
+// PRSR-42 measured the responses: neither a create nor a GET populates
+// `zone_id` or `zone_name`. dnsRecord decodes both, so both are always empty in
+// production, and two call sites read them:
+//
+//   - zoneOf, whose first operand is therefore never taken. The stray-removal
+//     path depends on the fallback, which is why it works at all.
+//   - wrongName, whose zone-naming branch can never fire, so the "configured
+//     zone" wording is the only text an operator ever sees.
+//
+// Neither is a bug — both were written with the fallback — but the fake used to
+// supply both fields under a comment calling them "the zone fields the API
+// echoes back", which made the suite exercise branches Cloudflare cannot reach
+// and left the first operand of zoneOf looking load-bearing.
+func TestDNS_RealResponsesCarryNoZoneFields(t *testing.T) {
+	// Exactly the key set observed on a live create response (PRSR-42).
+	const liveCreate = `{"result":{
+		"id":"983cfa92ab76da97243529d69b44b56f",
+		"type":"A",
+		"name":"prsr42-probe.zerogravity.industries",
+		"content":"192.0.2.10",
+		"proxied":false,
+		"ttl":1,
+		"created_on":"2026-08-28T04:33:31.187278Z",
+		"modified_on":"2026-08-28T04:33:31.187278Z",
+		"comment":null,"tags":[],"meta":{},"proxiable":true,"settings":{}
+	},"success":true,"errors":[],"messages":[]}`
+
+	var env struct {
+		Result dnsRecord `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(liveCreate), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := env.Result
+
+	if got.ZoneID != "" || got.ZoneName != "" {
+		t.Fatalf("the live API sends neither zone field; fixture drift: zone_id=%q zone_name=%q", got.ZoneID, got.ZoneName)
+	}
+
+	// zoneOf must therefore reach the configured zone, which is what makes
+	// removeStray able to delete what it just created.
+	p := NewDNS(DNSConfig{APIToken: "cf_token", ZoneID: testZoneID})
+	if z := p.zoneOf(got); z != testZoneID {
+		t.Errorf("zoneOf = %q, want the configured zone %q — the stray-removal path depends on this fallback", z, testZoneID)
+	}
+
+	// wrongName's message uses the fallback wording, since it has no zone name
+	// to use. Asserted so the branch's unreachability is visible rather than
+	// something a reader has to work out.
+	err := wrongName(dnsRecord{Name: "svc.example.org.zerogravity.industries"}, dnsRecord{Name: "svc.example.org"})
+	if err == nil {
+		t.Fatal("a zone-appended name must be refused")
+	}
+	if !strings.Contains(err.Error(), "the configured zone") {
+		t.Errorf("with no zone_name to name, the fallback wording is what an operator sees, got %v", err)
+	}
+
+	// And the fake must not supply what the API withholds. Asserted through
+	// fakeZone rather than only against the literal above, because the literal
+	// pins what Cloudflare sends while this pins what the *suite* sends — and it
+	// was the second one that drifted.
+	z := newZone()
+	stored := z.put(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "10.0.0.1"})
+	if stored.ZoneID != "" || stored.ZoneName != "" {
+		t.Errorf("fakeZone fabricates zone fields the live API does not send (zone_id=%q zone_name=%q), which would exercise branches Cloudflare cannot reach",
+			stored.ZoneID, stored.ZoneName)
 	}
 }
