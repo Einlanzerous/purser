@@ -261,14 +261,24 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   That is why the Makefile strips the `v` off `git describe`, and why `Get()`
   reports verbatim instead of sanitising: a prefix is a bug in the *build*, and
   silently stripping it at the reporter hides it from the only place it shows.
-- **`VERSION` is passed only on a tag that carries a version**, and it is the
-  same condition that decides whether the image gets a version *label* — that
-  equivalence is the invariant, not the tag list it happens to produce.
-  `publish.yml`'s `ver` step resolves one output, `stamp`, and both the binary
-  (`build-args: VERSION`) and the label (`type=semver`) key off it, so /healthz
-  and `org.opencontainers.image.version` agree by construction rather than by
-  two conditions being kept in step by hand. A push to main yields blank, which
-  maps to `dev`.
+- **`VERSION` is passed only on a tag that carries a version**, and on that path
+  the binary and the image label agree *by construction*: `publish.yml`'s `ver`
+  step resolves one output, `stamp`, which feeds `build-args: VERSION`, and the
+  `type=semver` entries that produce the label match on exactly the refs that
+  make `stamp` non-empty. One value, not two conditions kept in step by hand.
+  **The agreement is about the release path only, and the reason is worth
+  knowing before you add a tag entry.** `org.opencontainers.image.version` is not
+  set by `type=semver` as such — metadata-action sets it from `version.main`, the
+  value of the **highest-priority tag that matched**. On a release the semver
+  entry (priority 900) wins and the label is the bare version. On a push to main
+  the `type=raw` entry wins, so the label is the literal `latest` against a
+  binary stamped blank and reporting `dev`; on a `vnext` tag it is `sha-<short>`
+  against the same `dev`. Those are not agreements — they are an unstamped build
+  against a moving tag, which is the honest state for both, and nothing compares
+  them (see the `:latest` bullet below for why dev is safe).
+  The trap: **adding any tag entry with a priority above 900 moves `version.main`
+  off the semver value and breaks the agreement on the release path too**, which
+  is the one place this invariant is load-bearing.
   **Never stamp `steps.meta.outputs.version`.** That output is only the
   highest-*priority* tag that matched, so it silently becomes `latest` or
   `sha-<short>` depending on which entries fired, and storing a moving tag as an
@@ -291,6 +301,15 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   `:latest` labelled `version=latest` with a binary reporting `dev`.
   construct-server's dev tier pins `latest`, so that coin flip decided what dev
   purser claimed to be.
+  **The main build is now the sole writer, which makes dev's image consistently
+  `version=latest` / `/healthz: dev` instead of intermittently so.** That is the
+  intended state, not a residue of the fix: dev runs main's tip, main has no
+  release to name, and `dev` is the honest answer. It is safe because nothing
+  compares the two for dev — the per-merge dispatch deliberately carries no
+  `version`, which keeps construct-server's ledger-enrichment branch switched
+  off, so no claim is filed for dev that an observation could contradict. **If a
+  dev claim ever starts being filed, this is the thing that breaks**, and the
+  fix is a real version on main builds, not a relabelling.
   **The estate has not settled which way `:latest` should point.** Lyceum fixed
   the identical race the other way (LYCM-121): there `:latest` means the last
   release and main gets only `:sha-<short>`. Both are internally consistent and
