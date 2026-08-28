@@ -740,8 +740,9 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   would destroy something nobody asked to have removed.
   **The reason this file used to give for checking it afterwards was wrong**
   (PRSR-38). It said a Zone→DNS→Edit token "can't read the zone object to find
-  out first"; the production token answers `GET /zones` with exactly
-  `["zerogravity.industries"]`.
+  out first"; the production token answers `GET /zones/{zone_id}` with `name:
+  zerogravity.industries, status: active` — that object read is the one
+  `preflight` makes, and the list endpoint answers too.
 - **So the pre-flight runs first, and the create-then-delete is the backstop
   behind it** (PRSR-39). `preflight` resolves `PURSER_CF_ZONE_ID` to the zone's
   *name* and refuses a hostname that is not inside it, on `Inspect` as well as
@@ -758,10 +759,13 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   predict, it is the half that has actually been exercised live (PRSR-42), and it
   is the only guard left in the one state the pre-flight waves everything
   through — **a zone that could not be read**, which is never evidence the
-  hostname is wrong. Only a *successful* zone read is memoised, so one timeout
-  cannot disable the check for the life of a `purser serve`; and a 200 naming no
-  zone counts as a failed read, since an empty zone name would otherwise suffix-
-  match every hostname alive. The zone name is derived from the id and **never
+  hostname is wrong. Usually the same failure takes the record lookup with it and
+  the step reports `unknown` anyway, but that is a tendency, not a property: a
+  failure specific to `GET /zones/{id}` leaves the pre-flight silently inert, and
+  the backstop is what makes that acceptable rather than any self-healing. Only a
+  *successful* zone read is memoised, so one timeout cannot disable the check for
+  the life of a `purser serve`; and a 200 naming no zone counts as a failed read,
+  since an empty zone name would otherwise suffix-match every hostname alive. The zone name is derived from the id and **never
   configured** beside it: two settings that can disagree just relocate the
   mismatch this exists to catch.
 - **A refusal is not a failed read** (PRSR-31). `StepUnknown` covers a read that

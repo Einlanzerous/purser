@@ -801,8 +801,9 @@ What it decides, and why:
   This paragraph used to justify checking *only afterwards* by saying a token
   scoped to Zone → DNS → Edit "cannot read the zone object to find out
   beforehand". That is false: PRSR-38 found the production token answers
-  `GET /zones` with exactly `["zerogravity.industries"]`, and **PRSR-39** built
-  the pre-flight on it. `preflight` resolves `PURSER_CF_ZONE_ID` to the zone name
+  `GET /zones/{zone_id}` with `name: zerogravity.industries, status: active` —
+  the object read `preflight` actually makes, the list endpoint answering as well
+  — and **PRSR-39** built the pre-flight on it. `preflight` resolves `PURSER_CF_ZONE_ID` to the zone name
   and refuses an out-of-zone hostname on both `Inspect` and `Ensure`, ahead of the
   record lookup, so the operator sees it in the plan and nothing is ever written.
   It is `refused` rather than `unknown` — the read succeeded, so re-running
@@ -814,11 +815,15 @@ What it decides, and why:
   a pre-flight cannot predict, still the half exercised live (PRSR-42 ran it end
   to end), and the only guard at all in the one state the pre-flight waves
   through — a zone that could not be read, which is never evidence about the
-  hostname. Only successful zone reads are memoised (one timeout must not
-  disable the check for a whole `purser serve`), a 200 naming no zone counts as
-  a failed read rather than as a zone everything is inside, and the zone name is
-  derived from the id rather than configured beside it, since two settings that
-  can disagree merely relocate the mismatch.
+  hostname. Usually the same failure takes the record lookup with it and the step
+  reports `unknown` on its own, but that is a tendency rather than a property: a
+  failure specific to `GET /zones/{id}` leaves the pre-flight silently inert, and
+  the backstop rather than any self-healing is what makes that acceptable. Only
+  successful zone reads are memoised (one timeout must not disable the check for
+  a whole `purser serve`), a 200 naming no zone counts as a failed read rather
+  than as a zone everything is inside, and the zone name is derived from the id
+  rather than configured beside it, since two settings that can disagree merely
+  relocate the mismatch.
 - **Teardown targets the recorded id** and refuses without one, confirms the id
   still names this hostname before deleting, and treats an already-absent record
   as success — where "absent" means Cloudflare's record code (81044) and *not* a

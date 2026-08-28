@@ -385,16 +385,23 @@ func (p *DNSProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup.Re
 //
 // This is available at all only because the premise CLAUDE.md gave for *not*
 // doing it was false. It said a Zone → DNS → Edit token cannot read the zone
-// object; PRSR-38 probed the production token and GET /zones answers
-// ["zerogravity.industries"] quite happily. It is /user/tokens/verify that this
-// token cannot call, which is a different endpoint.
+// object; PRSR-38 probed the production token and this exact call —
+// GET /zones/{zone_id} — answered `name: zerogravity.industries, status:
+// active`. (Its sibling GET /zones answers ["zerogravity.industries"] too, but
+// that is the list endpoint and not the one below; the probe that backs this
+// code is the object one.) It is /user/tokens/verify that this token cannot
+// call, which is a different endpoint again.
 //
 // **A zone that could not be read is not evidence the hostname is wrong**, so a
 // failed read falls through to today's behaviour rather than refusing. That is
-// the same rule as everywhere else on this axis, and it costs less here than it
-// looks: anything that hides the zone read also fails the records() lookup two
-// lines later, so the step reports `unknown` on its own account, and if it
-// somehow does not, the create-path backstop is still there.
+// the same rule as everywhere else on this axis. In practice the same failure
+// usually takes the records() lookup with it — an outage, a revoked token — and
+// the step then reports `unknown` on its own account. That is a tendency and not
+// a guarantee: a failure specific to this route, with the record lookup still
+// answering, leaves the pre-flight silently inert and the read re-issued and
+// re-discarded on every call, since only successes are memoised. What makes that
+// acceptable is not self-healing, it is the create-path backstop, which is
+// exactly the state wrongName was the only guard in before this existed.
 func (p *DNSProvisioner) preflight(ctx context.Context, hostname string) error {
 	zone, err := p.zone(ctx)
 	if err != nil {
