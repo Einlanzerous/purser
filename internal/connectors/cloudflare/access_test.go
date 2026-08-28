@@ -1,9 +1,12 @@
 package cloudflare
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -145,6 +148,38 @@ func lastPathSegment(p string) string {
 		return p
 	}
 	return p[i+1:]
+}
+
+// pngOfSize renders a real PNG of the given dimensions.
+//
+// A real one, encoded by the stdlib, rather than a hand-built IHDR: measure()
+// sniffs the format from the bytes and the point of the check is that it reads
+// what a CDN actually serves. An all-zero gray canvas compresses to a couple of
+// kilobytes whatever its dimensions, so this is cheap even at argosy's 1169×512.
+func pngOfSize(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewGray(image.Rect(0, 0, w, h))); err != nil {
+		t.Fatalf("encode %dx%d png: %v", w, h, err)
+	}
+	return buf.Bytes()
+}
+
+// imageServer serves one body under one content type, 200.
+//
+// Separate from logoServer because that one writes a truncated PNG signature —
+// enough to answer the status/content-type question it was built for, and
+// deliberately not enough to decode. Tests that care about dimensions need a
+// body that really is an image; tests that do not are unaffected by a shape
+// nothing can read, which is what keeps this addition from touching them.
+func imageServer(t *testing.T, contentType string, body []byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 // logoServer serves one URL with the given status and content type.
@@ -427,7 +462,7 @@ func TestCheckLogo_HTMLLoginPageIsBroken(t *testing.T) {
 	gated := logoServer(t, http.StatusOK, "text/html; charset=utf-8")
 	p := NewAccess(AccessConfig{LogoClient: gated.Client()})
 
-	verdict, err := p.checkLogo(context.Background(), gated.URL)
+	verdict, _, err := p.checkLogo(context.Background(), gated.URL)
 	if verdict != logoBroken {
 		t.Fatalf("an HTML body must not pass as an image, got verdict %v", verdict)
 	}
@@ -457,7 +492,7 @@ func TestCheckLogo_SeparatesBrokenFromUnknown(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			p := NewAccess(AccessConfig{LogoClient: tc.cl})
-			if got, _ := p.checkLogo(context.Background(), tc.url); got != tc.want {
+			if got, _, _ := p.checkLogo(context.Background(), tc.url); got != tc.want {
 				t.Fatalf("verdict = %v, want %v", got, tc.want)
 			}
 		})
@@ -1959,5 +1994,272 @@ func TestTeardown_AnInconsistentApplicationCannotConfirmTheGateIsDown(t *testing
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error should say what could not be established; %q missing from %q", want, err)
 		}
+	}
+}
+
+// ─── the mark's proportions (PRSR-43) ───────────────────────────────────────
+
+// The band, and why each row sits where it does. The numbers on the left are
+// real: three are the marks Placard publishes today, and 1169×512 is argosy's
+// canonical mark as it stood on 2026-08-27 — the only non-square one in the
+// repo, and the reason this check exists.
+func TestLogoShape_TheBandClearsEveryRealMarkAndCatchesArgosy(t *testing.T) {
+	for _, tc := range []struct {
+		w, h     int
+		squarish bool
+		why      string
+	}{
+		{512, 512, true, "lyceum and placard: exactly 1:1"},
+		{482, 512, true, "switchyard: 0.94:1, the tightest real mark"},
+		{1169, 512, false, "argosy before placard#6: 2.28:1, cropped to its centre in the tile"},
+		{512, 1169, false, "the same mark on its side — a square tile crops a portrait exactly as badly"},
+		{600, 512, true, "1.17:1, inside the band: a designer letterboxing a glyph slightly"},
+		{700, 512, false, "1.37:1, outside it"},
+		{512, 640, true, "1:1.25 is the boundary and is in"},
+		{512, 660, false, "1:1.29 is out"},
+		{1, 1, true, "degenerate but square"},
+	} {
+		got := logoShape{w: tc.w, h: tc.h}.squarish()
+		if got != tc.squarish {
+			t.Errorf("logoShape{%d, %d}.squarish() = %v, want %v — %s", tc.w, tc.h, got, tc.squarish, tc.why)
+		}
+	}
+}
+
+// The band is symmetric in the ratio, which is not a coincidence to be
+// refactored away: 0.8 is 1/1.25, because the tile is square and has no
+// preference about which way a mark is wrong.
+func TestLogoShape_TheBandIsSymmetric(t *testing.T) {
+	if minLogoAspect*maxLogoAspect != 1 {
+		t.Errorf("min %v and max %v must be reciprocals — a square tile crops tall and wide marks alike", minLogoAspect, maxLogoAspect)
+	}
+}
+
+// An unmeasured shape is neither squarish nor off-square, and above all it is
+// not a note. Never treat unmeasurable as bad — the same rule logoUnknown makes
+// about a fetch that did not complete.
+func TestLogoShape_UnmeasuredSaysNothing(t *testing.T) {
+	var none logoShape
+	if none.measured() {
+		t.Error("a zero shape was not measured")
+	}
+	if none.squarish() {
+		t.Error("squarish() must not answer yes for something it never read")
+	}
+	if n := none.note("https://example.test/mark.svg"); n != "" {
+		t.Errorf("an unmeasured mark reports nothing, got %q", n)
+	}
+	// …and neither does one that is fine, which is what keeps the note out of
+	// every ordinary plan.
+	if n := (logoShape{512, 512}).note("https://example.test/mark.png"); n != "" {
+		t.Errorf("a square mark reports nothing, got %q", n)
+	}
+}
+
+// The number in the message is always the long side, with the colon saying which
+// way round — so "2.28:1" and "1:2.28" are two different marks and neither reads
+// as the other.
+func TestLogoShape_AspectNamesTheLongSide(t *testing.T) {
+	if got := (logoShape{1169, 512}).aspect(); got != "2.28:1" {
+		t.Errorf("wide mark aspect = %q, want 2.28:1", got)
+	}
+	if got := (logoShape{512, 1169}).aspect(); got != "1:2.28" {
+		t.Errorf("tall mark aspect = %q, want 1:2.28", got)
+	}
+}
+
+// The dimensions come out of the fetch checkLogo was already making — the whole
+// argument for putting this here rather than in a second request.
+func TestCheckLogo_MeasuresTheImageFromTheSameFetch(t *testing.T) {
+	srv := imageServer(t, "image/png", pngOfSize(t, 1169, 512))
+	p := NewAccess(AccessConfig{LogoClient: srv.Client()})
+
+	verdict, shape, err := p.checkLogo(context.Background(), srv.URL)
+	if verdict != logoOK || err != nil {
+		t.Fatalf("a served png is fine: verdict %v, err %v", verdict, err)
+	}
+	if shape.w != 1169 || shape.h != 512 {
+		t.Fatalf("want 1169×512 read off the body, got %+v", shape)
+	}
+	if shape.squarish() {
+		t.Error("2.28:1 is not squarish")
+	}
+}
+
+// An SVG has no header of this kind, and a body nothing can decode must report
+// nothing rather than guess. It is still a perfectly good logo: the verdict stays
+// logoOK and only the measurement is absent.
+func TestCheckLogo_AnUndecodableBodyIsUnmeasuredNotBroken(t *testing.T) {
+	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1169 512"/>`)
+	srv := imageServer(t, "image/svg+xml", svg)
+	p := NewAccess(AccessConfig{LogoClient: srv.Client()})
+
+	verdict, shape, err := p.checkLogo(context.Background(), srv.URL)
+	if verdict != logoOK || err != nil {
+		t.Fatalf("an svg is a servable image: verdict %v, err %v", verdict, err)
+	}
+	if shape.measured() {
+		t.Fatalf("nothing here can be decoded, so nothing should be reported: %+v", shape)
+	}
+	// The viewBox says 1169×512 and is deliberately not read. Parsing it would
+	// mean this package growing an SVG reader to answer a question the ticket
+	// said to leave unanswered.
+	if n := shape.note(srv.URL); n != "" {
+		t.Errorf("an unmeasured mark says nothing, got %q", n)
+	}
+}
+
+// The format is sniffed from the bytes, not taken from Content-Type. A header
+// that lies must not produce a measurement of a file that was never read.
+func TestCheckLogo_TheFormatComesFromTheBytesNotTheHeader(t *testing.T) {
+	srv := imageServer(t, "image/png", []byte("this is not a png at all"))
+	p := NewAccess(AccessConfig{LogoClient: srv.Client()})
+
+	verdict, shape, err := p.checkLogo(context.Background(), srv.URL)
+	if verdict != logoOK || err != nil {
+		// Still logoOK: the status and content type are what decide servability,
+		// and this file has never claimed to validate image *contents*.
+		t.Fatalf("verdict %v, err %v", verdict, err)
+	}
+	if shape.measured() {
+		t.Fatalf("a body that is not an image cannot be measured, got %+v", shape)
+	}
+}
+
+// The plan says so, and the step stays ok. This is the state the check exists
+// for: everything about the application is already correct, so without the note
+// a cropped tile has nothing at all to surface it.
+func TestInspect_AnOffSquareMarkIsANoteNotDrift(t *testing.T) {
+	srv := imageServer(t, "image/png", pngOfSize(t, 1169, 512))
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(srv.URL)}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: srv.Client()})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, srv.URL)})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !st.Matches {
+		// The whole difference from a broken logo. A mark that loads is not
+		// drift — there is nothing for --apply to write that would fix it, and
+		// reporting it as drift would have every plan promise an update that
+		// changes nothing, for ever.
+		t.Fatalf("proportions are a note, not something --apply can fix: %+v (%s)", st, st.Detail)
+	}
+	for _, want := range []string{"1169×512", "2.28:1", "cropped"} {
+		if !strings.Contains(st.Detail, want) {
+			t.Errorf("the plan should say %q, got %q", want, st.Detail)
+		}
+	}
+}
+
+// A square mark is silent. Without this the note becomes wallpaper on every
+// plan and stops being read at all.
+func TestInspect_ASquareMarkSaysNothingAboutItsShape(t *testing.T) {
+	srv := imageServer(t, "image/png", pngOfSize(t, 512, 512))
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(srv.URL)}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: srv.Client()})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, srv.URL)})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if strings.Contains(st.Detail, "cropped") {
+		t.Errorf("a 1:1 mark has nothing to report, got %q", st.Detail)
+	}
+}
+
+// The rule the ticket is most explicit about: this must not become a fourth
+// fatal case. A gated application is a DNS prerequisite, so refusing here would
+// leave a service unpublished over an icon — and a letterboxed icon still beats
+// two grey initials.
+func TestEnsure_AnOffSquareMarkIsStillWrittenAndSaysWhy(t *testing.T) {
+	srv := imageServer(t, "image/png", pngOfSize(t, 1169, 512))
+	api := &accessAPI{apps: []map[string]any{liveGatedApp("")}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: srv.Client()})
+
+	res, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, srv.URL)})
+	if err != nil {
+		t.Fatalf("a badly proportioned icon must not fail the step: %v", err)
+	}
+	if got := api.lastBody["logo_url"]; got != srv.URL {
+		t.Fatalf("the icon is written anyway, want %q in the body, got %v", srv.URL, got)
+	}
+	if !strings.Contains(res.Detail, "cropped") {
+		t.Errorf("the result should say the tile will crop it, got %q", res.Detail)
+	}
+}
+
+// Drift and the shape are separate answers about the same URL. A repoint to a
+// badly proportioned mark is still a repoint — the note travels beside it rather
+// than replacing it, so `--apply` is not withheld and the operator is told what
+// they are about to get.
+func TestInspect_ARepointToAnOffSquareMarkIsBothDriftAndANote(t *testing.T) {
+	srv := imageServer(t, "image/png", pngOfSize(t, 1169, 512))
+	api := &accessAPI{apps: []map[string]any{liveGatedApp("https://cdn.test/old.png")}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: srv.Client()})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, srv.URL)})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if st.Matches {
+		t.Fatal("a different url is drift")
+	}
+	if !strings.Contains(st.Detail, "spec wants") {
+		t.Errorf("the drift line should survive, got %q", st.Detail)
+	}
+	if !strings.Contains(st.Detail, "cropped") {
+		t.Errorf("the shape of what is about to be written should be named too, got %q", st.Detail)
+	}
+}
+
+// The branch where nothing is resolved — Placard has no mark for the slug, or
+// could not be asked — is the only chance anybody gets to hear about the mark
+// that is already up, since --apply will not touch it either way.
+func TestInspect_AnUnresolvedLogoStillReportsTheLiveMarksShape(t *testing.T) {
+	srv := imageServer(t, "image/png", pngOfSize(t, 1169, 512))
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(srv.URL)}}
+	p := newAccessProv(t, api, AccessConfig{
+		GroupID: testGroup, LogoClient: srv.Client(),
+		// No Logos resolver: the unconfigured deployment, which resolves to
+		// logoSourceKeep and writes nothing.
+	})
+
+	st, err := p.Inspect(context.Background(), spinup.Target{Spec: gatedSpec(t, string(spinup.LogoPlacard))})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if !st.Matches {
+		t.Fatalf("nothing was resolved, so there is nothing to call drift: %+v (%s)", st, st.Detail)
+	}
+	if !strings.Contains(st.Detail, "cropped") {
+		t.Errorf("the live mark's shape should still be reported, got %q", st.Detail)
+	}
+}
+
+// The apply says what the plan said. `logoDiff` measures the live mark on the
+// keep branch (TestInspect_AnUnresolvedLogoStillReportsTheLiveMarksShape); so
+// must `resolveLogo`, or an operator who runs --apply and reads its output
+// learns less than one who read the plan — and on this branch there is no drift
+// line, so the apply's Detail is the last thing that could mention it.
+func TestEnsure_AnUnresolvedLogoStillReportsTheLiveMarksShape(t *testing.T) {
+	srv := imageServer(t, "image/png", pngOfSize(t, 1169, 512))
+	api := &accessAPI{apps: []map[string]any{liveGatedApp(srv.URL)}}
+	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup, LogoClient: srv.Client()})
+
+	res, err := p.Ensure(context.Background(), spinup.Target{Spec: gatedSpec(t, string(spinup.LogoPlacard))})
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	// Unchanged, which is the point: nothing was resolved, so the tile is
+	// carried forward exactly as it was and only the account of it changes.
+	if got := api.lastBody["logo_url"]; got != srv.URL {
+		t.Fatalf("the live tile must be carried forward, want %q, got %v", srv.URL, got)
+	}
+	if !strings.Contains(res.Detail, "could not be asked") && !strings.Contains(res.Detail, "not set") {
+		t.Errorf("the keep note should survive, got %q", res.Detail)
+	}
+	if !strings.Contains(res.Detail, "cropped") {
+		t.Errorf("the apply should report the shape the plan reported, got %q", res.Detail)
 	}
 }

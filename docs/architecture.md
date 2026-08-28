@@ -974,6 +974,31 @@ an envelope is the one nobody will think to re-check.
   mode, not only under `go test`: switchyard resolves to Placard's mark against a
   stored URL that is a live 404; argosy reports the repoint with both URLs named;
   chronicle, which Placard has never heard of, reports `adopt` with a note.
+
+  **And a correct URL is still not a correctly-shaped asset (PRSR-43).** After
+  the repoint landed, argosy's tile was *still* wrong: Placard's canonical mark
+  was 1169×512, the only non-square one in the registry, and Cloudflare's App
+  Launcher tile is square and **fills** rather than fits, so it cropped the outer
+  ships off the glyph. Placard's own page fits, so the same file looked right
+  there and wrong in the launcher, and nothing reported a problem — the third
+  variant of one failure, each defeating the check before it.
+
+  `checkLogo` now reads the dimensions off the response it was already making
+  (`measure` sniffs the format from the bytes, so a lying `Content-Type` yields
+  no measurement rather than a wrong one) and reports when width ÷ height leaves
+  0.8–1.25 — symmetric, because a square tile has no preference about which way a
+  mark is wrong. It is a **note**: never drift, since nothing `--apply` could
+  write would fix it, and never fatal, since a gated app is a DNS prerequisite
+  and a letterboxed icon beats two grey initials. An unmeasured mark — an SVG, a
+  truncated body — reports nothing, which is `logoUnknown`'s rule one field over.
+
+  It belongs here as well as in Placard because Purser knows the **surface**:
+  that the tile is square is a fact about Cloudflare, and this is the last point
+  before the URL is written. The authoring-end half — an aspect check in
+  Placard's own `checker`, which would catch a bad mark once for every consumer
+  rather than one at a time at the point of use — is **PRSR-44**, and open. It
+  has a key rather than a sentence here because this project has twice lost the
+  remaining half of a piece of work by closing the ticket that described it.
 - ~~**PRSR-41 — `findApp` matched on hostname alone.**~~ **Fixed, 2026-08-26.**
   Two applications serve `switchyard.zerogravity.industries`: the service, and a
   path-scoped one on `/v1/external/github` whose only policy is `decision:
@@ -1070,6 +1095,9 @@ an envelope is the one nobody will think to re-check.
   than falling back to prod. Adding it is one line in `tunnelSet`; the rest of
   the ticket is the dev hostname convention and whether dev apps share the prod
   Access group.
+- **PRSR-44** — the aspect check in Placard's own `checker`, PRSR-43's
+  authoring-end half. Purser reports a mark a square tile will crop; Placard is
+  where a bad mark could be caught before any consumer points at it.
 - **PRSR-34** — orchestrating `Teardown`. The interface method exists and the
   resource table exists to give it concrete ids to target rather than a hostname
   to guess from, but nothing walks it. Its ordering is almost certainly the
