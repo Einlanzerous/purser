@@ -63,10 +63,28 @@ type fakeZone struct {
 	records map[string]dnsRecord
 	next    int
 	calls   []string
+
+	// zoneName is what GET /zones/{id} answers with — the read PRSR-39's
+	// pre-flight makes before it will look a hostname up. Empty models a 200
+	// that named no zone, which must read as "could not tell" rather than as a
+	// zone every hostname is inside of.
+	zoneName string
+	// zoneUnreadable fails that read. It is the state the create-path backstop
+	// is now the only guard in, so it is a fixture knob rather than a detail:
+	// see TestDNS_Ensure_OutOfZoneHostnameIsRefusedAndCleanedUp.
+	zoneUnreadable bool
+	// nameOnCreate, when set, decides the name the zone actually stores for a
+	// create, overriding the zone-append rule below.
+	//
+	// It models a normalisation surprise — Cloudflare writing something other
+	// than what was asked for a hostname that *is* in the zone — which since the
+	// pre-flight landed is the only way to reach wrongName on a run where the
+	// zone could be read.
+	nameOnCreate func(asked string) string
 }
 
 func newZone(seed ...dnsRecord) *fakeZone {
-	z := &fakeZone{records: map[string]dnsRecord{}}
+	z := &fakeZone{records: map[string]dnsRecord{}, zoneName: testZoneName}
 	for _, r := range seed {
 		z.put(r)
 	}
@@ -105,6 +123,11 @@ func (z *fakeZone) serve(t *testing.T) *httptest.Server {
 		defer z.mu.Unlock()
 		z.calls = append(z.calls, r.Method+" "+r.URL.Path)
 
+		if r.Method == http.MethodGet && r.URL.Path == "/zones/"+testZoneID {
+			z.zone(w)
+			return
+		}
+
 		rest, ok := strings.CutPrefix(r.URL.Path, "/zones/"+testZoneID+"/dns_records")
 		if !ok {
 			cfFail(w, http.StatusNotFound, 7003, "Could not route to "+r.URL.Path)
@@ -131,6 +154,19 @@ func (z *fakeZone) serve(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// zone answers the pre-flight's GET /zones/{id}.
+//
+// The key set is the subset this package reads plus the two an operator would
+// recognise; the live response carries far more. Only `name` is decoded, which
+// is the point of keeping the fixture honest about there being other keys.
+func (z *fakeZone) zone(w http.ResponseWriter) {
+	if z.zoneUnreadable {
+		cfFail(w, http.StatusInternalServerError, 10000, "internal error")
+		return
+	}
+	cfOK(w, map[string]any{"id": testZoneID, "name": z.zoneName, "status": "active"})
+}
+
 func (z *fakeZone) list(w http.ResponseWriter, name string) {
 	out := []dnsRecord{}
 	for _, r := range z.records {
@@ -146,9 +182,12 @@ func (z *fakeZone) create(t *testing.T, w http.ResponseWriter, r *http.Request) 
 	var in recordBody
 	decodeBody(t, r, &in)
 	name := in.Name
+	switch {
+	case z.nameOnCreate != nil:
+		name = z.nameOnCreate(name)
 	// Cloudflare treats a name outside the zone as relative to it and appends
 	// the zone silently — the trap wrongName() exists to catch.
-	if !strings.EqualFold(name, testZoneName) && !strings.HasSuffix(strings.ToLower(name), "."+testZoneName) {
+	case !strings.EqualFold(name, testZoneName) && !strings.HasSuffix(strings.ToLower(name), "."+testZoneName):
 		name += "." + testZoneName
 	}
 	cfOK(w, z.put(dnsRecord{Type: in.Type, Name: name, Content: in.Content, Proxied: in.Proxied, TTL: in.TTL}))
@@ -221,6 +260,27 @@ func (z *fakeZone) recordCount() int {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	return len(z.records)
+}
+
+// serveZone answers the pre-flight's GET /zones/{id} on a hand-rolled server,
+// and reports whether it handled the request.
+//
+// Every server in this file models one route, and PRSR-39 gave the provisioner a
+// second one they all now receive. A server that ignores it does not skip the
+// pre-flight — it answers the zone read with whatever its single handler
+// returns, which is a record list, which fails to decode as a zone, which
+// disables the pre-flight for the rest of the test. That is a fake modelling the
+// shape the test author assumed, and it is how TestDNS_Ensure_CreateConflict…
+// briefly came to pass without ever reaching the conflict it is named for.
+//
+// So a server that wants the pre-flight live calls this first, and a server that
+// wants it dead (the total-outage tests) says so in its comment.
+func serveZone(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodGet || r.URL.Path != "/zones/"+testZoneID {
+		return false
+	}
+	cfOK(w, map[string]any{"id": testZoneID, "name": testZoneName, "status": "active"})
+	return true
 }
 
 func cfOK(w http.ResponseWriter, result any) {
@@ -409,6 +469,11 @@ func TestDNS_Inspect_WrongValueIsAnUpdateAndSaysSo(t *testing.T) {
 // A lookup that fails is `unknown`, never absent: the orchestrator declines to
 // act on unknown, and the difference between the two is a duplicate record.
 func TestDNS_Inspect_LookupFailureIsNotAbsence(t *testing.T) {
+	// No serveZone here, deliberately: this models everything being down, the
+	// pre-flight's zone read included. That is the case the pre-flight is
+	// required to wave through rather than refuse — a zone that could not be
+	// read is not evidence about the hostname — and the step must still end up
+	// `unknown` off the record lookup below.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		cfFail(w, http.StatusInternalServerError, 10000, "internal error")
 	}))
@@ -432,7 +497,10 @@ func TestDNS_Inspect_LookupFailureIsNotAbsence(t *testing.T) {
 // not read, so re-running is the fix and the step is `unknown`. See
 // TestSpinup_AFullPageIsUnknownNotRefused, which pins that at the orchestrator.
 func TestDNS_Inspect_FullPageIsNotReadAsAnAnswer(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		out := make([]dnsRecord, perPage)
 		for i := range out {
 			out[i] = dnsRecord{ID: fmt.Sprint(i), Type: "A", Name: fmt.Sprintf("other%d.%s", i, testZoneName), Content: "10.0.0.1"}
@@ -454,7 +522,10 @@ func TestDNS_Inspect_FullPageIsNotReadAsAnAnswer(t *testing.T) {
 // The server-side filter narrows; the exact match here decides. A loose filter
 // must not let a different hostname's record be adopted or updated.
 func TestDNS_Inspect_IgnoresRecordsForOtherNames(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		cfOK(w, []dnsRecord{{ID: "x", Type: "A", Name: "argosy-staging." + testZoneName, Content: "100.64.0.7"}})
 	}))
 	defer srv.Close()
@@ -508,6 +579,9 @@ func TestDNS_Inspect_DualStackIsNotAmbiguous(t *testing.T) {
 func TestDNS_Ensure_CreatesTheProxiedTunnelCNAME(t *testing.T) {
 	var got recordBody
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			cfOK(w, []dnsRecord{})
@@ -580,6 +654,9 @@ func TestDNS_Ensure_AlreadyCorrectWritesNothing(t *testing.T) {
 func TestDNS_Ensure_DirectUpdateLeavesProxyingAlone(t *testing.T) {
 	var patched recordBody
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			cfOK(w, []dnsRecord{{ID: "rec1", Type: "A", Name: "argosy." + testZoneName, Content: "10.0.0.1", Proxied: true}})
@@ -644,8 +721,16 @@ func TestDNS_Ensure_ChangesTheTypeOfALoneRecord(t *testing.T) {
 // <name>.<zone>. Purser refuses it and takes the stray record back out: nothing
 // records a failed step, so leaving it would put a live record in the zone that
 // nothing knows about.
+//
+// Since PRSR-39 this is the *backstop*, reached only when the pre-flight could
+// not answer — hence the unreadable zone, which is what makes the test still
+// about the thing it is named for rather than about the new check. The zone
+// being unreadable is exactly the state in which the pre-flight waves a hostname
+// through, so this is not a contrived fixture: it is the one live case where
+// create-then-delete is the only guard there is.
 func TestDNS_Ensure_OutOfZoneHostnameIsRefusedAndCleanedUp(t *testing.T) {
 	z := newZone()
+	z.zoneUnreadable = true
 	p := dnsFor(t, z)
 	target := directTarget("100.64.0.7")
 	target.Spec.Hostname = "argosy.example.org"
@@ -670,6 +755,9 @@ func TestDNS_Ensure_OutOfZoneHostnameIsRefusedAndCleanedUp(t *testing.T) {
 func TestDNS_Ensure_CreateConflictAcceptsAMatchingRecord(t *testing.T) {
 	var lists int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			lists++
@@ -699,6 +787,9 @@ func TestDNS_Ensure_CreateConflictAcceptsAMatchingRecord(t *testing.T) {
 // …but only when it matches. Anything else is still the error Cloudflare gave.
 func TestDNS_Ensure_CreateConflictOnAMismatchStaysAnError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			cfOK(w, []dnsRecord{})
@@ -877,6 +968,9 @@ func TestDNSRecordNotFound_RequiresTheRecordCode(t *testing.T) {
 func TestDNS_Ensure_DirectUpdateLeavesTTLAlone(t *testing.T) {
 	var patched recordBody
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			cfOK(w, []dnsRecord{{ID: "rec1", Type: "A", Name: "argosy." + testZoneName, Content: "10.0.0.1", TTL: 300}})
@@ -902,6 +996,9 @@ func TestDNS_Ensure_DirectUpdateLeavesTTLAlone(t *testing.T) {
 func TestDNS_Ensure_TunnelledUpdateSetsAutomaticTTL(t *testing.T) {
 	var patched recordBody
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveZone(w, r) {
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			cfOK(w, []dnsRecord{{ID: "rec1", Type: "CNAME", Name: "interlock." + testZoneName, Content: "old" + tunnelSuffix, TTL: 300}})
@@ -1050,5 +1147,206 @@ func TestDNS_RealResponsesCarryNoZoneFields(t *testing.T) {
 	if stored.ZoneID != "" || stored.ZoneName != "" {
 		t.Errorf("fakeZone fabricates zone fields the live API does not send (zone_id=%q zone_name=%q), which would exercise branches Cloudflare cannot reach",
 			stored.ZoneID, stored.ZoneName)
+	}
+}
+
+// --- the zone pre-flight (PRSR-39) -----------------------------------------
+
+// The headline: a hostname in another domain is refused in the *plan*, and the
+// zone is never even searched for it.
+//
+// Before this, Inspect reported `create` for such a hostname — a plan promising
+// a record — and only --apply found out, by making one and deleting it again.
+func TestDNS_Preflight_OutOfZoneHostnameIsRefusedByInspect(t *testing.T) {
+	z := newZone()
+	target := directTarget("100.64.0.7")
+	target.Spec.Hostname = "argosy.example.org"
+
+	st, err := dnsFor(t, z).Inspect(context.Background(), target)
+	if err == nil {
+		t.Fatalf("a hostname outside the zone must not preview as a record to create, got %+v", st)
+	}
+	if !spinup.IsRefused(err) {
+		// unknown says "re-run", and re-running says this for ever; unavailable
+		// says "set an env var", and they are all set. Only refused names a fix
+		// that is actually the fix.
+		t.Errorf("the zone read succeeded, so this is refused rather than unknown: %v", err)
+	}
+	for _, want := range []string{"argosy.example.org", testZoneName} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal should name %q, got %v", want, err)
+		}
+	}
+	// The whole point of doing it up front: nothing was looked up, so there is
+	// no window in which a wrong record exists and no lookup to misread.
+	for _, c := range z.callLog() {
+		if strings.Contains(c, "dns_records") {
+			t.Errorf("an out-of-zone hostname must be refused before the zone is searched, got %v", z.callLog())
+			break
+		}
+	}
+}
+
+// And the apply refuses on its own account rather than trusting the plan, which
+// is the same rule Ensure already follows by re-running the record lookup.
+func TestDNS_Preflight_OutOfZoneHostnameIsRefusedByEnsureWithoutWriting(t *testing.T) {
+	z := newZone()
+	target := directTarget("100.64.0.7")
+	target.Spec.Hostname = "argosy.example.org"
+
+	_, err := dnsFor(t, z).Ensure(context.Background(), target)
+	if !spinup.IsRefused(err) {
+		t.Fatalf("want a refusal, got %v", err)
+	}
+	if z.writes() != 0 {
+		t.Errorf("nothing may be written for a hostname the zone cannot hold: %v", z.callLog())
+	}
+	if n := z.recordCount(); n != 0 {
+		t.Errorf("no record should exist to clean up, got %d", n)
+	}
+	// The line PRSR-39 exists to stop printing.
+	if strings.Contains(err.Error(), "removed") {
+		t.Errorf("nothing was created, so nothing should be reported as removed: %v", err)
+	}
+}
+
+// The apex is in its own zone. A spec may legitimately claim it, and refusing
+// there would be the pre-flight blocking a hostname Cloudflare handles fine.
+func TestDNS_Preflight_TheApexIsInTheZone(t *testing.T) {
+	z := newZone()
+	target := directTarget("100.64.0.7")
+	target.Spec.Hostname = testZoneName
+
+	if _, err := dnsFor(t, z).Inspect(context.Background(), target); err != nil {
+		t.Fatalf("the zone apex is inside the zone: %v", err)
+	}
+}
+
+// A zone id is fixed for a deployment, so the name behind it is read once and
+// remembered — `purser serve` must not ask Cloudflare on every request.
+func TestDNS_Preflight_TheZoneIsReadOnce(t *testing.T) {
+	z := newZone(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "100.64.0.7"})
+	p := dnsFor(t, z)
+	ctx := context.Background()
+	for range 3 {
+		if _, err := p.Inspect(ctx, directTarget("100.64.0.7")); err != nil {
+			t.Fatalf("Inspect: %v", err)
+		}
+	}
+	reads := 0
+	for _, c := range z.callLog() {
+		if c == "GET /zones/"+testZoneID {
+			reads++
+		}
+	}
+	if reads != 1 {
+		t.Errorf("the zone name cannot change under a fixed zone id; want 1 read, got %d: %v", reads, z.callLog())
+	}
+}
+
+// Never treat unverifiable as absent, here too: a zone that could not be read is
+// not evidence the hostname is wrong, so the run proceeds exactly as it did
+// before the pre-flight existed.
+func TestDNS_Preflight_AnUnreadableZoneDoesNotRefuse(t *testing.T) {
+	z := newZone(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "100.64.0.7"})
+	z.zoneUnreadable = true
+
+	st, err := dnsFor(t, z).Inspect(context.Background(), directTarget("100.64.0.7"))
+	if err != nil {
+		t.Fatalf("a failed zone read must not fail the step: %v", err)
+	}
+	if !st.Matches {
+		t.Errorf("the record is correct and the zone read is irrelevant to that, got %+v", st)
+	}
+}
+
+// …and a failed read is not remembered as an answer. Caching it would disable
+// the pre-flight for the life of the process on the strength of one timeout,
+// which for `purser serve` means until somebody restarts it.
+func TestDNS_Preflight_AFailedZoneReadIsNotCached(t *testing.T) {
+	z := newZone()
+	z.zoneUnreadable = true
+	p := dnsFor(t, z)
+	target := directTarget("100.64.0.7")
+	target.Spec.Hostname = "argosy.example.org"
+	ctx := context.Background()
+
+	if _, err := p.Inspect(ctx, target); spinup.IsRefused(err) {
+		t.Fatalf("with the zone unreadable there is nothing to refuse on: %v", err)
+	}
+	z.mu.Lock()
+	z.zoneUnreadable = false
+	z.mu.Unlock()
+
+	if _, err := p.Inspect(ctx, target); !spinup.IsRefused(err) {
+		t.Errorf("once the zone can be read the pre-flight must work, got %v", err)
+	}
+}
+
+// A 200 that named no zone is a read that did not answer, not a zone called ""
+// — which inZone's suffix test would otherwise match every hostname against.
+func TestDNS_Preflight_AZoneWithNoNameIsNotAnAnswer(t *testing.T) {
+	z := newZone()
+	z.zoneName = ""
+	target := directTarget("100.64.0.7")
+	target.Spec.Hostname = "argosy.example.org"
+
+	if _, err := dnsFor(t, z).Inspect(context.Background(), target); spinup.IsRefused(err) {
+		t.Fatalf("a nameless zone is not an answer to refuse on: %v", err)
+	}
+}
+
+// The backstop still earns its place with the pre-flight in front of it, because
+// the two answer different questions: the pre-flight asks what the spec said,
+// wrongName asks what Cloudflare did. A hostname that IS in the zone and comes
+// back written under another name is caught only by the second.
+func TestDNS_Ensure_ANormalisationSurpriseIsStillCaught(t *testing.T) {
+	z := newZone()
+	z.nameOnCreate = func(string) string { return "somethingelse." + testZoneName }
+	target := directTarget("100.64.0.7") // argosy.zerogravity.industries — in zone
+
+	_, err := dnsFor(t, z).Ensure(context.Background(), target)
+	if err == nil {
+		t.Fatal("a record written under a name nobody asked for must not be accepted")
+	}
+	if !strings.Contains(err.Error(), "somethingelse."+testZoneName) {
+		t.Errorf("the error should show what Cloudflare actually wrote, got %v", err)
+	}
+	if left := z.recordCount(); left != 0 {
+		t.Errorf("the stray record should have been removed, %d left", left)
+	}
+}
+
+// inZone mirrors what Cloudflare treats as inside the zone, and the row that
+// matters is the third: a suffix test that drops the dot would read
+// "notzerogravity.industries" as being inside "zerogravity.industries" and let a
+// hostname on somebody else's domain straight through the check that exists to
+// stop exactly that.
+func TestInZone(t *testing.T) {
+	const zone = "zerogravity.industries"
+	for _, tc := range []struct {
+		host string
+		want bool
+		why  string
+	}{
+		{"argosy.zerogravity.industries", true, "the ordinary case"},
+		{"zerogravity.industries", true, "the apex is in its own zone"},
+		{"a.b.zerogravity.industries", true, "depth is not the question"},
+		{"ARGOSY.ZeroGravity.Industries", true, "hostnames are case-insensitive"},
+		{"argosy.zerogravity.industries.", true, "a trailing dot is the same name"},
+		{"notzerogravity.industries", false, "a suffix that is not a label boundary"},
+		{"argosy.example.org", false, "another domain entirely"},
+		{"zerogravity.industries.example.org", false, "the zone as a prefix is not the zone"},
+		{"industries", false, "a parent of the zone is not inside it"},
+	} {
+		if got := inZone(tc.host, zone); got != tc.want {
+			t.Errorf("inZone(%q, %q) = %v, want %v — %s", tc.host, zone, got, tc.want, tc.why)
+		}
+	}
+	// Whatever the caller passed, an empty zone matches nothing: zone() reports
+	// a nameless response as a failed read rather than handing one here, and
+	// this is the second half of that guarantee.
+	if inZone("argosy.example.org", "") {
+		t.Error(`inZone(_, "") must not match — an unknown zone is not a zone everything is in`)
 	}
 }

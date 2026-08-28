@@ -740,12 +740,34 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   would destroy something nobody asked to have removed.
   **The reason this file used to give for checking it afterwards was wrong**
   (PRSR-38). It said a Zone→DNS→Edit token "can't read the zone object to find
-  out first"; the production token answers `GET /zones` with exactly
-  `["zerogravity.industries"]`. A pre-flight against the token's own zone is
-  available and would refuse an out-of-zone hostname in the *plan*, before
-  anything exists to delete — PRSR-39. The create-then-delete stays as the
-  backstop either way: it catches a normalisation surprise a pre-flight cannot
-  predict, and it is the half that has actually been reasoned about.
+  out first"; the production token answers `GET /zones/{zone_id}` with `name:
+  zerogravity.industries, status: active` — that object read is the one
+  `preflight` makes, and the list endpoint answers too.
+- **So the pre-flight runs first, and the create-then-delete is the backstop
+  behind it** (PRSR-39). `preflight` resolves `PURSER_CF_ZONE_ID` to the zone's
+  *name* and refuses a hostname that is not inside it, on `Inspect` as well as
+  `Ensure`, before the record lookup — so the operator reads it in the **plan**,
+  no wrong record ever resolves, and the most alarming line this provisioner can
+  print ("Purser deleted a record it had just made") is off the ordinary path.
+  Refused, not unknown: the read succeeded and re-running says the same thing for
+  ever. What needs fixing is the *spec*, which is a third thing neither status
+  names — but `unknown` says "re-run" and `unavailable` says "set an env var",
+  and only the refusal's message is the actual fix.
+  The two guards ask **different questions** and that is why both stay:
+  pre-flight asks what the spec said, `wrongName` asks what Cloudflare *did*. So
+  the backstop still catches a normalisation surprise a pre-flight cannot
+  predict, it is the half that has actually been exercised live (PRSR-42), and it
+  is the only guard left in the one state the pre-flight waves everything
+  through — **a zone that could not be read**, which is never evidence the
+  hostname is wrong. Usually the same failure takes the record lookup with it and
+  the step reports `unknown` anyway, but that is a tendency, not a property: a
+  failure specific to `GET /zones/{id}` leaves the pre-flight silently inert, and
+  the backstop is what makes that acceptable rather than any self-healing. Only a
+  *successful* zone read is memoised, so one timeout cannot disable the check for
+  the life of a `purser serve`; and a 200 naming no zone counts as a failed read,
+  since an empty zone name would otherwise suffix-match every hostname alive. The zone name is derived from the id and **never
+  configured** beside it: two settings that can disagree just relocate the
+  mismatch this exists to catch.
 - **A refusal is not a failed read** (PRSR-31). `StepUnknown` covers a read that
   did not complete — re-running is the whole fix. `StepRefused` covers a read
   that *succeeded* and came back with something no provisioner may write to: a
@@ -1014,9 +1036,11 @@ that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
 spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
 the `Teardown` walk — its orchestration, that is; the Access provisioner's own
 `Teardown` has now run live (PRSR-40), so what is left there is the ordering and
-the "is this hostname still someone's?" question. **PRSR-39** is the zone
-pre-flight that PRSR-38's probe showed was available all along. **PRSR-36**,
-**PRSR-37** and **PRSR-40** are all closed.
+the "is this hostname still someone's?" question. **PRSR-36**, **PRSR-37**,
+**PRSR-39** and **PRSR-40** are all closed — PRSR-39 built the zone pre-flight
+that PRSR-38's probe showed was available all along, and left the
+create-then-delete in place behind it as the backstop for the case a pre-flight
+cannot see.
 
 **PRSR-41 was found by running the binary** — the third time on this axis that
 has caught something reading could not (PRSR-31's outcome line, PRSR-38's
