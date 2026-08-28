@@ -966,13 +966,36 @@ verb in `access.go` has now executed**, on both application shapes:
 The estate was byte-identical to its pre-probe snapshot afterwards, `updated_at`
 included; all three disposable apps and the disposable policy were deleted.
 
-So the caveat is now genuinely narrower: **the DNS write verbs and the tunnel
-write verbs have never executed against Cloudflare.** `DNSProvisioner`'s
-create/update/delete and `TunnelProvisioner.putConfig` are still fake-only —
-PRSR-38 probed the DNS delete with raw curl, which is not the same as running
-the provisioner. The tunnel is the one that matters most and is the worst
-candidate for a casual probe, since its write is a read-modify-write of a
-document holding every other service's routes.
+**PRSR-42 finished the job (2026-08-28). Every write verb this axis owns has now
+executed against Cloudflare through the provisioner that owns it** — the caveat
+that stood here is retired rather than narrowed again.
+
+DNS, on a disposable hostname: create in both shapes (a direct spec really does
+come out **unproxied** with automatic TTL; a tunnelled one **proxied**, which
+SERV-45 requires because an unproxied CNAME to `cfargotunnel.com` reaches
+nothing), the no-op on a match (`modified_on` did not move), an **A → CNAME type
+change in place** on the same record id, `Teardown`, and the already-gone path.
+The two update invariants that had only ever been asserted against a fake are
+now measured: a direct-spec update carried a hand-set **TTL of 300** and a
+hand-set **`proxied: true`** across instead of resetting them to this file's
+create-time defaults. And the zone-append backstop ran end to end — asking for
+`prsr42-probe.example.org` produced
+`prsr42-probe.example.org.zerogravity.industries`, `wrongName` caught it,
+`removeStray` deleted it, and the zone diffed byte-identical to its snapshot.
+
+The tunnel was exercised on a **disposable tunnel seeded with a verbatim copy of
+production's ingress document** — same six rules, same `warp-routing`, same
+sha256 — so the bytes round-tripped were the real ones while the blast radius
+stayed at zero. `putConfig` inserted before the terminal catch-all, `version`
+moved **1 → 2, exactly one**, `warp-routing` survived byte-for-byte, and all six
+original rules came back unchanged and in order. A re-run wrote nothing and left
+`version` at 2. `Teardown` returned the document byte-identical to the seed.
+Then the case production cannot exercise: with a `*.zerogravity.industries`
+holding-page rule in the document, the route was inserted **before the wildcard**
+(index 5 of 8) and the plan named it — the shadowing case, which without
+`scanRoute` would have landed in the dead region behind it and still passed its
+read-back. A wildcard was correctly never adopted as ours. Production's document
+was untouched throughout: `version` 5, identical sha, before and after.
 
 **PRSR-37** made the launcher icon a resolved fact rather than a typed path.
 `ServiceSpec.Logo` is a ref (`placard` | `none` | url) defaulting to `placard`,
