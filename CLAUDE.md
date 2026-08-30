@@ -505,45 +505,42 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   A run that passed `--prune` reports `prune` instead, which **is** counted by
   `Pending`: that run asked for the removal, so it is work outstanding rather
   than a state.
-- **A prune removes only *this* service's resources.** `Ensure` builds its record
-  map from `ServiceResourcesForHostname`, which is keyed on hostname alone, so
-  without a check every active row there is a prune candidate whatever service it
-  is recorded to — and a spec naming `--access none` would delete *another*
+- **A prune removes only *this* service's resources, and the refusal is the
+  whole run.** `Ensure` builds its record map from
+  `ServiceResourcesForHostname`, which is keyed on hostname alone, so without a
+  check every active row there is a prune candidate whatever service it is
+  recorded to — and a spec naming `--access none` would delete *another*
   service's Access application, leave its hostname resolving, and mark the row
-  removed so nothing mentions it again. That is the hole `teardown-service`'s
-  `checkOwnership` refuses on, reached through the additive command, and the
-  operator has already supplied the second coordinate that closes it.
-  It is **per-resource** (`StepRefused`, naming the owner) rather than the
-  whole-run refusal the teardown walk uses, and the difference is not a
-  softening. `Ensure`'s additive half is legitimate on a reassigned hostname —
-  an adopt rewrites a row and touches nothing upstream — and, decisively, a
-  whole-run refusal would be **unfixable**: nothing rebinds an *orphan's*
-  `service_key`, because only `ensureOne`'s adopt path rewrites a row and an
-  orphan is a kind the spec does not call for. The row would refuse for ever with
-  no command to type. The refusal names the two that work instead: that service's
-  own spec with `--prune`, or a teardown of the hostname as that service.
-  **And the run must not create the state it is refusing over.** `Ensure`'s
-  additive pass reaches `StepAdopt` on exactly the same mismatch, and an adopt
-  rebinds a row: on a hostname where a prune is already refusing, that moves one
-  kind to this spec's service while the refused kinds keep the old one — the
-  "half-reassigned" state `checkOwnership` refuses a whole teardown on. So the
-  run would manufacture, in the act of refusing, the condition that stops the
-  remedy its own message names. The adopt is therefore held (`contested`,
-  computed before the loop so it does not depend on KindOrder deciding orphans
-  first) and only the adopt is: a create or an update is an upstream change the
-  operator asked for. The refusal also names **one** remedy rather than two —
-  "run their spec with `--prune`" reads well and mostly does not work, since
-  their spec presumably still *calls for* that kind and so has no orphan to
-  prune.
-  **The additive half is still not safe on a contested hostname**, and the
-  comment there says so rather than implying otherwise: an `update` writes, and a
+  removed so nothing mentions it again. That is the hole `checkOwnership` refuses
+  on for a teardown, reached through the additive command. It reuses that
+  sentinel (`ErrHostnameNotThisService`, 409 over HTTP), so one rule is stated
+  once and both surfaces answer the same way.
+  **Two narrower shapes were tried first and both are wrong, which is worth
+  keeping because each looks obviously right.** Refusing each orphan on its own
+  leaves the additive pass free to run — and *every* row-writing branch of
+  `ensureOne` calls `s.record`, which stamps this spec's `service_key`. So the
+  run rebound one kind while refusing the others, producing exactly the
+  half-reassigned hostname `checkOwnership` refuses a whole teardown on, for
+  **both** keys: it manufactured, in the act of refusing, the condition that
+  stops the remedy its own message names. Holding only the `adopt` then fixed one
+  branch of four and left `update` doing the same — and `update` is the *likelier*
+  input, since a hostname genuinely held by another service has a record that
+  does not match this spec.
+  **The objection that sent it down that road was wrong, and is recorded so
+  nobody re-derives it.** A whole-run refusal looked unfixable: nothing rebinds an
+  *orphan's* `service_key`, because only `ensureOne`'s adopt path rewrites a row
+  and an orphan is a kind the spec does not call for, so the row would refuse for
+  ever with no command to type. That overlooked the remedy the refusal itself
+  names. `teardown-service --service <owner>` removes the hostname's resources,
+  and it works **precisely because nothing was written** — every row still names
+  one service. Refusing early is what keeps that true; the narrower shapes are
+  what broke it.
+  Only orphans make a hostname contested. A *called-for* kind whose row names
+  another service is the ordinary reassignment an adopt exists to rebind, which
+  is deliberate. **On the paths that write upstream that is not safe either** — a
   `--access bookmark` spec against another service's *gated* application strips
-  its policies. That is **PRSR-48**, which this ticket deliberately does not fix.
-  The CLI's summary line for `refused` says "a state Purser will not act from"
-  rather than "upstream … fix it there", which is what it said until a live run
-  printed that over an ownership refusal. The two cases share an instruction and
-  differ about *where*, so the summary gives the instruction and each finding's
-  own text gives the where.
+  its policies and leaves it resolving — but that is **PRSR-48**, reachable
+  without `--prune` at all, and deliberately not fixed here.
 - **DETAIL describes the resource; ACTION carries the verb.** The prune line
   first read "… — removing it (app-77e1 …)", which is fine under `prune` and a
   lie under every other status the path produces, since `pruneOne` leaves Detail

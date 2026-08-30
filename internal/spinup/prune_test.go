@@ -440,14 +440,26 @@ func TestPrune_ADeclinedPruneDoesNotStillReadAsARemoval(t *testing.T) {
 	}
 }
 
-// **A prune may only remove this service's own resources.** `active` is built
-// from a hostname-keyed lookup, so without the guard every row at the hostname is
-// a prune candidate whatever service it is recorded to — and a spec naming
+// **A prune may only remove this service's own resources**, and the refusal is
+// the whole run rather than the orphan (found over three rounds of purser#58's
+// review). `active` is keyed on hostname alone, so without a guard a spec naming
 // `--access none` deletes *another* service's Access application, leaves its
 // hostname resolving, and marks the row removed so nothing mentions it again.
-// That is the hole `teardown-service` refuses on, reached through the additive
-// command (found in review of purser#58).
-func TestPrune_WillNotRemoveAnotherServicesResource(t *testing.T) {
+//
+// Refusing per-orphan was tried first and is wrong for a reason worth pinning:
+// `Ensure`'s additive pass would still run, and every row-writing branch of
+// ensureOne stamps this spec's service_key — so the run rebound one kind while
+// refusing the others, producing the half-reassigned hostname a teardown refuses
+// on for *both* keys. It manufactured, in the act of refusing, the condition
+// that stops the remedy its own message named.
+func TestPrune_RefusesAHostnameHoldingAnotherServicesResource(t *testing.T) {
+	// The likely input, not the convenient one: argosy's record does NOT match
+	// chronicle's direct spec, so the DNS step is an `update` rather than an
+	// `adopt`. That is the branch a narrower guard missed.
+	dns := &fakeProv{kind: model.ResourceDNSRecord,
+		state:   State{Exists: true, ExternalID: "id-dns_record", ParentID: "parent-dns_record"},
+		ensured: Resource{ExternalID: "id-dns_record", ParentID: "parent-dns_record", Detail: "repointed"}}
+
 	st := newStore()
 	for _, k := range model.KindOrder {
 		st.put(model.ServiceResource{
@@ -464,56 +476,36 @@ func TestPrune_WillNotRemoveAnotherServicesResource(t *testing.T) {
 	}
 	route := &fakeProv{kind: model.ResourceTunnelRoute}
 	app := &fakeProv{kind: model.ResourceAccessApp}
-	res, err := New(st, NewRegistry(route, app, dnsInPlace())).
-		Ensure(context.Background(), Request{Spec: spec, Apply: true, Prune: true})
-	if err != nil {
-		t.Fatal(err)
+	svc := New(st, NewRegistry(route, app, dns))
+
+	_, err = svc.Ensure(context.Background(), Request{Spec: spec, Apply: true, Prune: true})
+	if !errors.Is(err, ErrHostnameNotThisService) {
+		t.Fatalf("want ErrHostnameNotThisService, got %v", err)
+	}
+	for _, want := range []string{`"argosy"`, "chronicle", "teardown-service", "without --prune"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q: %v", want, err)
+		}
 	}
 
-	for _, k := range []model.ResourceKind{model.ResourceTunnelRoute, model.ResourceAccessApp} {
-		f := findingFor(t, res, k)
-		if f.Status != StepRefused {
-			t.Errorf("%s: %s, want %s", k, f.Status, StepRefused)
-		}
-		// It names the owner and the command that removes it. Only one, and only
-		// one that works: "run their spec with --prune" reads well and mostly
-		// does not, since their spec presumably still calls for this kind and so
-		// has no orphan to prune (PRSR-46 review).
-		for _, want := range []string{`"argosy"`, "teardown-service"} {
-			if !strings.Contains(f.Err, want) {
-				t.Errorf("%s: refusal does not mention %s: %q", k, want, f.Err)
-			}
-		}
-		if got := st.rows[key(teardownHost, k)].Status; got != model.ResourceActive {
-			t.Errorf("%s row is %q — nothing was removed, so nothing may be recorded as removed", k, got)
-		}
+	// Nothing removed, nothing written, nothing contacted — the refusal is
+	// before the walk, not a finding inside it.
+	if route.teardowns != 0 || app.teardowns != 0 || dns.ensures != 0 {
+		t.Errorf("the refusal acted (route=%d app=%d dnsEnsure=%d)", route.teardowns, app.teardowns, dns.ensures)
 	}
-	if route.teardowns != 0 || app.teardowns != 0 {
-		t.Errorf("another service's resource was deleted (route=%d app=%d)", route.teardowns, app.teardowns)
-	}
-	// It needs attention: the operator asked for a removal that did not happen.
-	if len(res.NeedsAttention()) != 3 {
-		t.Errorf("NeedsAttention has %d, want 3 (two refused orphans and the held adopt)", len(res.NeedsAttention()))
-	}
-	// **And the adopt is held**, which is the half a first version of this got
-	// wrong. An adopt would rebind only *this* row to chronicle while the refused
-	// kinds keep argosy — the half-reassigned state a teardown refuses outright —
-	// so the run would create, in the act of refusing, the very condition that
-	// stops the remedy its own message names (PRSR-46 review).
-	if got := findingFor(t, res, model.ResourceDNSRecord).Status; got != StepRefused {
-		t.Errorf("dns_record: %s, want %s — rebinding one row of a contested hostname splits its ownership", got, StepRefused)
+	if st.upserts != 0 || st.removals != 0 {
+		t.Errorf("the refusal wrote rows (upserts=%d removals=%d)", st.upserts, st.removals)
 	}
 	for _, k := range model.KindOrder {
 		if got := st.rows[key(teardownHost, k)].ServiceKey; got != "argosy" {
-			t.Errorf("%s row moved to %q; every row at a contested hostname must keep one owner", k, got)
+			t.Errorf("%s row moved to %q; every row must keep one owner", k, got)
 		}
 	}
 
-	// The assertion the whole thing is for: the command the refusal names has to
-	// actually run afterwards.
-	if _, err := New(st, NewRegistry(&fakeProv{kind: model.ResourceTunnelRoute},
-		&fakeProv{kind: model.ResourceAccessApp}, dnsInPlace())).
-		Teardown(context.Background(), TeardownRequest{ServiceKey: "argosy", Hostname: teardownHost}); err != nil {
+	// The assertion the whole shape is for, and the one two narrower versions
+	// failed: the command the refusal names has to actually run afterwards.
+	if _, err := svc.Teardown(context.Background(),
+		TeardownRequest{ServiceKey: "argosy", Hostname: teardownHost}); err != nil {
 		t.Errorf("the teardown this refusal tells the operator to run is refused: %v", err)
 	}
 }

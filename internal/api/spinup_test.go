@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -504,5 +505,61 @@ func TestSpinup_PrunedIsEchoed(t *testing.T) {
 	})
 	if body["pruned"] != true {
 		t.Errorf("pruned = %v, want true", body["pruned"])
+	}
+}
+
+// A prune of a hostname holding another service's resource is a 409, matching
+// POST /v1/teardowns' reading of the same sentinel: the request is well-formed
+// and it is the state that refuses it (PRSR-46).
+func TestSpinup_PruningAnotherServicesHostnameIs409(t *testing.T) {
+	st := newMemStore()
+	prov := &stubProv{kind: model.ResourceTunnelRoute}
+	svc := spinup.New(st, spinup.NewRegistry(
+		&stubProv{kind: model.ResourceDNSRecord},
+		&stubProv{kind: model.ResourceAccessApp},
+		prov,
+	), spinup.WithTunnels(spinup.TunnelSet{spinup.TunnelProd: "tunnel-1"}))
+	srv := httptest.NewServer(New(nil, svc, nil, "").Handler())
+	defer srv.Close()
+
+	_, _ = st.UpsertServiceResource(context.Background(), model.ServiceResource{
+		ServiceKey: "argosy", Hostname: "argosy.zerogravity.industries",
+		Kind: model.ResourceTunnelRoute, ParentID: "tunnel-1",
+	})
+
+	body := map[string]any{
+		"service": "chronicle", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"apply": true, "prune": true,
+	}
+	buf, _ := json.Marshal(body)
+	resp, err := srv.Client().Post(srv.URL+"/v1/spinups", "application/json", bytes.NewReader(buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d, want 409", resp.StatusCode)
+	}
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "argosy") {
+		t.Errorf("the 409 must name the owner, got %q", msg)
+	}
+	if prov.ensures != 0 {
+		t.Error("the refusal acted")
+	}
+
+	// Without prune the same request is an ordinary 200 — nothing was going to
+	// be removed, so there is nothing to refuse.
+	delete(body, "prune")
+	buf, _ = json.Marshal(body)
+	resp2, err := srv.Client().Post(srv.URL+"/v1/spinups", "application/json", bytes.NewReader(buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("status %d without prune, want 200", resp2.StatusCode)
 	}
 }

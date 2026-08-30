@@ -272,6 +272,14 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if errors.Is(err, spinup.ErrHostnameNotThisService) {
+			// A `prune` asked to remove a resource this hostname's records
+			// attribute to another service (PRSR-46). 409 rather than 400, for
+			// the reading POST /v1/teardowns gives the same sentinel: the
+			// request is well-formed and it is the *state* that refuses it.
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		log.Printf("api: spin-up of %s failed: %v", spec.Hostname, err)
 		writeError(w, http.StatusInternalServerError, "spin-up failed")
 		return
