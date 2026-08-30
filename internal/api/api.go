@@ -216,6 +216,13 @@ type spinupRequest struct {
 	LogoURL string `json:"logo_url"`
 	Tunnel  string `json:"tunnel"`
 	Apply   bool   `json:"apply"`
+	// Prune asks the run to remove what the spec no longer calls for (PRSR-46).
+	//
+	// Both this and `apply` are needed to remove anything, and both default to
+	// false — so a caller written against an earlier release gets exactly the
+	// behaviour it was written for, and the one destructive thing this endpoint
+	// can do takes two fields nobody sets by accident.
+	Prune bool `json:"prune"`
 }
 
 func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
@@ -252,7 +259,7 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.spin.Ensure(r.Context(), spinup.Request{Spec: spec, Apply: req.Apply})
+	res, err := s.spin.Ensure(r.Context(), spinup.Request{Spec: spec, Apply: req.Apply, Prune: req.Prune})
 	if err != nil {
 		// Everything a provisioner did or failed to do is a finding, so this is
 		// only reached for a request that could not be attempted: an
@@ -286,6 +293,13 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 	for _, f := range res.Findings {
 		if f.Status == spinup.StepAppliedNotRecorded {
 			log.Printf("api: spin-up of %s: %s changed upstream but was not recorded: %s",
+				spec.Hostname, f.Kind, f.Err)
+		}
+		if f.Status == spinup.StepPrunedNotRecorded {
+			// The mirror of the line above and logged for its reason: the
+			// resource is gone and Purser holds a live-looking row for it, which
+			// a later run reads as something to adopt.
+			log.Printf("api: spin-up of %s: %s was removed but not recorded: %s",
 				spec.Hostname, f.Kind, f.Err)
 		}
 		if f.Warning != "" {

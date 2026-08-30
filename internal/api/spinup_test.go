@@ -426,3 +426,83 @@ func TestSpinup_NeedsAttentionSeparatesUnconfiguredFromAlreadyCorrect(t *testing
 		t.Errorf("an edge that matches the spec needs no attention, got %v", fine["needs_attention"])
 	}
 }
+
+// --- prune (PRSR-46) --------------------------------------------------------
+
+// `prune` and `apply` are both needed to remove anything, and both default to
+// false — so a caller written against an earlier release gets exactly the
+// behaviour it was written for.
+func TestSpinup_PruneDefaultsOffAndNeedsApply(t *testing.T) {
+	for name, body := range map[string]map[string]any{
+		"neither":    {},
+		"apply only": {"apply": true},
+		"prune only": {"prune": true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newMemStore()
+			prov := &stubProv{kind: model.ResourceTunnelRoute}
+			svc := spinup.New(st, spinup.NewRegistry(
+				&stubProv{kind: model.ResourceDNSRecord},
+				&stubProv{kind: model.ResourceAccessApp},
+				prov,
+			), spinup.WithTunnels(spinup.TunnelSet{spinup.TunnelProd: "tunnel-1"}))
+			srv := httptest.NewServer(New(nil, svc, nil, "").Handler())
+			defer srv.Close()
+
+			// A row for a kind this direct spec does not call for.
+			_, _ = st.UpsertServiceResource(context.Background(), model.ServiceResource{
+				ServiceKey: "argosy", Hostname: "argosy.zerogravity.industries",
+				Kind: model.ResourceTunnelRoute, ExternalID: "", ParentID: "tunnel-1",
+			})
+
+			req := map[string]any{
+				"service": "argosy", "hostname": "argosy.zerogravity.industries",
+				"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+			}
+			for k, v := range body {
+				req[k] = v
+			}
+			buf, _ := json.Marshal(req)
+			resp, err := srv.Client().Post(srv.URL+"/v1/spinups", "application/json", bytes.NewReader(buf))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			var out map[string]any
+			_ = json.NewDecoder(resp.Body).Decode(&out)
+
+			for _, raw := range out["findings"].([]any) {
+				f := raw.(map[string]any)
+				if f["kind"] != string(model.ResourceTunnelRoute) {
+					continue
+				}
+				wantStatus := "orphaned"
+				if body["prune"] == true {
+					wantStatus = "prune"
+				}
+				if f["status"] != wantStatus {
+					t.Errorf("tunnel_route status = %v, want %v", f["status"], wantStatus)
+				}
+				if f["applied"] == true {
+					t.Error("something was removed without both flags")
+				}
+			}
+			if st.rows[hostname(model.ServiceResource{Hostname: "argosy.zerogravity.industries", Kind: model.ResourceTunnelRoute})].Status != model.ResourceActive {
+				t.Error("the row was marked removed without both flags")
+			}
+		})
+	}
+}
+
+// `pruned` echoes the request, so a caller can tell an `orphaned` line that was
+// never going to be acted on from one on a run that asked.
+func TestSpinup_PrunedIsEchoed(t *testing.T) {
+	srv, _ := spinupServer(t)
+	_, body := postSpinup(t, srv, map[string]any{
+		"service": "argosy", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark", "prune": true,
+	})
+	if body["pruned"] != true {
+		t.Errorf("pruned = %v, want true", body["pruned"])
+	}
+}

@@ -10,7 +10,7 @@ import (
 	"github.com/Einlanzerous/purser/internal/spinup"
 )
 
-const provisionUsage = "usage: purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply]"
+const provisionUsage = "usage: purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply] [--prune]"
 
 // runProvisionService is `purser provision-service`: stand up the edge for a
 // service — its DNS record, its Cloudflare Access application, and (when it is
@@ -50,6 +50,7 @@ func runProvisionService(args []string) {
 		logo     = fs.String("logo", "", "launcher icon: placard (default — resolve it by service key), none (clear it), or an https url")
 		tunnel   = fs.String("tunnel", "", "which tunnel carries it: prod (required for --mode tunnelled, refused for direct)")
 		apply    = fs.Bool("apply", false, "actually create and update; without it this is a plan")
+		prune    = fs.Bool("prune", false, "also remove what this spec no longer calls for — the resources otherwise reported as `orphaned`; needs --apply to act")
 	)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, provisionUsage)
@@ -62,6 +63,11 @@ func runProvisionService(args []string) {
 		fmt.Fprintln(os.Stderr, "The launcher icon defaults to --logo placard, which resolves the mark")
 		fmt.Fprintln(os.Stderr, "by service key. An omitted --logo therefore leaves an existing icon")
 		fmt.Fprintln(os.Stderr, "alone; only --logo none removes one.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Without --prune, a resource this spec no longer calls for is reported")
+		fmt.Fprintln(os.Stderr, "as `orphaned` and left exactly where it is. --prune removes it, after")
+		fmt.Fprintln(os.Stderr, "the additive steps have landed, and is the only thing this command")
+		fmt.Fprintln(os.Stderr, "can do that takes something away.")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
@@ -97,7 +103,7 @@ func runProvisionService(args []string) {
 	// os.Exit skips deferred calls and this command has non-zero exits that are
 	// not crashes, so the pool is closed explicitly rather than by a defer only
 	// the error paths would reach — the arrangement offboard uses.
-	code := provisionService(ctx, a, spinup.Request{Spec: spec, Apply: *apply})
+	code := provisionService(ctx, a, spinup.Request{Spec: spec, Apply: *apply, Prune: *prune})
 	a.cleanup()
 	os.Exit(code)
 }
@@ -157,8 +163,16 @@ func printProvision(res *spinup.Result) {
 		fmt.Fprintf(os.Stderr, "%d held back so the hostname is not published in front of a step that did not land.\n", n)
 	}
 	if n := c[spinup.StepOrphaned]; n > 0 {
-		fmt.Fprintf(os.Stderr, "%d recorded here but not called for by this spec — still live, and this spec will never remove %s.\n",
+		// Names the flag, because the whole reason this line used to end
+		// "and this spec will never remove them" was that there was no flag
+		// (PRSR-46). It still exits zero: an orphan does not falsify the claim
+		// the exit code makes, which is that the spec is satisfied.
+		fmt.Fprintf(os.Stderr, "%d recorded here but not called for by this spec — still live. Re-run with --prune to remove %s.\n",
 			n, plural2(n, "it", "them"))
+	}
+	if n := c[spinup.StepPrunedNotRecorded]; n > 0 {
+		fmt.Fprintf(os.Stderr, "%d removed but NOT recorded — %s gone, and Purser's rows still say otherwise. Fix the rows: a later run would read them as something to adopt.\n",
+			n, plural2(n, "it is", "they are"))
 	}
 	if n := c[spinup.StepMissing]; n > 0 {
 		fmt.Fprintf(os.Stderr, "%d recorded by Purser and gone from upstream — removed outside Purser.\n", n)
@@ -223,6 +237,13 @@ func provisionOutcome(res *spinup.Result) string {
 	switch {
 	case res.Applied:
 		return fmt.Sprintf("Applied %d of %d.", res.Changed(), len(res.Findings))
+	case res.Pending() > 0 && res.Pruned:
+		// Worth spelling out separately: with --prune in play, "act on" covers
+		// deletions, and a plan that says only "act on 3 steps" over a line that
+		// is going to remove a live Access application is not a plan anybody
+		// should be reading in a hurry.
+		return fmt.Sprintf("Plan — nothing created, changed or removed. Re-run with --apply to act on %d step%s, removals included.",
+			res.Pending(), plural(res.Pending()))
 	case res.Pending() > 0:
 		return fmt.Sprintf("Plan — nothing created or changed. Re-run with --apply to act on %d step%s.",
 			res.Pending(), plural(res.Pending()))

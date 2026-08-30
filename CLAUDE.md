@@ -459,6 +459,59 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   orchestrator marked the row removed over a rule still in the file. "No rule for
   this hostname" out of a document nobody may read is not evidence, which is the
   revoked-not-recorded lie reached through a read rather than a write.
+- **`--prune` is the orphan's command, and it is a *second* flag on purpose**
+  (PRSR-46). An orphan is a resource at a hostname the spec is keeping up — a
+  service that was `--access gated` and is now `--access none` — so
+  `teardown-service` is the wrong tool twice over: it removes everything at the
+  hostname, and it works from rows and has no spec, which is the only thing that
+  can tell an orphan from a resource. `Ensure` can, so the command lives there.
+  Both `--apply` and `--prune` are needed to remove anything: `--apply` is "act
+  on this plan", `--prune` is "and the plan includes taking things away", and the
+  overwhelmingly common operator never has to think about the second.
+- **Pruning runs after the whole additive pass, and that ordering is the reason
+  it is safe rather than a tidiness.** The case that decides it is a tunnelled →
+  direct switch: the ingress route becomes an orphan while the DNS step
+  *repoints* the record off `<tunnel>.cfargotunnel.com`. Drop the route first and
+  the hostname 502s until the record catches up; repoint first and the route is
+  already serving nobody when it goes. Running `KindOrder` to completion gets
+  that for every spec without a second ordering rule to keep in step.
+  The guard behind it is one rule, deliberately stronger than a per-kind
+  dependency list: **a prune is held back when any step the spec *does* call for
+  did not land** (`unmetPruneDeps`, reusing `inPlace`). `--prune` means "make the
+  edge match this spec", so if the additive half didn't land the edge is not the
+  one the spec describes, and removing what it no longer names is acting on a
+  state nobody has. The concrete case is the ordering one gone wrong — a *failed*
+  DNS repoint leaves the record pointing at the tunnel, so dropping the route
+  takes a working service down — and the general rule catches it without needing
+  to know it, which is what an enumeration of pairs would stop doing the moment a
+  fourth kind arrives.
+- **`prune` is a status, and `pruned-not-recorded` is not
+  `applied-not-recorded`.** `--prune` changes what the run is *asking for*, so an
+  extra resource stops being "nothing will be done about this" and becomes "this
+  is going" — different instructions to a reader, which is what a status is for.
+  Note this is not the distinction `--apply` makes: `--apply` never changes a
+  status, because the plan is the first half of the apply. And the two
+  not-recorded statuses point opposite ways: `applied-not-recorded` means
+  something was *created* and Purser holds no id, so a teardown would miss it;
+  `pruned-not-recorded` means something is *gone* and Purser holds a live-looking
+  row, so a later run reads it as one to adopt. Same argument PRSR-34 made for
+  keeping `removed-not-recorded` separate.
+- **`orphaned` still does not count toward `NeedsAttention`, and the reason is
+  now the durable one.** It has outlived two: "nothing orchestrates a teardown",
+  then "PRSR-34's walk is whole-hostname". Neither survives `--prune`. It stays
+  excluded because an orphan does not falsify the claim that method makes — "the
+  spec is satisfied", and everything the spec asks for *is* in place. Reading it
+  as "and nothing else is here" is the rounding-up the exclusion exists to stop.
+  A run that passed `--prune` reports `prune` instead, which **is** counted by
+  `Pending`: that run asked for the removal, so it is work outstanding rather
+  than a state.
+- **DETAIL describes the resource; ACTION carries the verb.** The prune line
+  first read "… — removing it (app-77e1 …)", which is fine under `prune` and a
+  lie under every other status the path produces, since `pruneOne` leaves Detail
+  alone when it declines. A live run against an unconfigured deployment printed
+  `unavailable` beside "removing it" — a plan promising in one column what it
+  refuses in the next. Found by running the binary, which is now the fifth time
+  on this axis.
 - **The tunnel is a spec field, not a global** (PRSR-33). The account has two
   healthy tunnels; a dev instance is the same shape pointed at a different one.
   Specs name a ref (`prod` | `dev`) and `TunnelSet` resolves it to an id once per
@@ -1237,6 +1290,13 @@ One caveat it does **not** retire: nothing on the teardown path has contacted
 Cloudflare. PRSR-40 and PRSR-42 retired that for the write verbs; the way down is
 still fake-only, and both of its two silent-success bugs were found by argument
 rather than by observation. **PRSR-47** holds the live run.
+
+**PRSR-46 gives the orphan a command**: `provision-service --prune`, plus
+`"prune": true` on `POST /v1/spinups`. It closes the gap PRSR-34 left open and
+named — `Ensure` reported a resource the spec no longer called for, exited zero,
+and there was nothing to type. See the invariants above for the two things that
+make it safe rather than merely possible: it runs after the additive pass, and it
+is held back when any step the spec *does* call for did not land.
 
 **PRSR-41 was found by running the binary** — the third time on this axis that
 has caught something reading could not (PRSR-31's outcome line, PRSR-38's

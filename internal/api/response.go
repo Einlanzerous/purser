@@ -138,8 +138,11 @@ func newStatusResponse(inv model.Invite, tasks []model.ProvisionTask) statusResp
 // lowercased and a display name defaults to the key, and a caller comparing what
 // it sent against what was recorded needs the form the run actually used.
 type spinupResponse struct {
-	Spec     spinupSpecDTO  `json:"spec"`
-	Applied  bool           `json:"applied"`
+	Spec    spinupSpecDTO `json:"spec"`
+	Applied bool          `json:"applied"`
+	// Pruned echoes the request's `prune`, so a caller can tell an `orphaned`
+	// line that was never going to be acted on from one on a run that asked.
+	Pruned   bool           `json:"pruned"`
 	Findings []stepDTO      `json:"findings"`
 	Counts   map[string]int `json:"counts"`
 	// Pending is how many steps still want doing — what distinguishes "nothing
@@ -216,6 +219,7 @@ func newSpinupResponse(res *spinup.Result) spinupResponse {
 			Tunnel:      string(res.Spec.Tunnel),
 		},
 		Applied: res.Applied,
+		Pruned:  res.Pruned,
 		Counts:  make(map[string]int),
 		Pending: res.Pending(),
 		Changed: res.Changed(),
