@@ -475,9 +475,11 @@ func TestPrune_WillNotRemoveAnotherServicesResource(t *testing.T) {
 		if f.Status != StepRefused {
 			t.Errorf("%s: %s, want %s", k, f.Status, StepRefused)
 		}
-		// It names the owner, and the two commands that would actually remove
-		// it — a refusal with no way forward is the mistake this is not.
-		for _, want := range []string{`"argosy"`, "--prune", "teardown-service"} {
+		// It names the owner and the command that removes it. Only one, and only
+		// one that works: "run their spec with --prune" reads well and mostly
+		// does not, since their spec presumably still calls for this kind and so
+		// has no orphan to prune (PRSR-46 review).
+		for _, want := range []string{`"argosy"`, "teardown-service"} {
 			if !strings.Contains(f.Err, want) {
 				t.Errorf("%s: refusal does not mention %s: %q", k, want, f.Err)
 			}
@@ -490,15 +492,29 @@ func TestPrune_WillNotRemoveAnotherServicesResource(t *testing.T) {
 		t.Errorf("another service's resource was deleted (route=%d app=%d)", route.teardowns, app.teardowns)
 	}
 	// It needs attention: the operator asked for a removal that did not happen.
-	if len(res.NeedsAttention()) != 2 {
-		t.Errorf("NeedsAttention has %d, want 2", len(res.NeedsAttention()))
+	if len(res.NeedsAttention()) != 3 {
+		t.Errorf("NeedsAttention has %d, want 3 (two refused orphans and the held adopt)", len(res.NeedsAttention()))
 	}
-	// And the additive half is untouched — adopting a reassigned hostname
-	// rewrites a row and touches nothing upstream, which is deliberate. Refusing
-	// the whole run would also be unfixable: nothing rebinds an orphan's
-	// service_key, so the row would refuse for ever with no command to type.
-	if got := findingFor(t, res, model.ResourceDNSRecord).Status; got != StepAdopt {
-		t.Errorf("dns_record: %s, want %s — the additive half is legitimate here", got, StepAdopt)
+	// **And the adopt is held**, which is the half a first version of this got
+	// wrong. An adopt would rebind only *this* row to chronicle while the refused
+	// kinds keep argosy — the half-reassigned state a teardown refuses outright —
+	// so the run would create, in the act of refusing, the very condition that
+	// stops the remedy its own message names (PRSR-46 review).
+	if got := findingFor(t, res, model.ResourceDNSRecord).Status; got != StepRefused {
+		t.Errorf("dns_record: %s, want %s — rebinding one row of a contested hostname splits its ownership", got, StepRefused)
+	}
+	for _, k := range model.KindOrder {
+		if got := st.rows[key(teardownHost, k)].ServiceKey; got != "argosy" {
+			t.Errorf("%s row moved to %q; every row at a contested hostname must keep one owner", k, got)
+		}
+	}
+
+	// The assertion the whole thing is for: the command the refusal names has to
+	// actually run afterwards.
+	if _, err := New(st, NewRegistry(&fakeProv{kind: model.ResourceTunnelRoute},
+		&fakeProv{kind: model.ResourceAccessApp}, dnsInPlace())).
+		Teardown(context.Background(), TeardownRequest{ServiceKey: "argosy", Hostname: teardownHost}); err != nil {
+		t.Errorf("the teardown this refusal tells the operator to run is refused: %v", err)
 	}
 }
 

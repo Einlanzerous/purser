@@ -522,6 +522,23 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   orphan is a kind the spec does not call for. The row would refuse for ever with
   no command to type. The refusal names the two that work instead: that service's
   own spec with `--prune`, or a teardown of the hostname as that service.
+  **And the run must not create the state it is refusing over.** `Ensure`'s
+  additive pass reaches `StepAdopt` on exactly the same mismatch, and an adopt
+  rebinds a row: on a hostname where a prune is already refusing, that moves one
+  kind to this spec's service while the refused kinds keep the old one — the
+  "half-reassigned" state `checkOwnership` refuses a whole teardown on. So the
+  run would manufacture, in the act of refusing, the condition that stops the
+  remedy its own message names. The adopt is therefore held (`contested`,
+  computed before the loop so it does not depend on KindOrder deciding orphans
+  first) and only the adopt is: a create or an update is an upstream change the
+  operator asked for. The refusal also names **one** remedy rather than two —
+  "run their spec with `--prune`" reads well and mostly does not work, since
+  their spec presumably still *calls for* that kind and so has no orphan to
+  prune.
+  **The additive half is still not safe on a contested hostname**, and the
+  comment there says so rather than implying otherwise: an `update` writes, and a
+  `--access bookmark` spec against another service's *gated* application strips
+  its policies. That is **PRSR-48**, which this ticket deliberately does not fix.
   The CLI's summary line for `refused` says "a state Purser will not act from"
   rather than "upstream … fix it there", which is what it said until a live run
   printed that over an ownership refusal. The two cases share an instruction and

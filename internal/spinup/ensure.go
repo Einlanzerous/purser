@@ -438,6 +438,11 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 	// Findings so far, so a step can see whether the steps it depends on are in
 	// place. KindOrder is an apply order, so a dependency has always been
 	// decided by the time its dependent is reached.
+	// Whether this run is about to refuse an orphan for belonging to somebody
+	// else — computed before the loop rather than read out of it, so it does not
+	// depend on KindOrder happening to decide the orphans first.
+	contested := req.Prune && contestedOwnership(spec, active)
+
 	done := make(map[model.ResourceKind]StepFinding, len(model.KindOrder))
 	for _, kind := range model.KindOrder {
 		rec, hasRec := active[kind]
@@ -445,7 +450,7 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 		if !spec.callsFor(kind) {
 			f = notApplicable(kind, spec, rec, hasRec, s.registry, req.Prune)
 		} else {
-			f = s.ensureOne(ctx, target, kind, rec, hasRec, req.Apply, unmetDeps(spec, kind, done))
+			f = s.ensureOne(ctx, target, kind, rec, hasRec, req.Apply, unmetDeps(spec, kind, done), contested)
 		}
 		done[kind] = f
 	}
@@ -478,6 +483,24 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 		res.Findings = append(res.Findings, done[kind])
 	}
 	return res, nil
+}
+
+// contestedOwnership reports whether this hostname holds a resource this spec
+// does not call for and does not own — the state that makes an orphan refusable
+// (see notApplicable).
+//
+// Only orphans count. A *called-for* kind whose row names another service is the
+// ordinary reassignment an adopt exists to rebind, and that is deliberate.
+func contestedOwnership(spec ServiceSpec, active map[model.ResourceKind]model.ServiceResource) bool {
+	for _, kind := range model.KindOrder {
+		if spec.callsFor(kind) {
+			continue
+		}
+		if rec, ok := active[kind]; ok && rec.ServiceKey != spec.Key {
+			return true
+		}
+	}
+	return false
 }
 
 // unmetPruneDeps returns the steps this spec *does* call for that did not land.
@@ -644,9 +667,11 @@ func notApplicable(kind model.ResourceKind, spec ServiceSpec, rec model.ServiceR
 		//
 		// Per-resource rather than refusing the whole run, which is the shape
 		// `checkOwnership` takes on the teardown walk. Two reasons. `Ensure`'s
-		// additive half is legitimate here — adopting a reassigned hostname
-		// rewrites a row and touches nothing upstream, and is deliberate
-		// behaviour — and, decisively, a whole-run refusal would be unfixable:
+		// additive half is what the operator asked for and this design keeps it
+		// acting — note that is a statement about intent, not a claim that the
+		// additive half is harmless on a contested hostname: it is not, and
+		// PRSR-48 holds the part of that this ticket does not fix. And,
+		// decisively, a whole-run refusal would be unfixable:
 		// nothing rebinds an *orphan's* service_key, because only ensureOne's
 		// adopt path rewrites a row and an orphan is a kind the spec does not
 		// call for. So the row would refuse for ever with no command to type,
@@ -655,8 +680,14 @@ func notApplicable(kind model.ResourceKind, spec ServiceSpec, rec model.ServiceR
 		// --prune, or a teardown of the hostname as that service.
 		f.Status = StepRefused
 		f.Detail = fmt.Sprintf("%s, and Purser recorded one here%s", f.Detail, prunedTarget(rec))
-		f.Err = fmt.Sprintf("recorded to service %q, not %q — a spin-up removes only its own service's resources; remove it by running %s's spec with --prune, or `purser teardown-service --service %s --hostname %s`",
-			rec.ServiceKey, spec.Key, rec.ServiceKey, rec.ServiceKey, rec.Hostname)
+		// Names one remedy, and only one that works. "Run their spec with
+		// --prune" reads well and mostly does not: their spec presumably still
+		// *calls for* this kind, so it reaches ensureOne rather than
+		// notApplicable and there is no orphan to prune (PRSR-46 review). The
+		// teardown does work — but only because the adopt above is held, which
+		// is what keeps every row at this hostname naming one service.
+		f.Err = fmt.Sprintf("recorded to service %q, not %q — a spin-up removes only its own service's resources; remove it as its owner: `purser teardown-service --service %s --hostname %s`",
+			rec.ServiceKey, spec.Key, rec.ServiceKey, rec.Hostname)
 		return f
 	}
 	f.Status = StepPrune
@@ -694,7 +725,7 @@ func prunedTarget(rec model.ServiceResource) string {
 // Like offboardOne it returns no error: every outcome is a finding. Once a step
 // has changed the edge, aborting would discard the findings accumulated so far
 // and leave the operator with an error and no idea what was already created.
-func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKind, rec model.ServiceResource, hasRec bool, apply bool, unmet []model.ResourceKind) StepFinding {
+func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKind, rec model.ServiceResource, hasRec bool, apply bool, unmet []model.ResourceKind, contested bool) StepFinding {
 	f := StepFinding{Kind: kind, DisplayName: string(kind)}
 
 	prov, ok := s.registry.Get(kind)
@@ -749,6 +780,24 @@ func (s *Service) ensureOne(ctx context.Context, t Target, kind model.ResourceKi
 		f.Status = StepAdopt
 	default:
 		f.Status = StepOK
+		return f
+	}
+
+	// An adopt is a pure rebinding of a row, and on a hostname where this run is
+	// already refusing to touch somebody else's orphan it is the one write that
+	// makes things worse (PRSR-46 review). It would move *this* kind to the
+	// spec's service while the refused kinds keep the old one — which is the
+	// "half-reassigned" state `checkOwnership` refuses a whole teardown on, so
+	// the run would create, in the act of refusing, exactly the condition that
+	// stops the remedy its own message names from working.
+	//
+	// Only the adopt is held. A create or an update is an upstream change the
+	// operator asked for, and blocking those would block the additive half this
+	// per-resource design exists to keep.
+	if contested && f.Status == StepAdopt {
+		f.Status = StepRefused
+		f.Err = fmt.Sprintf("recorded to service %q, not %q, and this run is already refusing to remove a resource of theirs at this hostname — rebinding only this row would leave the hostname's records naming two services, which is the state a teardown refuses outright; resolve who owns %s first",
+			rec.ServiceKey, t.Spec.Key, t.Spec.Hostname)
 		return f
 	}
 
