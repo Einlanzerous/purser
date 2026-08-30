@@ -1165,8 +1165,18 @@ func TestTunnel_TeardownLeavesARuleBehindAShadowAlone(t *testing.T) {
 	}
 	// And it is reported rather than silently left: the whole complaint was that
 	// one path mentions these rules and the other does not.
-	if !strings.Contains(rm.Detail, "behind") {
-		t.Errorf("the removal must say a rule was left in place, got %q", rm.Detail)
+	//
+	// On Warning, not in Detail. The step succeeded — the reachable route is
+	// gone — but a rule left behind may be one Purser wrote that a later
+	// wildcard orphaned, and after this run nothing records it. That is trouble
+	// around a resource other than the one Detail describes, which is what
+	// Warning is for and why a caller must be able to find it without
+	// pattern-matching a truncatable column (purser#56 review).
+	if !strings.Contains(rm.Warning, "behind") {
+		t.Errorf("the leftover must reach Warning, got %q", rm.Warning)
+	}
+	if strings.Contains(rm.Detail, "behind") {
+		t.Errorf("the leftover is buried in Detail: %q", rm.Detail)
 	}
 }
 
@@ -1181,13 +1191,75 @@ func TestTunnel_TeardownDoesNotReadItsOwnRestraintAsAFailure(t *testing.T) {
 	if _, err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
 		t.Fatalf("the dead rule it deliberately kept must not read as 'still routed': %v", err)
 	}
-	// Idempotent from there: the reachable route is gone, so a second run finds
-	// nothing to remove and writes nothing.
+	if _, puts := f.counts(); puts != 1 {
+		t.Errorf("%d PUTs, want 1", puts)
+	}
+}
+
+// **A dead rule is not reliably somebody else's.** The first version of this
+// change said it was, on the grounds that assertWritable cannot write a route
+// into a region cloudflared never reaches — true at *write* time, and nowhere
+// else, because shadowing is a property of the document rather than of the rule.
+// Insert a wildcard above a specific rule and a route Purser did write is dead,
+// with the document still well-formed.
+//
+// Nothing reachable to remove is then not evidence the route is gone, and
+// returning success has the orchestrator mark the row removed over a rule still
+// in the file — recorded-not-removed, the mirror of PRSR-17's lie, and the
+// well-formed version of the malformed-document refusal. Found in review of
+// purser#56, where the test above pinned the wrong behaviour on its second call.
+func TestTunnel_TeardownRefusesWhenTheOnlyRuleLeftIsBehindAShadow(t *testing.T) {
+	f := newFakeTunnel(t, `{"ingress":[
+		{"hostname":"switchyard.zerogravity.industries","service":"http://switchyard:4001"},
+		{"hostname":"*.zerogravity.industries","service":"http://holding-page:80"},
+		{"hostname":"lyceum.zerogravity.industries","service":"http://lyceum:8083"},
+		{"service":"http_status:404"}
+	]}`)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	_, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if err == nil {
+		t.Fatal("a rule for the hostname behind a shadow is not 'already gone' — reporting success marks the row removed over a rule still in the file")
+	}
+	if !spinup.IsRefused(err) {
+		t.Errorf("want ErrRefused — the read succeeded and what needs deciding is upstream — got %v", err)
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("a refused teardown wrote (%d PUTs)", puts)
+	}
+	// Distinguished from the plain "nothing here" case, which stays an
+	// idempotent success: an absent route really is absent.
+	clean := newFakeTunnel(t, liveShape)
+	rm, err := clean.prov(t).Teardown(context.Background(),
+		target(t, "interlock.zerogravity.industries", "http://interlock:8080"),
+		model.ServiceResource{Hostname: "interlock.zerogravity.industries", ParentID: testTunnelID})
+	if err != nil {
+		t.Fatalf("a hostname with no rule at all is still a clean no-op: %v", err)
+	}
+	if !strings.Contains(rm.Detail, "not routed") {
+		t.Errorf("detail %q", rm.Detail)
+	}
+}
+
+// The second teardown of a hostname whose reachable route this run removed, on a
+// document that still carries a dead rule for it. It refuses rather than
+// reporting a clean sweep — which is the same finding from the other side, and
+// the case the old test asserted backwards.
+func TestTunnel_ASecondTeardownOverALeftoverRefuses(t *testing.T) {
+	f := newFakeTunnel(t, shadowedTeardownDoc)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
 	if _, err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
-		t.Fatalf("second Teardown: %v", err)
+		t.Fatalf("first Teardown: %v", err)
+	}
+	_, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if !spinup.IsRefused(err) {
+		t.Fatalf("want ErrRefused on the re-run, got %v", err)
 	}
 	if _, puts := f.counts(); puts != 1 {
-		t.Errorf("%d PUTs across two teardowns, want 1 — the second had nothing to remove", puts)
+		t.Errorf("%d PUTs, want 1 — the refusal writes nothing", puts)
 	}
 }
 
