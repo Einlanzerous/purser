@@ -549,12 +549,12 @@ func (p *DNSProvisioner) removeStray(ctx context.Context, stray dnsRecord, cause
 // that reported failure for an absent record would leave a removed resource on
 // the books as live, which is offboard's "revoke that didn't happen" (PRSR-17)
 // pointed the other way.
-func (p *DNSProvisioner) Teardown(ctx context.Context, _ spinup.Target, rec model.ServiceResource) error {
-	if !p.configured() {
-		return p.unavailable()
+func (p *DNSProvisioner) Teardown(ctx context.Context, t spinup.Target, rec model.ServiceResource) (spinup.Removal, error) {
+	if err := p.CanTeardown(t); err != nil {
+		return spinup.Removal{}, err
 	}
 	if strings.TrimSpace(rec.ExternalID) == "" {
-		return fmt.Errorf("cloudflare: no DNS record id was recorded for %s — Purser deletes only ids it recorded, since a record found by name may be one somebody created by hand",
+		return spinup.Removal{}, fmt.Errorf("cloudflare: no DNS record id was recorded for %s — Purser deletes only ids it recorded, since a record found by name may be one somebody created by hand",
 			rec.Hostname)
 	}
 	// The recorded parent, not today's config: a zone id read from configuration
@@ -565,18 +565,36 @@ func (p *DNSProvisioner) Teardown(ctx context.Context, _ spinup.Target, rec mode
 	got, err := p.recordByID(ctx, zone, rec.ExternalID)
 	switch {
 	case dnsRecordNotFound(err):
-		return nil // already gone
+		return spinup.Removal{Detail: fmt.Sprintf("DNS record %s was already gone from zone %s", rec.ExternalID, zone)}, nil
 	case err != nil:
-		return err
+		return spinup.Removal{}, err
 	}
 	if !strings.EqualFold(trimDot(got.Name), trimDot(rec.Hostname)) {
 		// The id outlived what it referred to. Deleting whatever it names now
 		// would remove a record for a hostname nobody asked about.
-		return fmt.Errorf("cloudflare: recorded DNS record %s answers for %q, not %q — refusing to delete a record that is no longer this hostname's",
+		return spinup.Removal{}, fmt.Errorf("cloudflare: recorded DNS record %s answers for %q, not %q — refusing to delete a record that is no longer this hostname's",
 			rec.ExternalID, got.Name, rec.Hostname)
 	}
-	if err := p.delete(ctx, zone, rec.ExternalID); err != nil && !dnsRecordNotFound(err) {
-		return err
+	if err := p.delete(ctx, zone, rec.ExternalID); err != nil {
+		if !dnsRecordNotFound(err) {
+			return spinup.Removal{}, err
+		}
+		// Read a moment ago and absent now. Reported as its own line rather than
+		// folded into the ordinary success: somebody else deleted it between the
+		// two calls, which is worth an operator seeing on a hostname they are
+		// taking down.
+		return spinup.Removal{Detail: fmt.Sprintf("DNS record %s (%s %s) went between the read and the delete — it is gone, and something other than this run removed it", rec.ExternalID, got.Type, trimDot(got.Name))}, nil
+	}
+	return spinup.Removal{Detail: fmt.Sprintf("deleted the %s record for %s (%s) from zone %s", got.Type, trimDot(got.Name), rec.ExternalID, zone)}, nil
+}
+
+// CanTeardown answers from configuration alone, so a teardown *plan* can report
+// this step honestly without calling anything. Teardown delegates to it rather
+// than repeating the check, which is what stops the plan and the apply drifting
+// (spinup.TeardownChecker, after connector.CanDeprovision).
+func (p *DNSProvisioner) CanTeardown(spinup.Target) error {
+	if !p.configured() {
+		return p.unavailable()
 	}
 	return nil
 }

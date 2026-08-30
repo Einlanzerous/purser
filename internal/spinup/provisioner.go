@@ -105,6 +105,28 @@ type Resource struct {
 	Warning string
 }
 
+// Removal is what Teardown took away. It is Resource's counterpart on the way
+// down, and it carries no ids for the reason it doesn't need any: the caller
+// already holds the row that was targeted, and what it does not hold is a
+// description of what happened to it.
+//
+// It exists because `error` alone was not a wide enough return (PRSR-30 review,
+// carried onto PRSR-34). The tunnel's concurrent-write note is the case that
+// forced it: on the Ensure path that warning reaches the operator through
+// Resource.Warning, and on the teardown path it reached a server log and
+// nothing else — so whoever ran the teardown was told nothing, about the one
+// message that says another service may have just lost its route.
+type Removal struct {
+	// Detail describes what was removed, or why there was nothing to remove —
+	// the line an operator reads to check that what went was what they meant.
+	Detail string
+	// Warning is trouble *around* a removal that succeeded, and never a reason
+	// to call it failed. Same field, same rule and same reader as
+	// Resource.Warning: it is about a resource that is not this one, so it must
+	// be findable without pattern-matching a substring out of Detail.
+	Warning string
+}
+
 // ServiceProvisioner manages one kind of edge resource for a service. It is the
 // spin-up axis's Connector: registered by kind, asked to make upstream match a
 // spec, and required to be idempotent.
@@ -146,7 +168,47 @@ type ServiceProvisioner interface {
 	// Like Ensure it is idempotent: a resource already gone is a success. Like
 	// Deprovision on the person axis it must never claim more than it did — a
 	// provisioner that cannot delete returns ErrUnavailable rather than nil.
-	Teardown(ctx context.Context, t Target, rec model.ServiceResource) error
+	//
+	// It is handed a Target built from the *record*, not from a spec: a teardown
+	// has no spec, so only Spec.Key and Spec.Hostname are populated and TunnelID
+	// is empty. That is not a shortfall to work around — rec.ParentID is the
+	// container the resource actually went into, which is the answer a teardown
+	// wants and a spec cannot give, now that the tunnel is a per-spec choice
+	// (PRSR-33). An implementation that needs a field the record cannot supply
+	// is one asking the wrong question.
+	Teardown(ctx context.Context, t Target, rec model.ServiceResource) (Removal, error)
+}
+
+// TeardownChecker is an optional interface a ServiceProvisioner implements to
+// answer "could you remove this, if asked?" without contacting anything.
+//
+// It is connector.RevokeChecker, one axis over, and it is here for the same
+// property. A teardown plan makes no upstream call at all — it has nothing to
+// ask, since the records are the target — so without this a plan reports
+// `remove` for a step that --apply then reports `unavailable`, and "the preview
+// is exactly what the apply does" stops being true on the one command you cannot
+// take back. On the Ensure path the equivalent answer arrives for free, because
+// a dry run's Inspect returns ErrUnavailable.
+//
+// An implementation's Teardown must delegate to the same answer, so the two
+// cannot drift — which is CanDeprovision's rule, and the reason it is worth
+// stating twice.
+//
+// A provisioner that does not implement it is assumed able; only one that knows
+// it cannot act needs to say so.
+type TeardownChecker interface {
+	// CanTeardown returns nil when Teardown could act, or the error explaining
+	// why it could not — normally wrapping ErrUnavailable.
+	CanTeardown(t Target) error
+}
+
+// CanTeardown asks p whether it could remove a resource, without contacting
+// upstream.
+func CanTeardown(p ServiceProvisioner, t Target) error {
+	if tc, ok := p.(TeardownChecker); ok {
+		return tc.CanTeardown(t)
+	}
+	return nil
 }
 
 // Registry is the set of provisioners, keyed by resource kind. It is separate
@@ -247,6 +309,12 @@ func (u *Unavailable) Ensure(context.Context, Target) (Resource, error) {
 	return Resource{}, fmt.Errorf("%w: %s", ErrUnavailable, u.Reason)
 }
 
-func (u *Unavailable) Teardown(context.Context, Target, model.ServiceResource) error {
+func (u *Unavailable) Teardown(context.Context, Target, model.ServiceResource) (Removal, error) {
+	return Removal{}, u.CanTeardown(Target{})
+}
+
+// CanTeardown is the same refusal Teardown gives, which is what lets a teardown
+// plan report this step honestly without calling anything.
+func (u *Unavailable) CanTeardown(Target) error {
 	return fmt.Errorf("%w: %s", ErrUnavailable, u.Reason)
 }

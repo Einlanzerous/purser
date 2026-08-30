@@ -54,6 +54,19 @@ func (s *memStore) UpsertServiceResource(_ context.Context, r model.ServiceResou
 	return r, nil
 }
 
+func (s *memStore) MarkServiceResourceRemoved(_ context.Context, id uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, r := range s.rows {
+		if r.ID == id {
+			r.Status = model.ResourceRemoved
+			s.rows[k] = r
+			return nil
+		}
+	}
+	return fmt.Errorf("memStore: no row %s", id)
+}
+
 // dnsFinding pulls the DNS line out of a result. Every kind always has one, so
 // a missing line is a bug rather than a "nothing to say".
 func dnsFinding(t *testing.T, res *spinup.Result) spinup.StepFinding {

@@ -366,7 +366,7 @@ func TestDNS_RoundTrip_CreateReadBackDelete(t *testing.T) {
 		Hostname: target.Spec.Hostname, Kind: model.ResourceDNSRecord,
 		ExternalID: res.ExternalID, ParentID: res.ParentID,
 	}
-	if err := p.Teardown(ctx, target, rec); err != nil {
+	if _, err := p.Teardown(ctx, target, rec); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
 	gone, err := p.Inspect(ctx, target)
@@ -377,7 +377,7 @@ func TestDNS_RoundTrip_CreateReadBackDelete(t *testing.T) {
 		t.Error("the record should be gone after Teardown")
 	}
 	// Idempotent: tearing down what is already gone is a success, not an error.
-	if err := p.Teardown(ctx, target, rec); err != nil {
+	if _, err := p.Teardown(ctx, target, rec); err != nil {
 		t.Errorf("a second Teardown should be a no-op success, got %v", err)
 	}
 }
@@ -810,7 +810,7 @@ func TestDNS_Ensure_CreateConflictOnAMismatchStaysAnError(t *testing.T) {
 func TestDNS_Teardown_RefusesWithoutARecordedID(t *testing.T) {
 	z := newZone(dnsRecord{Type: "A", Name: "argosy." + testZoneName, Content: "100.64.0.7"})
 	p := dnsFor(t, z)
-	err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
+	_, err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
 		Hostname: "argosy." + testZoneName, Kind: model.ResourceDNSRecord,
 	})
 	// Asserted on the reason, not merely on "an error": without the guard the
@@ -825,12 +825,44 @@ func TestDNS_Teardown_RefusesWithoutARecordedID(t *testing.T) {
 	}
 }
 
+// The Removal describes what went, which on the teardown path is the whole of
+// what an operator has to check the command against — there is no plan-time
+// upstream read to describe.
+func TestDNS_Teardown_SaysWhatItRemoved(t *testing.T) {
+	z := newZone(dnsRecord{ID: "rec1", Type: "CNAME", Name: "argosy." + testZoneName, Content: "origin.example.com"})
+	p := dnsFor(t, z)
+	rm, err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
+		Hostname: "argosy." + testZoneName, Kind: model.ResourceDNSRecord,
+		ExternalID: "rec1", ParentID: testZoneID,
+	})
+	if err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	for _, want := range []string{"CNAME", "argosy." + testZoneName, "rec1"} {
+		if !strings.Contains(rm.Detail, want) {
+			t.Errorf("detail %q does not name %q", rm.Detail, want)
+		}
+	}
+
+	// A record already gone is a success, and says which kind of success it is.
+	rm, err = p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
+		Hostname: "argosy." + testZoneName, Kind: model.ResourceDNSRecord,
+		ExternalID: "rec1", ParentID: testZoneID,
+	})
+	if err != nil {
+		t.Fatalf("second Teardown: %v", err)
+	}
+	if !strings.Contains(rm.Detail, "already gone") {
+		t.Errorf("detail %q should distinguish an absent record from one this run deleted", rm.Detail)
+	}
+}
+
 // The id outlived what it pointed at. Deleting whatever it names now would
 // remove a record for a hostname nobody asked about.
 func TestDNS_Teardown_RefusesWhenTheIDNamesAnotherHostname(t *testing.T) {
 	z := newZone(dnsRecord{ID: "rec1", Type: "A", Name: "someone-else." + testZoneName, Content: "10.0.0.1"})
 	p := dnsFor(t, z)
-	err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
+	_, err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
 		Hostname: "argosy." + testZoneName, Kind: model.ResourceDNSRecord,
 		ExternalID: "rec1", ParentID: testZoneID,
 	})
@@ -858,7 +890,7 @@ func TestDNS_Teardown_UsesTheRecordedZone(t *testing.T) {
 	defer srv.Close()
 
 	p := newDNSWithBase(t, srv.URL, DNSConfig{APIToken: "cf_token", ZoneID: "todays-zone"})
-	err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
+	_, err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
 		Hostname: "argosy." + testZoneName, Kind: model.ResourceDNSRecord,
 		ExternalID: "rec1", ParentID: "the-zone-it-went-into",
 	})
@@ -895,7 +927,7 @@ func TestDNS_Unconfigured_IsUnavailableOnEveryPath(t *testing.T) {
 			if _, err := p.Ensure(ctx, target); !spinup.IsUnavailable(err) {
 				t.Errorf("Ensure: want ErrUnavailable, got %v", err)
 			}
-			if err := p.Teardown(ctx, target, model.ServiceResource{ExternalID: "x"}); !spinup.IsUnavailable(err) {
+			if _, err := p.Teardown(ctx, target, model.ServiceResource{ExternalID: "x"}); !spinup.IsUnavailable(err) {
 				t.Errorf("Teardown: want ErrUnavailable, got %v", err)
 			}
 		})
@@ -1032,7 +1064,7 @@ func TestDNS_Teardown_UnroutableRequestIsNotAbsence(t *testing.T) {
 	defer srv.Close()
 
 	p := newDNSWithBase(t, srv.URL, DNSConfig{APIToken: "cf_token", ZoneID: testZoneID})
-	err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
+	_, err := p.Teardown(context.Background(), directTarget("100.64.0.7"), model.ServiceResource{
 		Hostname: "argosy." + testZoneName, Kind: model.ResourceDNSRecord,
 		ExternalID: "rec1", ParentID: "a-zone-this-token-cannot-address",
 	})

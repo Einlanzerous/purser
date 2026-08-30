@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -26,6 +27,9 @@ type fakeProv struct {
 	inspectErr error
 	ensured    Resource
 	ensureErr  error
+
+	removed     Removal
+	teardownErr error
 
 	inspects  int
 	ensures   int
@@ -53,9 +57,9 @@ func (p *fakeProv) Ensure(_ context.Context, _ Target) (Resource, error) {
 	return p.ensured, nil
 }
 
-func (p *fakeProv) Teardown(_ context.Context, _ Target, _ model.ServiceResource) error {
+func (p *fakeProv) Teardown(_ context.Context, _ Target, _ model.ServiceResource) (Removal, error) {
 	p.teardowns++
-	return nil
+	return p.removed, p.teardownErr
 }
 
 // present builds a provisioner reporting a resource that exists and matches.
@@ -84,7 +88,11 @@ type fakeStore struct {
 	failUpsert error
 	// failList, when set, makes the record read fail.
 	failList error
-	upserts  int
+	// failRemove, when set, makes MarkServiceResourceRemoved fail — the only way
+	// to reach removed-not-recorded.
+	failRemove error
+	upserts    int
+	removals   int
 }
 
 func newStore() *fakeStore { return &fakeStore{rows: map[string]model.ServiceResource{}} }
@@ -121,7 +129,31 @@ func (s *fakeStore) UpsertServiceResource(_ context.Context, r model.ServiceReso
 	return r, nil
 }
 
-func (s *fakeStore) put(r model.ServiceResource) {
+// MarkServiceResourceRemoved stamps the row the way the real one does: status
+// flips, removed_at is set once and never re-set, and the row stays.
+func (s *fakeStore) MarkServiceResourceRemoved(_ context.Context, id uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removals++
+	if s.failRemove != nil {
+		return s.failRemove
+	}
+	for k, r := range s.rows {
+		if r.ID != id {
+			continue
+		}
+		r.Status = model.ResourceRemoved
+		if r.RemovedAt == nil {
+			now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+			r.RemovedAt = &now
+		}
+		s.rows[k] = r
+		return nil
+	}
+	return fmt.Errorf("fakeStore: no row %s", id)
+}
+
+func (s *fakeStore) put(r model.ServiceResource) model.ServiceResource {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r.Status == "" {
@@ -129,6 +161,7 @@ func (s *fakeStore) put(r model.ServiceResource) {
 	}
 	r.ID = uuid.New()
 	s.rows[key(r.Hostname, r.Kind)] = r
+	return r
 }
 
 func (s *fakeStore) count() int {

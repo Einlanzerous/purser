@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/Einlanzerous/purser/internal/model"
 )
 
@@ -45,6 +47,15 @@ type Store interface {
 	ServiceResourcesForHostname(ctx context.Context, hostname string) ([]model.ServiceResource, error)
 	// UpsertServiceResource records a resource as active.
 	UpsertServiceResource(ctx context.Context, r model.ServiceResource) (model.ServiceResource, error)
+	// MarkServiceResourceRemoved records that a recorded resource is gone.
+	//
+	// Separate from an upsert-with-a-status because only one of the two may ever
+	// be called speculatively: this one asserts the resource is gone *upstream*,
+	// and the invariant offboard learned the expensive way (PRSR-17) applies
+	// here unchanged — a teardown that didn't happen must never be recorded as
+	// one, because the lie outlives the error message and the next run reads the
+	// column.
+	MarkServiceResourceRemoved(ctx context.Context, id uuid.UUID) error
 }
 
 // Service orchestrates spin-ups over a provisioner registry and store.

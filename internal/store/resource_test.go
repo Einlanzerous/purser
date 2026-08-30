@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -238,5 +239,117 @@ func TestUpsertServiceResource_RequiresHostname(t *testing.T) {
 	r := dnsRow("")
 	if _, err := st.UpsertServiceResource(context.Background(), r); err == nil {
 		t.Error("without a hostname there is no conflict target, so every run would insert a new row")
+	}
+}
+
+// --- the teardown walk, over the real table (PRSR-34) -----------------------
+
+// tearProv is a provisioner whose removals succeed and which counts them. It
+// exists so the *store* half of a teardown is exercised against real SQL: the
+// orchestrator's own logic has its own tests with a fake, and what those cannot
+// show is that MarkServiceResourceRemoved does what Teardown's contract needs.
+//
+// PRSR-27 shipped that method with the note "untested against a real
+// orchestrator because there isn't one". There is now.
+type tearProv struct {
+	kind      model.ResourceKind
+	teardowns int
+	err       error
+}
+
+func (p *tearProv) Kind() model.ResourceKind { return p.kind }
+func (p *tearProv) DisplayName() string      { return string(p.kind) }
+func (p *tearProv) Inspect(context.Context, spinup.Target) (spinup.State, error) {
+	return spinup.State{}, nil
+}
+func (p *tearProv) Ensure(context.Context, spinup.Target) (spinup.Resource, error) {
+	return spinup.Resource{}, nil
+}
+func (p *tearProv) Teardown(context.Context, spinup.Target, model.ServiceResource) (spinup.Removal, error) {
+	p.teardowns++
+	return spinup.Removal{Detail: "removed"}, p.err
+}
+
+func TestTeardownWalk_MarksRowsRemovedOverRealSQL(t *testing.T) {
+	st := resourceStore(t)
+	ctx := context.Background()
+	const host = "argosy.zerogravity.industries"
+	for _, k := range model.KindOrder {
+		if _, err := st.UpsertServiceResource(ctx, model.ServiceResource{
+			ServiceKey: "argosy", Hostname: host, Kind: k, ExternalID: "id-" + string(k),
+		}); err != nil {
+			t.Fatalf("seed %s: %v", k, err)
+		}
+	}
+	svc := spinup.New(st, spinup.NewRegistry(
+		&tearProv{kind: model.ResourceDNSRecord},
+		&tearProv{kind: model.ResourceAccessApp},
+		&tearProv{kind: model.ResourceTunnelRoute},
+	))
+
+	res, err := svc.Teardown(ctx, spinup.TeardownRequest{ServiceKey: "argosy", Hostname: host, Apply: true})
+	if err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	if res.Changed() != len(model.KindOrder) {
+		t.Fatalf("changed=%d, want %d (%v)", res.Changed(), len(model.KindOrder), res.NeedsAttention())
+	}
+
+	rows, err := st.ServiceResourcesForHostname(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != len(model.KindOrder) {
+		t.Fatalf("%d rows, want %d — a torn-down row is marked, not deleted", len(rows), len(model.KindOrder))
+	}
+	for _, r := range rows {
+		if r.Status != model.ResourceRemoved {
+			t.Errorf("%s is %q, want %q", r.Kind, r.Status, model.ResourceRemoved)
+		}
+		if r.RemovedAt == nil {
+			t.Errorf("%s has no removed_at; the column is what makes 'when was it taken away' durable", r.Kind)
+		}
+	}
+
+	// And a re-run reads them back as `gone` rather than as never-recorded,
+	// which is the distinction the two statuses exist for.
+	again, err := svc.Teardown(ctx, spinup.TeardownRequest{ServiceKey: "argosy", Hostname: host, Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range again.Findings {
+		if f.Status != spinup.TeardownGone {
+			t.Errorf("%s re-runs as %s, want %s", f.Kind, f.Status, spinup.TeardownGone)
+		}
+	}
+}
+
+// A removal that didn't happen must never be recorded as one — PRSR-17's
+// invariant, over the real UPDATE this time. The lie outlives the error message,
+// and this column is what the next run reads.
+func TestTeardownWalk_AFailedRemovalLeavesTheRowActive(t *testing.T) {
+	st := resourceStore(t)
+	ctx := context.Background()
+	const host = "argosy.zerogravity.industries"
+	if _, err := st.UpsertServiceResource(ctx, dnsRow(host)); err != nil {
+		t.Fatal(err)
+	}
+	svc := spinup.New(st, spinup.NewRegistry(
+		&tearProv{kind: model.ResourceDNSRecord, err: errors.New("cloudflare: 500")},
+	))
+
+	res, err := svc.Teardown(ctx, spinup.TeardownRequest{ServiceKey: "argosy", Hostname: host, Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Changed() != 0 {
+		t.Errorf("changed=%d after a failed removal", res.Changed())
+	}
+	rows, err := st.ServiceResourcesForHostname(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Status != model.ResourceActive || rows[0].RemovedAt != nil {
+		t.Errorf("row = %+v; a failed removal must leave it active so the next run retries", rows[0])
 	}
 }
