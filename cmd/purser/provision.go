@@ -153,12 +153,10 @@ func printProvision(res *spinup.Result) {
 			n, plural2(n, "that step", "those steps"))
 	}
 	if n := c[spinup.StepRefused]; n > 0 {
-		// Deliberately not "upstream … fix it there", which this said until a
-		// live run printed it over an *ownership* refusal — a resource recorded
-		// to another service, which is in Purser's own records and nowhere near
-		// upstream (PRSR-46 review). The two cases share an instruction ("go and
-		// resolve it; re-running will not") and differ about where, so the line
-		// gives the instruction and each finding's own text gives the where.
+		// Worded around the instruction rather than around "upstream", which is
+		// where every one of these comes from today but is a fact about the
+		// providers rather than about the status. It costs nothing to be right
+		// if that changes, and each finding's own text names the where.
 		fmt.Fprintf(os.Stderr, "%d refused — a state Purser will not act from. Re-running repeats this until it is resolved; each line below says what and where.\n", n)
 	}
 	if n := c[spinup.StepUnknown]; n > 0 {

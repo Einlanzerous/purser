@@ -197,14 +197,15 @@ const (
 	//
 	// Distinct from StepUnavailable in the other direction: unavailable is
 	// Purser's own configuration missing a credential, which the operator fixes
-	// here. Refused is a state Purser will not act *from*, which they resolve
-	// somewhere else.
+	// here. Refused is upstream being in a shape nobody can safely write to,
+	// which they fix there.
 	//
-	// Usually that state is upstream. PRSR-46 adds the one case where it is in
-	// Purser's own records: a `--prune` asked to remove a resource recorded to a
-	// *different* service. Same instruction either way, which is what makes it
-	// the same status — go and resolve the thing this run cannot decide, because
-	// re-running prints this until you do.
+	// Every one of these comes from a provisioner — IsRefused on an Inspect,
+	// Ensure or Teardown call. PRSR-46 briefly widened it to cover a `--prune`
+	// meeting another service's record, and that is no longer true: an ownership
+	// disagreement refuses the whole run with ErrHostnameNotThisService, before
+	// any step is decided, so it produces no finding at all (see
+	// refuseContested).
 	StepRefused StepStatus = "refused"
 	// StepFailed — the write was attempted and errored. Nothing is recorded,
 	// so a re-run reconsiders the step from scratch.
