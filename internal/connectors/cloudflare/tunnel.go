@@ -848,13 +848,24 @@ func shadowLabel(r ingressRule) string {
 //   - **Same hostname, no path.** A path-scoped rule for the hostname was
 //     somebody's deliberate, narrower route, and deleting a record made by hand
 //     is not a thing re-running fixes.
-//   - **In front of the shadow.** A rule sitting behind the terminal catch-all
-//     or a wildcard that takes the hostname first is never matched, and cannot
-//     be Purser's: assertWritable refuses to write a route into a region
-//     cloudflared does not reach, so nothing here ever put one there. planRoute
+//
+//   - **In front of the shadow.** A rule sitting behind the terminal catch-all or
+//     a wildcard that takes the hostname first is never matched. planRoute
 //     already declines to touch those and says so in the plan; this used to
 //     remove them silently, which is the disagreement PRSR-34 settled (PRSR-30
 //     review). They are counted and reported instead.
+//
+//     **They are not reliably somebody else's, and the first version of this
+//     said they were** (purser#56 review). The retired argument was that
+//     assertWritable refuses to write a route into a region cloudflared does not
+//     reach, so nothing here ever put one there — true at *write* time and
+//     nowhere else, because shadowing is a property of the **document**, not of
+//     the rule. Insert `*.zerogravity.industries` above a specific rule and a
+//     route Purser did write is dead, with the document still well-formed and
+//     documentShape still passing. That is why `behind` is returned rather than
+//     merely skipped, and why Teardown refuses when it is the only thing left:
+//     "nothing reachable here" is not evidence the route is gone. Do not
+//     reinstate the stronger claim without a counter-example for that sequence.
 //
 // It reads its stopping point through scanRoute, like every other walk of this
 // list, which is what keeps the read path and the write path agreeing about

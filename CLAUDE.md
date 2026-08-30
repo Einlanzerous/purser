@@ -1233,6 +1233,11 @@ front instead of reading an absence out of one. And running the binary turned up
 a third: the tunnel's `unavailable` message was telling an operator taking a
 service *down* to go and add its ingress rule.
 
+One caveat it does **not** retire: nothing on the teardown path has contacted
+Cloudflare. PRSR-40 and PRSR-42 retired that for the write verbs; the way down is
+still fake-only, and both of its two silent-success bugs were found by argument
+rather than by observation. **PRSR-47** holds the live run.
+
 **PRSR-41 was found by running the binary** — the third time on this axis that
 has caught something reading could not (PRSR-31's outcome line, PRSR-38's
 fixture, and now this), and it is fixed. See the invariant above.
