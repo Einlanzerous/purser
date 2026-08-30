@@ -240,3 +240,76 @@ func newSpinupResponse(res *spinup.Result) spinupResponse {
 	}
 	return out
 }
+
+// teardownResponse is POST /v1/teardowns.
+//
+// It is not a spinupResponse with different words in it: there is no spec to
+// echo (a teardown works from Purser's records, not from one), and the statuses
+// are a different closed set answering a different question. Sharing the shape
+// would have a caller read a `status` and then have to remember which direction
+// the request was travelling in — the thing PRSR-21 took off the person axis.
+type teardownResponse struct {
+	Service  string            `json:"service"`
+	Hostname string            `json:"hostname"`
+	Applied  bool              `json:"applied"`
+	Findings []teardownStepDTO `json:"findings"`
+	Counts   map[string]int    `json:"counts"`
+	// Pending is how many resources --apply would still remove. Zero is NOT the
+	// claim that the hostname is clear, for the reason spinupResponse.Pending
+	// isn't either: blocked, unavailable, refused and failed are all excluded,
+	// because the missing flag was never why they didn't happen.
+	Pending int `json:"pending"`
+	Changed int `json:"changed"`
+	// NeedsAttention names the kinds in a state a person has to resolve — the
+	// verdict the two counts above look like and are not. Computed from the same
+	// list the CLI's exit code uses.
+	NeedsAttention []string `json:"needs_attention,omitempty"`
+}
+
+// teardownStepDTO is one recorded resource's verdict.
+type teardownStepDTO struct {
+	Kind        string `json:"kind"`
+	DisplayName string `json:"display_name"`
+	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
+	// Warning is trouble around a removal that happened — see spinup.Removal.
+	// Its own field rather than a clause inside detail, because the tunnel's
+	// says another service on the same tunnel may have lost its route, and a
+	// caller must be able to find that without pattern-matching a description.
+	Warning string `json:"warning,omitempty"`
+	// ExternalID is omitted when empty rather than sent as "": for a tunnel
+	// route it is empty by nature, since a route's handle is (tunnel, hostname).
+	ExternalID string `json:"external_id,omitempty"`
+	Applied    bool   `json:"applied"`
+	Error      string `json:"error,omitempty"`
+}
+
+func newTeardownResponse(res *spinup.TeardownResult) teardownResponse {
+	out := teardownResponse{
+		Service:  res.ServiceKey,
+		Hostname: res.Hostname,
+		Applied:  res.Applied,
+		Counts:   make(map[string]int),
+		Pending:  res.Pending(),
+		Changed:  res.Changed(),
+	}
+	for st, n := range res.Counts() {
+		out.Counts[string(st)] = n
+	}
+	for _, f := range res.NeedsAttention() {
+		out.NeedsAttention = append(out.NeedsAttention, string(f.Kind))
+	}
+	for _, f := range res.Findings {
+		out.Findings = append(out.Findings, teardownStepDTO{
+			Kind:        string(f.Kind),
+			DisplayName: f.DisplayName,
+			Status:      string(f.Status),
+			Detail:      f.Detail,
+			Warning:     f.Warning,
+			ExternalID:  f.ExternalID,
+			Applied:     f.Applied,
+			Error:       f.Err,
+		})
+	}
+	return out
+}

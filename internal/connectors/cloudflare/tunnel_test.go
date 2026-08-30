@@ -218,7 +218,7 @@ func TestTunnel_Unconfigured_IsUnavailableOnEveryPath(t *testing.T) {
 	if _, err := p.Ensure(context.Background(), tgt); !spinup.IsUnavailable(err) {
 		t.Errorf("Ensure: want ErrUnavailable, got %v", err)
 	}
-	if err := p.Teardown(context.Background(), tgt, model.ServiceResource{}); !spinup.IsUnavailable(err) {
+	if _, err := p.Teardown(context.Background(), tgt, model.ServiceResource{}); !spinup.IsUnavailable(err) {
 		t.Errorf("Teardown: want ErrUnavailable, got %v", err)
 	}
 }
@@ -1006,7 +1006,7 @@ func TestTunnel_RefusesALocallyManagedTunnel(t *testing.T) {
 	if _, err := p.Ensure(context.Background(), tgt); err == nil {
 		t.Error("Ensure must refuse too")
 	}
-	if err := p.Teardown(context.Background(), tgt, model.ServiceResource{
+	if _, err := p.Teardown(context.Background(), tgt, model.ServiceResource{
 		Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID,
 	}); err == nil {
 		// Removing a route from a document that isn't in force removes nothing,
@@ -1066,7 +1066,7 @@ func TestTunnel_TeardownRemovesOnlyItsOwnRule(t *testing.T) {
 		ParentID: testTunnelID,
 	}
 
-	if err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
+	if _, err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
 	want := []string{
@@ -1084,7 +1084,7 @@ func TestTunnel_TeardownIsIdempotent(t *testing.T) {
 	tgt := target(t, "interlock.zerogravity.industries", "http://interlock:8080")
 	rec := model.ServiceResource{Hostname: "interlock.zerogravity.industries", ParentID: testTunnelID}
 
-	if err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
+	if _, err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
 		t.Fatalf("a route already gone is a success: %v", err)
 	}
 	if _, puts := f.counts(); puts != 0 {
@@ -1100,7 +1100,7 @@ func TestTunnel_TeardownTargetsTheRecordedTunnel(t *testing.T) {
 	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
 	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: "an-older-tunnel"}
 
-	if err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
+	if _, err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
 	f.mu.Lock()
@@ -1121,12 +1121,310 @@ func TestTunnel_TeardownLeavesPathScopedRulesAlone(t *testing.T) {
 	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
 	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
 
-	if err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
+	if _, err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
 	rules := f.ingress(t)
 	if len(rules) != 2 || rules[0].str("path") != "/admin" {
 		t.Errorf("a narrower hand-written route is not ours to delete, got %v", f.hostnames(t))
+	}
+}
+
+// PRSR-34: Ensure and Teardown disagreed about who owns a rule for the hostname
+// that cloudflared never reaches. planRoute declines to touch one on a stated
+// principle and says so in the plan; withoutRoute removed it without mentioning
+// it — and it is provably not Purser's, since assertWritable makes it impossible
+// to have written a route into a dead region. It is somebody's hand edit, most
+// plausibly a route they meant to work.
+//
+// The document below is the one the ticket probed the branch against: a live
+// rule, a wildcard that takes the hostname first, and a dead rule behind it.
+const shadowedTeardownDoc = `{"ingress":[
+	{"hostname":"lyceum.zerogravity.industries","service":"http://lyceum:8083"},
+	{"hostname":"*.zerogravity.industries","service":"http://holding-page:80"},
+	{"hostname":"lyceum.zerogravity.industries","service":"http://lyceum-old:8083"},
+	{"service":"http_status:404"}
+]}`
+
+func TestTunnel_TeardownLeavesARuleBehindAShadowAlone(t *testing.T) {
+	f := newFakeTunnel(t, shadowedTeardownDoc)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	rm, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	want := []string{
+		"*.zerogravity.industries=http://holding-page:80",
+		"lyceum.zerogravity.industries=http://lyceum-old:8083",
+		"*=http_status:404",
+	}
+	if got := f.hostnames(t); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("got %v,\nwant %v — a rule Purser did not write is not one it deletes", got, want)
+	}
+	// And it is reported rather than silently left: the whole complaint was that
+	// one path mentions these rules and the other does not.
+	//
+	// On Warning, not in Detail. The step succeeded — the reachable route is
+	// gone — but a rule left behind may be one Purser wrote that a later
+	// wildcard orphaned, and after this run nothing records it. That is trouble
+	// around a resource other than the one Detail describes, which is what
+	// Warning is for and why a caller must be able to find it without
+	// pattern-matching a truncatable column (purser#56 review).
+	if !strings.Contains(rm.Warning, "behind") {
+		t.Errorf("the leftover must reach Warning, got %q", rm.Warning)
+	}
+	if strings.Contains(rm.Detail, "behind") {
+		t.Errorf("the leftover is buried in Detail: %q", rm.Detail)
+	}
+}
+
+// The read-back checks the same set the removal took — which is now the
+// reachable region — so a dead rule left standing on purpose is not mistaken for
+// a removal that failed.
+func TestTunnel_TeardownDoesNotReadItsOwnRestraintAsAFailure(t *testing.T) {
+	f := newFakeTunnel(t, shadowedTeardownDoc)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	if _, err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
+		t.Fatalf("the dead rule it deliberately kept must not read as 'still routed': %v", err)
+	}
+	if _, puts := f.counts(); puts != 1 {
+		t.Errorf("%d PUTs, want 1", puts)
+	}
+}
+
+// **A dead rule is not reliably somebody else's.** The first version of this
+// change said it was, on the grounds that assertWritable cannot write a route
+// into a region cloudflared never reaches — true at *write* time, and nowhere
+// else, because shadowing is a property of the document rather than of the rule.
+// Insert a wildcard above a specific rule and a route Purser did write is dead,
+// with the document still well-formed.
+//
+// Nothing reachable to remove is then not evidence the route is gone, and
+// returning success has the orchestrator mark the row removed over a rule still
+// in the file — recorded-not-removed, the mirror of PRSR-17's lie, and the
+// well-formed version of the malformed-document refusal. Found in review of
+// purser#56, where the test above pinned the wrong behaviour on its second call.
+func TestTunnel_TeardownRefusesWhenTheOnlyRuleLeftIsBehindAShadow(t *testing.T) {
+	f := newFakeTunnel(t, `{"ingress":[
+		{"hostname":"switchyard.zerogravity.industries","service":"http://switchyard:4001"},
+		{"hostname":"*.zerogravity.industries","service":"http://holding-page:80"},
+		{"hostname":"lyceum.zerogravity.industries","service":"http://lyceum:8083"},
+		{"service":"http_status:404"}
+	]}`)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	_, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if err == nil {
+		t.Fatal("a rule for the hostname behind a shadow is not 'already gone' — reporting success marks the row removed over a rule still in the file")
+	}
+	if !spinup.IsRefused(err) {
+		t.Errorf("want ErrRefused — the read succeeded and what needs deciding is upstream — got %v", err)
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("a refused teardown wrote (%d PUTs)", puts)
+	}
+	// Distinguished from the plain "nothing here" case, which stays an
+	// idempotent success: an absent route really is absent.
+	clean := newFakeTunnel(t, liveShape)
+	rm, err := clean.prov(t).Teardown(context.Background(),
+		target(t, "interlock.zerogravity.industries", "http://interlock:8080"),
+		model.ServiceResource{Hostname: "interlock.zerogravity.industries", ParentID: testTunnelID})
+	if err != nil {
+		t.Fatalf("a hostname with no rule at all is still a clean no-op: %v", err)
+	}
+	if !strings.Contains(rm.Detail, "not routed") {
+		t.Errorf("detail %q", rm.Detail)
+	}
+}
+
+// The second teardown of a hostname whose reachable route this run removed, on a
+// document that still carries a dead rule for it. It refuses rather than
+// reporting a clean sweep — which is the same finding from the other side, and
+// the case the old test asserted backwards.
+func TestTunnel_ASecondTeardownOverALeftoverRefuses(t *testing.T) {
+	f := newFakeTunnel(t, shadowedTeardownDoc)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	if _, err := f.prov(t).Teardown(context.Background(), tgt, rec); err != nil {
+		t.Fatalf("first Teardown: %v", err)
+	}
+	_, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if !spinup.IsRefused(err) {
+		t.Fatalf("want ErrRefused on the re-run, got %v", err)
+	}
+	if _, puts := f.counts(); puts != 1 {
+		t.Errorf("%d PUTs, want 1 — the refusal writes nothing", puts)
+	}
+}
+
+// A document this provisioner will not *write* into is one it cannot read an
+// absence from either. "No rule for this hostname" out of a document with a dead
+// tail is not evidence, and reported as success the orchestrator marks the row
+// removed over a rule that is still in the file — the revoked-not-recorded lie
+// (PRSR-17) reached through a read.
+func TestTunnel_TeardownRefusesAMalformedDocumentRatherThanReportingSuccess(t *testing.T) {
+	f := newFakeTunnel(t, `{"ingress":[
+		{"service":"http_status:404"},
+		{"hostname":"lyceum.zerogravity.industries","service":"http://lyceum:8083"}
+	]}`)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	_, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if err == nil {
+		t.Fatal("a catch-all that is not last must refuse, not act on a document Ensure will not read or write")
+	}
+	if !spinup.IsRefused(err) {
+		t.Errorf("want ErrRefused — the read succeeded and it is upstream that needs fixing, not a re-run — got %v", err)
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("a refused document was written to (%d PUTs)", puts)
+	}
+}
+
+// The half of that with teeth, and the one the old code got wrong silently: the
+// hostname has no rule in the document at all. Nothing to remove reads as
+// "already gone" and returns success, and the orchestrator then marks the row
+// removed — over a document that is no evidence about what is served. A removal
+// that didn't happen recorded as one is precisely PRSR-17's lie, and here it
+// arrives through a *read* rather than through a write.
+func TestTunnel_TeardownWillNotReadAnAbsenceOutOfAMalformedDocument(t *testing.T) {
+	f := newFakeTunnel(t, `{"ingress":[
+		{"hostname":"switchyard.zerogravity.industries","service":"http://switchyard:4001"},
+		{"service":"http_status:404"},
+		{"hostname":"wiki.zerogravity.industries","service":"http://wiki:3000"}
+	]}`)
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	_, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if err == nil {
+		t.Fatal("'no rule here' out of a document nobody may read is not evidence the route is gone")
+	}
+	if !spinup.IsRefused(err) {
+		t.Errorf("want ErrRefused, got %v", err)
+	}
+}
+
+// A tunnel configured by a file on the origin machine serves something this
+// endpoint cannot show us, so the same rule applies one step further out: none
+// of the shape guards can see it, and every one of them is about who *else*
+// wrote the document rather than whether it is the one in force.
+func TestTunnel_TeardownRefusesALocallyManagedTunnel(t *testing.T) {
+	f := newFakeTunnel(t, liveShape)
+	f.source = "local"
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	_, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if !spinup.IsRefused(err) {
+		t.Fatalf("want ErrRefused, got %v", err)
+	}
+	if _, puts := f.counts(); puts != 0 {
+		t.Errorf("wrote to a tunnel whose served configuration is a file we cannot see (%d PUTs)", puts)
+	}
+}
+
+// The gap PRSR-30's review filed: the concurrent-write note reached a server log
+// and nothing else, so whoever ran the teardown was told nothing about the one
+// message that says another service may have just lost its route.
+func TestTunnel_TeardownReturnsTheConcurrentWriteWarning(t *testing.T) {
+	f := newFakeTunnel(t, liveShape)
+	f.verBump = 4 // somebody else wrote in between
+	tgt := target(t, "lyceum.zerogravity.industries", "http://lyceum:8083")
+	rec := model.ServiceResource{Hostname: "lyceum.zerogravity.industries", ParentID: testTunnelID}
+
+	rm, err := f.prov(t).Teardown(context.Background(), tgt, rec)
+	if err != nil {
+		t.Fatalf("a concurrent write is a warning on a removal that happened, not a failure: %v", err)
+	}
+	if rm.Warning == "" {
+		t.Fatal("the concurrent-write note must reach the caller, not just a log")
+	}
+	if !strings.Contains(rm.Warning, "another writer") {
+		t.Errorf("warning %q", rm.Warning)
+	}
+	// It is a warning *around* the step, not part of its description: a caller
+	// must be able to find it without pattern-matching a substring out of
+	// Detail.
+	if strings.Contains(rm.Detail, "another writer") {
+		t.Error("the warning is duplicated into Detail; the split is what lets a renderer give it prominence")
+	}
+}
+
+func TestTunnel_TeardownIsUnavailableRatherThanSilentWithoutCredentials(t *testing.T) {
+	p := NewTunnel(TunnelConfig{})
+	if err := p.CanTeardown(spinup.Target{}); !spinup.IsUnavailable(err) {
+		t.Errorf("CanTeardown: want ErrUnavailable, got %v", err)
+	}
+	// CanTeardown and Teardown must give the same answer, or a plan promises
+	// what an apply refuses.
+	_, err := p.Teardown(context.Background(), spinup.Target{}, model.ServiceResource{ParentID: "t", Hostname: "x.example.com"})
+	if !spinup.IsUnavailable(err) {
+		t.Fatalf("Teardown: want ErrUnavailable, got %v", err)
+	}
+	if err.Error() != p.CanTeardown(spinup.Target{}).Error() {
+		t.Errorf("the checker and the doer differ:\n  check: %v\n  do:    %v", p.CanTeardown(spinup.Target{}), err)
+	}
+	// And the hand-fix is the removal's, not the spin-up's. Found by running the
+	// binary: an operator told a service is being taken down was being advised
+	// to add the ingress rule.
+	if strings.Contains(err.Error(), "add the ingress rule") {
+		t.Errorf("a teardown refusal gives spin-up advice: %v", err)
+	}
+	if !strings.Contains(err.Error(), "remove the hostname") {
+		t.Errorf("a teardown refusal should say what to remove by hand: %v", err)
+	}
+}
+
+// --- withoutRoute ----------------------------------------------------------
+
+func TestWithoutRoute_SplitsAtTheShadow(t *testing.T) {
+	rules := []ingressRule{
+		{"hostname": jsonString("a.example.com"), "service": jsonString("http://a:1")},
+		{"hostname": jsonString("a.example.com"), "path": jsonString("/admin"), "service": jsonString("http://admin:1")},
+		{"hostname": jsonString("*.example.com"), "service": jsonString("http://holding:80")},
+		{"hostname": jsonString("a.example.com"), "service": jsonString("http://dead:1")},
+		{"service": jsonString(catchAllService)},
+	}
+	next, removed, behind := withoutRoute(rules, "a.example.com")
+	if removed != 1 {
+		t.Errorf("removed %d, want 1 — only the reachable route is Purser's", removed)
+	}
+	if behind != 1 {
+		t.Errorf("behind %d, want 1 — the rule past the wildcard is counted, not deleted", behind)
+	}
+	if len(next) != 4 {
+		t.Fatalf("%d rules left, want 4", len(next))
+	}
+	// The path-scoped rule stays because it is narrower and hand-written; the
+	// dead one stays because it is not ours. Different reasons, same answer.
+	if next[0].str("path") != "/admin" {
+		t.Errorf("the path-scoped rule went: %v", next[0])
+	}
+	if next[2].str("service") != "http://dead:1" {
+		t.Errorf("the shadowed rule went: %v", next[2])
+	}
+}
+
+// A list with no shadow at all is malformed, and both callers refuse such a
+// document before reaching here. Treating the whole list as reachable is the
+// conservative reading for anyone who does not — it removes what it finds rather
+// than declaring rules dead on a document nobody understood.
+func TestWithoutRoute_NoShadowMeansEverythingIsReachable(t *testing.T) {
+	rules := []ingressRule{
+		{"hostname": jsonString("a.example.com"), "service": jsonString("http://a:1")},
+		{"hostname": jsonString("b.example.com"), "service": jsonString("http://b:1")},
+	}
+	next, removed, behind := withoutRoute(rules, "a.example.com")
+	if removed != 1 || behind != 0 || len(next) != 1 {
+		t.Errorf("removed=%d behind=%d left=%d, want 1/0/1", removed, behind, len(next))
 	}
 }
 
@@ -1205,7 +1503,7 @@ func TestTunnel_UnavailableIsTheSpinUpSentinelNotThePersonAxisOne(t *testing.T) 
 	// The two axes share an ethos and no types. ErrPending's wording is pinned
 	// by migration 0004's backfill, which is why this axis has its own.
 	p := NewTunnel(TunnelConfig{})
-	err := p.Teardown(context.Background(), spinup.Target{Spec: spinup.ServiceSpec{Hostname: "x.example.com"}}, model.ServiceResource{})
+	_, err := p.Teardown(context.Background(), spinup.Target{Spec: spinup.ServiceSpec{Hostname: "x.example.com"}}, model.ServiceResource{})
 	if !errors.Is(err, spinup.ErrUnavailable) {
 		t.Fatalf("want spinup.ErrUnavailable, got %v", err)
 	}

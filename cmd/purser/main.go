@@ -10,6 +10,7 @@
 //	purser invite --name … --email … --to switchyard,cloudflare
 //	purser offboard --email …   # revoke access; previews unless --apply
 //	purser provision-service --service … --hostname …  # stand up a service's edge
+//	purser teardown-service --service … --hostname …   # take it down; previews unless --apply
 //	purser person add --name … --email …  # record someone; provisions nothing
 //	purser person list          # the roster: who has what, from local records
 //	purser person show --email … # one person in full, from local records
@@ -63,6 +64,8 @@ func main() {
 		runOffboard(args)
 	case "provision-service":
 		runProvisionService(args)
+	case "teardown-service":
+		runTeardownService(args)
 	case "person":
 		runPerson(args)
 	case "audit":
@@ -75,7 +78,7 @@ func main() {
 		fmt.Println(version.Get().Version)
 	default:
 		fmt.Fprintf(os.Stderr, "purser: unknown command %q\n", cmd)
-		fmt.Fprintln(os.Stderr, "commands: serve, invite, offboard, provision-service, person, audit, reconcile, migrate, version")
+		fmt.Fprintln(os.Stderr, "commands: serve, invite, offboard, provision-service, teardown-service, person, audit, reconcile, migrate, version")
 		os.Exit(2)
 	}
 }

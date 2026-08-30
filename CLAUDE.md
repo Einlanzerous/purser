@@ -13,8 +13,8 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
 ## Layout
 
 - `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `offboard`,
-  `provision-service`, `person add|list|show`, `audit`, `reconcile`, `migrate`,
-  `version`). Composition root: `setup()` wires store + connectors + **both**
+  `provision-service`, `teardown-service`, `person add|list|show`, `audit`,
+  `reconcile`, `migrate`, `version`). Composition root: `setup()` wires store + connectors + **both**
   orchestrators — `invite.Service` and, since PRSR-31, `spinup.Service` via
   `spinupRegistry`/`tunnelSet`.
 - `internal/model/` — domain types (person, service, account, invite,
@@ -36,9 +36,11 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   is where idempotency lives.
 - `internal/spinup/` — the **second axis** (PRSR-27): `ServiceSpec`, the
   `ServiceProvisioner` interface, its own `Registry`/`Unavailable`/
-  `ErrUnavailable`, and the `Ensure` orchestrator. Keyed on hostname, not on a
-  person. It imports `internal/model` and nothing else of ours — deliberately
-  not `internal/connector`, and not `internal/store`.
+  `ErrUnavailable`, the `Ensure` orchestrator and — since PRSR-34 — the
+  `Teardown` one in `teardown.go`, with its own status set and its own
+  `TeardownChecker`. Keyed on hostname, not on a person. It imports
+  `internal/model` and nothing else of ours — deliberately not
+  `internal/connector`, and not `internal/store`.
 - `internal/placard/` — the launcher-mark resolver (PRSR-37). A client for
   Placard's `/api/services`, deliberately **not** under `internal/connectors/`:
   Placard is never an invite target and implements neither axis's interface.
@@ -366,6 +368,97 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   and the write didn't, the opposite advice from `failed` (compare
   `revoked-not-recorded`, PRSR-17). And `service_resource.hostname` is unique
   case-insensitively, for the same reason `person.email` is (migration 0003).
+- **The teardown walk works from rows, and the rows are the plan** (PRSR-34).
+  `Ensure` takes a spec and asks upstream what is there; `Teardown` takes a
+  hostname and asks *Purser* what it put there, because the recorded id is the
+  only thing it may target — deleting a record somebody made by hand is not a
+  mistake re-running fixes. So there is no spec argument, no `Inspect`, and a dry
+  run makes **no provisioner call at all** — not even a read-only one, which is
+  `offboard`'s rule and stronger than `Ensure`'s: `Ensure` previews because one
+  of its three steps rewrites shared state, and here every step is a deletion.
+  The `Target` a provisioner is handed therefore carries only `Spec.Key` and
+  `Spec.Hostname`, with `TunnelID` empty; `rec.ParentID` is the container the
+  resource actually went into, which is the answer a teardown wants and a spec
+  cannot give now that the tunnel is per-spec.
+- **DNS comes off first, and `model.TeardownOrder()` is `KindOrder` reversed
+  rather than a second list.** The argument is `KindOrder`'s read backwards: the
+  record is what makes the hostname live, so pull the Access application while it
+  still resolves and a gated service is reachable *ungated* — not
+  self-announcing, unlike the 502 a removed ingress route gives. Derived rather
+  than written out again, because the way a second literal fails is by removing
+  the gate before the record with nothing anywhere reporting it. And ordering
+  only closes the window when the earlier removal *landed*, so
+  `teardownDependsOn` holds the other two behind DNS (`blocked`) exactly as
+  `ServiceSpec.dependsOn` holds DNS behind them on the way up.
+  It takes no spec and cannot, which costs one distinction: a *bookmark* Access
+  app is deliberately not a DNS prerequisite going up, and a row records the kind
+  rather than whether the application was a gate or a tile. Blocking both is the
+  only answer available and the right direction to be wrong in — wrong about a
+  bookmark costs a re-run, wrong about a gate costs an ungated service.
+- **"Is this hostname still someone's?" is answered by two coordinates that must
+  agree, not by Purser guessing.** A `service_resource` row proves Purser created
+  something here; it does not prove the hostname is still that service's to
+  remove, and a reassigned key, a hostname now fronting something else and a
+  hand-edited record each want a different answer. So `teardown-service` requires
+  `--service` as well as `--hostname` and refuses the **whole run** —
+  `spinup.ErrHostnameNotThisService`, 409 over HTTP — when any active row
+  disagrees, removing nothing and contacting nothing. That is `offboard`'s shape
+  (`--email` required, always one target, no bulk mode) and the comparison is
+  load-bearing rather than ceremonial: `UpsertServiceResource` overwrites
+  `service_key` on conflict and `ensureOne` adopts on a mismatch, so a hostname
+  that changed hands names its new owner from the first spin-up run. *Every*
+  active row is checked, since a hostname whose kinds disagree with each other
+  has been half-reassigned. A **removed** row from a former owner does not
+  refuse: that is the history of a hostname that legitimately changed hands.
+- **A removal that didn't happen must never be recorded as one**, and
+  `removed-not-recorded` is its own status. Only a successful `Teardown` marks
+  the row removed; `failed`, `unavailable`, `refused` and `blocked` leave it
+  **active** so the next run retries — PRSR-17's invariant unchanged, because the
+  lie outlives the error message and the row is what the next run reads. The
+  inverse points the other way: the resource is gone and Purser holds an active
+  row for it, which a later spin-up reads as something to adopt and a later
+  teardown targets an id nobody can delete. It counts toward `NeedsAttention` for
+  that reason even though the edge is correct.
+- **`Teardown` returns a `spinup.Removal`, not a bare `error`.** The tunnel's
+  concurrent-write note is what forced it: on the `Ensure` path that warning
+  reaches an operator through `Resource.Warning`, and on this path it reached a
+  server log and nothing else — so whoever ran the teardown was told nothing,
+  about the one message saying another service may have just lost its route.
+  Same split as on the way up: `Detail` describes this resource, `Warning` is
+  about one that is not this one, and it is returned rather than logged because
+  `log` and the CLI's summary share stderr.
+- **A teardown plan cannot learn from an `Inspect` that never runs, so
+  `TeardownChecker` exists.** Without it a plan reports `remove` for a step
+  `--apply` then reports `unavailable`, and "the preview is exactly what the
+  apply does" stops being true on the one command you cannot take back. It is
+  `connector.RevokeChecker` one axis over, with the same rule: `CanTeardown`
+  answers from capability and configuration alone, contacting nothing, and
+  `Teardown` delegates to the same answer so the two cannot drift. It asks about
+  the *empty* spec a teardown carries on purpose — Access's `available()` demands
+  the members group id only for a gated spec, and a checker that wanted it would
+  refuse to remove a bookmark tile over a credential nothing on this path reads.
+  The per-direction half is the hand-fix sentence: the tunnel's "add the ingress
+  rule in the dashboard" is exactly the wrong instruction to give somebody taking
+  a service down, which is why `teardownUnavailable` exists beside `unavailable`.
+  Found by running the binary, which is now the fourth time on this axis.
+- **`Ensure` and `Teardown` must agree about who owns a shadowed ingress rule**
+  (PRSR-34, out of PRSR-30's review). `planRoute`, meeting a rule for the
+  hostname behind a catch-all or a wildcard, leaves it alone on a stated
+  principle — a rule Purser did not write is not one it deletes — and names it in
+  the plan. `withoutRoute` took every rule with the hostname and no path,
+  reachable or not, so the same rule was removed without being mentioned; and it
+  is *provably* not Purser's, since `assertWritable` makes it impossible to have
+  written a route into a region cloudflared never reaches. It is somebody's hand
+  edit, most plausibly a route they meant to work. `withoutRoute` now splits at
+  `scanRoute`'s shadow, reports what it left, and the read-back checks the
+  reachable region so the restraint is not misread as a removal that failed.
+- **A malformed ingress document is refused on the teardown path too, before
+  anything is concluded from it.** The write path already refuses it and the read
+  path already refuses it; the teardown used to remove what it could see and, in
+  the case with teeth, find *nothing* and return success — after which the
+  orchestrator marked the row removed over a rule still in the file. "No rule for
+  this hostname" out of a document nobody may read is not evidence, which is the
+  revoked-not-recorded lie reached through a read rather than a write.
 - **The tunnel is a spec field, not a global** (PRSR-33). The account has two
   healthy tunnels; a dev instance is the same shape pointed at a different one.
   Specs name a ref (`prod` | `dev`) and `TunnelSet` resolves it to an id once per
@@ -652,8 +745,8 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   place in the file where the undecidable answer must not resolve to absent:
   `hostPath` earns its pass because Purser *knows* the application was never this
   spec's, while `hostAmbiguous` is the state where it knows nothing, which is
-  `Teardown`'s third documented outcome. PRSR-34's walk will read a `nil` there as
-  licence to drop the `service_resource` row, after which the remaining
+  `Teardown`'s third documented outcome. PRSR-34's walk reads a `nil` there as
+  licence to mark the `service_resource` row removed, after which the remaining
   application is tracked by nothing. So `!= hostPath`, not `== hostWhole` —
   erroring is the safe direction here in a way it is not in `findApp`, because a
   wrong error costs a noisy retry and a wrong `nil` costs a removal recorded over
@@ -990,13 +1083,13 @@ PRSR-27 landed the foundation: `internal/spinup` (spec, `ServiceProvisioner`,
 registry, `Ensure` orchestrator) and `service_resource` (migration 0007). It
 settled the two questions the connectors were waiting on — preview by default,
 and the tunnel as a spec field — and it deliberately stops short of the three
-provisioners and the CLI. `Teardown` is on the interface, because the resource
-table exists to give it concrete ids to target, but nothing orchestrates a
-teardown yet: its ordering and its "is this hostname still someone's?" question
-are **PRSR-34**. That has a key rather than a comment on a closed ticket for a
-reason — twice now this project has lost the remaining half of a piece of work
-by closing the ticket that described it (see PRSR-25, below) — so don't delete
-that interface method as dead code; it is waiting on a walk, not unused.
+provisioners and the CLI. `Teardown` was on the interface from the start,
+because the resource table exists to give it concrete ids to target, and for a
+fortnight nothing called it — which is exactly why it was filed as **PRSR-34**
+rather than left as a comment on a closed ticket: twice this project has lost the
+remaining half of a piece of work by closing the ticket that described it (see
+PRSR-25, below). **PRSR-34 is now done** — see the teardown invariants above and
+the entry below.
 
 PRSR-30 completes the three: `TunnelProvisioner` in `tunnel.go`, the ingress
 route. It is the step with the blast radius — one shared document per tunnel
@@ -1113,15 +1206,37 @@ turned up PRSR-41.
 
 **PRSR-33** wires the `dev` tunnel ref
 that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
-spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-34** holds
-the `Teardown` walk — its orchestration, that is; the Access provisioner's own
-`Teardown` has now run live (PRSR-40), so what is left there is the ordering and
-the "is this hostname still someone's?" question. **PRSR-44** is PRSR-43's
+spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-44** is PRSR-43's
 authoring-end half — the aspect check in Placard's own checker. **PRSR-36**,
 **PRSR-37**, **PRSR-39** and **PRSR-40** are all closed — PRSR-39 built the zone
 pre-flight that PRSR-38's probe showed was available all along, and left the
 create-then-delete in place behind it as the backstop for the case a pre-flight
 cannot see.
+
+**PRSR-34 gives the axis its inverse**: `internal/spinup/teardown.go`, `purser
+teardown-service` and `POST /v1/teardowns`. It settled the two questions PRSR-27
+left open. Ordering is `KindOrder` reversed and *derived* from it, with the other
+two removals held behind DNS rather than merely ordered after it. "Is this
+hostname still someone's?" is answered by requiring the operator to name the
+service and refusing the whole run when Purser's rows disagree — the honest
+answer, since Purser cannot settle it from the outside and both wrong guesses
+delete something. It also widened `ServiceProvisioner.Teardown` to return a
+`spinup.Removal`, which is what gave PRSR-30's concurrent-write warning somewhere
+to go, and added `TeardownChecker` so a plan that contacts nothing still cannot
+promise what `--apply` refuses.
+
+Two behaviour changes fell out of it rather than being added to it. The tunnel's
+`withoutRoute` no longer sweeps rules the `Ensure` path declines to touch — the
+disagreement PRSR-30's review filed, which stopped being low-stakes the moment
+`Teardown` became reachable — and it refuses a malformed ingress document up
+front instead of reading an absence out of one. And running the binary turned up
+a third: the tunnel's `unavailable` message was telling an operator taking a
+service *down* to go and add its ingress rule.
+
+One caveat it does **not** retire: nothing on the teardown path has contacted
+Cloudflare. PRSR-40 and PRSR-42 retired that for the write verbs; the way down is
+still fake-only, and both of its two silent-success bugs were found by argument
+rather than by observation. **PRSR-47** holds the live run.
 
 **PRSR-41 was found by running the binary** — the third time on this axis that
 has caught something reading could not (PRSR-31's outcome line, PRSR-38's
@@ -1142,7 +1257,7 @@ had seen. **PRSR-38 observed both** — see the DNS bullet above: the delete
 *does* send the envelope (so that premise was wrong and the code was defensively
 right anyway), 81044 arrives with a 404 as hoped, and a malformed id answers
 405/10405 rather than any "could not route" 404. The reason it blocked PRSR-34
-is discharged with it: `Teardown` is where a wrong absence-predicate starts
+was discharged with it: `Teardown` is where a wrong absence-predicate starts
 marking rows removed for records that still resolve, and the predicate is now
 keyed on a code somebody has actually seen.
 

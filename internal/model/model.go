@@ -171,6 +171,31 @@ const (
 // spin-up and that window, so it lives here rather than in each caller.
 var KindOrder = []ResourceKind{ResourceTunnelRoute, ResourceAccessApp, ResourceDNSRecord}
 
+// TeardownOrder is the order a teardown removes them in: KindOrder reversed.
+//
+// **DNS goes first, because DNS is what makes the hostname live.** It is the
+// same argument that puts it last on the way up, read backwards, and the failure
+// it prevents is the mirror image: pull the Access application first and the
+// service is briefly reachable *ungated*, which is the one outcome this axis
+// must not produce quietly. Pull the ingress route first and a tunnelled service
+// answers 502 until the record goes — noisy, self-announcing, and the lesser of
+// the two, exactly as it is on the way up.
+//
+// Derived from KindOrder rather than written out again. A second literal is a
+// second thing to keep in step, and the way it would fail is by removing the
+// gate before the record with nothing anywhere reporting it.
+//
+// Ordering alone only closes the window when the earlier removal actually
+// landed, which is what ServiceSpec has dependsOn for on the way up and what
+// spinup's teardownDependsOn has here.
+func TeardownOrder() []ResourceKind {
+	out := make([]ResourceKind, len(KindOrder))
+	for i, k := range KindOrder {
+		out[len(KindOrder)-1-i] = k
+	}
+	return out
+}
+
 // ResourceStatus is whether a recorded edge resource is still in place.
 //
 // There is deliberately no counterpart to AccountStale. That status exists on

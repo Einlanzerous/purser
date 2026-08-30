@@ -242,11 +242,8 @@ func (s ServiceSpec) Normalized() ServiceSpec {
 	s.Access = AccessShape(strings.TrimSpace(string(s.Access)))
 	s.Tunnel = TunnelRef(strings.TrimSpace(string(s.Tunnel)))
 
-	s.Key = strings.ToLower(strings.TrimSpace(s.Key))
-	// TrimRight, not TrimSuffix: "host.example.com.." is as much a trailing-dot
-	// mistake as one dot is, and leaving the second one turns an empty label
-	// into part of the identity key.
-	s.Hostname = strings.ToLower(strings.TrimRight(strings.TrimSpace(s.Hostname), "."))
+	s.Key = normalizeKey(s.Key)
+	s.Hostname = normalizeHostname(s.Hostname)
 	s.Upstream = strings.TrimSpace(s.Upstream)
 	if s.Mode == ModeDirect {
 		// A DNS record value, and DNS is case-insensitive.
@@ -262,6 +259,24 @@ func (s ServiceSpec) Normalized() ServiceSpec {
 		s.DisplayName = s.Key
 	}
 	return s
+}
+
+// normalizeKey folds a service key to the spelling `service_key` is written and
+// compared in. It is a function rather than two inline calls because the
+// teardown path has no spec and must fold its own arguments identically: a
+// hostname or key folded one way on the way up and another on the way down
+// simply fails to find the row it was going to remove.
+func normalizeKey(key string) string {
+	return strings.ToLower(strings.TrimSpace(key))
+}
+
+// normalizeHostname folds a hostname to this axis's identity key.
+//
+// TrimRight, not TrimSuffix: "host.example.com.." is as much a trailing-dot
+// mistake as one dot is, and leaving the second one turns an empty label into
+// part of the identity key.
+func normalizeHostname(h string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(h), "."))
 }
 
 // Validate reports whether the spec describes something coherent, and returns

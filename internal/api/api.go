@@ -51,6 +51,7 @@ func (s *Server) Handler() *http.ServeMux {
 	mux.HandleFunc("POST /v1/invites", s.auth(s.handleCreateInvite))
 	mux.HandleFunc("GET /v1/invites/{id}", s.auth(s.handleGetInvite))
 	mux.HandleFunc("POST /v1/spinups", s.auth(s.handleSpinup))
+	mux.HandleFunc("POST /v1/teardowns", s.auth(s.handleTeardown))
 	return mux
 }
 
@@ -292,6 +293,90 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, newSpinupResponse(res))
+}
+
+// teardownRequest is the POST /v1/teardowns body (PRSR-34).
+//
+// Both identifiers are required, and that is the endpoint's guard rather than a
+// formality: `service` is checked against Purser's own records before anything
+// is removed, and a disagreement refuses the whole request. A hostname alone
+// would have this endpoint delete whatever the rows happen to say, which is the
+// question PRSR-34 was filed to answer — a row proves Purser created something
+// here, not that the hostname is still this service's.
+//
+// `apply` defaults to false, so the unadorned request is a plan — the same
+// default the CLI has, and it matters more here than on POST /v1/spinups: every
+// step of this one is a deletion, and a caller who forgets the field gets a
+// report rather than a hostname that stops resolving.
+type teardownRequest struct {
+	Service  string `json:"service"`
+	Hostname string `json:"hostname"`
+	Apply    bool   `json:"apply"`
+}
+
+func (s *Server) handleTeardown(w http.ResponseWriter, r *http.Request) {
+	if s.spin == nil {
+		writeError(w, http.StatusServiceUnavailable, "this build has no spin-up orchestrator wired")
+		return
+	}
+	var req teardownRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	tr := spinup.TeardownRequest{
+		ServiceKey: req.Service,
+		Hostname:   req.Hostname,
+		Apply:      req.Apply,
+	}
+	// Validated here so a malformed request is a 400 rather than a 500. Teardown
+	// validates again — it is the orchestrator's own precondition and not
+	// something a caller may skip — and this call is what decides whose fault
+	// the refusal is, exactly as handleSpinup's spec.Validate does.
+	if _, err := tr.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	res, err := s.spin.Teardown(r.Context(), tr)
+	if err != nil {
+		// Everything a provisioner did or failed to do is a finding, and the
+		// request itself validated above, so this is only reached for the
+		// ownership refusal or a failed read of Purser's own records.
+		if errors.Is(err, spinup.ErrHostnameNotThisService) {
+			// 409 rather than 400: the request is well-formed, and it is the
+			// *state* that refuses it — the same reading ErrNameConflictOnEmail
+			// gets on the invite path. It is also the one refusal here worth a
+			// distinct code, because the fix is to look at who owns the hostname
+			// rather than to correct the request.
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		log.Printf("api: teardown of %s failed: %v", req.Hostname, err)
+		writeError(w, http.StatusInternalServerError, "teardown failed")
+		return
+	}
+	// Logged as well as returned, for handleSpinup's reason: a caller that
+	// ignores these fields would otherwise leave no trace of them anywhere, and
+	// a 200 with sensible counts reveals neither.
+	//
+	//   removed-not-recorded — the resource is gone and the row still says it is
+	//     live, so a later spin-up reads it as something to adopt.
+	//   warning — the removal *succeeded*, and something around it may not have.
+	//     The tunnel's is the one that matters: another service's ingress route
+	//     may have been dropped from the shared document, which is somebody
+	//     else's outage and appears nowhere in this response's status or counts.
+	for _, f := range res.Findings {
+		if f.Status == spinup.TeardownRemovedNotRecorded {
+			log.Printf("api: teardown of %s: %s was removed upstream but not recorded: %s",
+				res.Hostname, f.Kind, f.Err)
+		}
+		if f.Warning != "" {
+			log.Printf("api: teardown of %s: %s: %s", res.Hostname, f.Kind, f.Warning)
+		}
+	}
+	writeJSON(w, http.StatusOK, newTeardownResponse(res))
 }
 
 // auth wraps a handler with bearer-token check when an API token is configured.

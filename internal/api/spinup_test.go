@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -46,6 +47,19 @@ func (s *memStore) UpsertServiceResource(_ context.Context, r model.ServiceResou
 	return r, nil
 }
 
+func (s *memStore) MarkServiceResourceRemoved(_ context.Context, id uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, r := range s.rows {
+		if r.ID == id {
+			r.Status = model.ResourceRemoved
+			s.rows[k] = r
+			return nil
+		}
+	}
+	return fmt.Errorf("memStore: no row %s", id)
+}
+
 func hostname(r model.ServiceResource) string { return r.Hostname + "|" + string(r.Kind) }
 
 // stubProv reports a resource that is already there and already correct, so the
@@ -71,7 +85,9 @@ func (p *stubProv) Ensure(context.Context, spinup.Target) (spinup.Resource, erro
 	p.ensures++
 	return spinup.Resource{ExternalID: "res-1", Detail: "already correct", Warning: p.warning}, nil
 }
-func (p *stubProv) Teardown(context.Context, spinup.Target, model.ServiceResource) error { return nil }
+func (p *stubProv) Teardown(context.Context, spinup.Target, model.ServiceResource) (spinup.Removal, error) {
+	return spinup.Removal{}, nil
+}
 
 func spinupServer(t *testing.T) (*httptest.Server, *memStore) {
 	t.Helper()

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/Einlanzerous/purser/internal/model"
 )
 
@@ -45,6 +47,15 @@ type Store interface {
 	ServiceResourcesForHostname(ctx context.Context, hostname string) ([]model.ServiceResource, error)
 	// UpsertServiceResource records a resource as active.
 	UpsertServiceResource(ctx context.Context, r model.ServiceResource) (model.ServiceResource, error)
+	// MarkServiceResourceRemoved records that a recorded resource is gone.
+	//
+	// Separate from an upsert-with-a-status because only one of the two may ever
+	// be called speculatively: this one asserts the resource is gone *upstream*,
+	// and the invariant offboard learned the expensive way (PRSR-17) applies
+	// here unchanged — a teardown that didn't happen must never be recorded as
+	// one, because the lie outlives the error message and the next run reads the
+	// column.
+	MarkServiceResourceRemoved(ctx context.Context, id uuid.UUID) error
 }
 
 // Service orchestrates spin-ups over a provisioner registry and store.
@@ -287,14 +298,25 @@ func (r *Result) Pending() int {
 // must not round it up.
 //
 // It is excluded because nothing here can act on it. `Ensure` only ever adds and
-// updates; removing an orphan is `Teardown`'s, which nothing orchestrates yet
-// (PRSR-34). Counting it would make every run of a deliberately narrowed spec
-// report trouble and exit non-zero, for ever, with no command to type — the
-// prescribe-a-provable-no-op mistake `offboard`'s SSO warning exists to avoid,
-// which teaches an operator to ignore the signal that matters. It is reported
-// loudly on its own line instead, since nothing else in the report would mention
-// a resource that is still serving traffic. Revisit this when PRSR-34 gives it
-// somewhere to go.
+// updates, and PRSR-34's `Teardown` walk is **whole-hostname** — driven by
+// (service, hostname), with every removal ordered behind the DNS record going
+// first. An orphan is a resource at a hostname that is *staying up*: a service
+// that was `--access gated` and is now `--access none`. Tearing the hostname
+// down to remove it is not what anybody means.
+//
+// So the exclusion survives PRSR-34, for a different reason than it was first
+// given: not "nothing orchestrates a teardown" but "no command removes one
+// resource from a live hostname". Counting it would make every run of a
+// deliberately narrowed spec report trouble and exit non-zero, for ever, with no
+// command to type — the prescribe-a-provable-no-op mistake `offboard`'s SSO
+// warning exists to avoid, which teaches an operator to ignore the signal that
+// matters. It is reported loudly on its own line instead, since nothing else in
+// the report would mention a resource that is still serving traffic.
+//
+// Giving it a command is **PRSR-46**, which has a key rather than this sentence
+// because a deferral pointing at a closed ticket is how this project has twice
+// lost the remaining half of a piece of work (see PRSR-25, and PRSR-34's own
+// existence).
 func (r *Result) NeedsAttention() []StepFinding {
 	var out []StepFinding
 	for _, f := range r.Findings {

@@ -46,7 +46,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -118,9 +117,26 @@ func (p *TunnelProvisioner) configured() bool {
 // unavailable is the "registered but cannot act" answer, in the spin-up axis's
 // own sentinel — so an unconfigured deployment previews as `unavailable` rather
 // than as a breakage, and never as "the route is missing".
+//
+// The hand-fix half is per-direction. The variables to set are the same either
+// way, but "add the ingress rule in the dashboard" is advice for a spin-up and
+// exactly the wrong instruction on a teardown, where the operator has been told
+// a service is being taken down — see teardownUnavailable. Found by running the
+// binary rather than by reading it, which is now the fourth time on this axis.
 func (p *TunnelProvisioner) unavailable() error {
-	return fmt.Errorf("%w: cloudflare is not configured (set PURSER_CF_API_TOKEN and PURSER_CF_ACCOUNT_ID); add the ingress rule for the hostname on the tunnel in the Zero Trust dashboard (Networks → Tunnels → Public Hostnames)",
-		spinup.ErrUnavailable)
+	return p.notConfigured("add the ingress rule for the hostname on the tunnel in the Zero Trust dashboard (Networks → Tunnels → Public Hostnames)")
+}
+
+// teardownUnavailable is the same refusal with the removal's hand-fix.
+func (p *TunnelProvisioner) teardownUnavailable() error {
+	return p.notConfigured("remove the hostname's public hostname entry from the tunnel in the Zero Trust dashboard (Networks → Tunnels → Public Hostnames)")
+}
+
+// notConfigured is the shared half: one list of variables, so the two answers
+// cannot drift about which credentials this provisioner needs.
+func (p *TunnelProvisioner) notConfigured(hint string) error {
+	return fmt.Errorf("%w: cloudflare is not configured (set PURSER_CF_API_TOKEN and PURSER_CF_ACCOUNT_ID); %s",
+		spinup.ErrUnavailable, hint)
 }
 
 // usable reports whether this provisioner can act on t at all.
@@ -292,17 +308,55 @@ func (p *TunnelProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 	// serve`, where there is no double-print to avoid and a caller that ignores
 	// the field would leave no trace of it anywhere; the API layer logs it from
 	// the Warning field instead, the way it already logs applied-not-recorded
-	// (PRSR-31). Teardown still logs its own — nothing carries a Resource back
-	// from there.
+	// (PRSR-31). Teardown returns the same note the same way as of PRSR-34,
+	// which is what widening its return to a spinup.Removal was for: it used to
+	// reach a server log and nothing else, so whoever ran the teardown was told
+	// nothing about the one message that says another service may have just
+	// lost its route.
 	note := concurrentWriteNote(before.version, after.version, t.TunnelID)
 	return spinup.Resource{ParentID: t.TunnelID, Detail: detail, Warning: note}, nil
 }
 
 // Teardown removes the hostname's ingress rule from the tunnel it was recorded
 // on. Idempotent: a route already gone is a success, and makes no write.
-func (p *TunnelProvisioner) Teardown(ctx context.Context, t spinup.Target, rec model.ServiceResource) error {
-	if !p.configured() {
-		return p.unavailable()
+//
+// It removes only the *reachable* route, which is the correction PRSR-34 makes
+// to a disagreement PRSR-30's review found between the two paths. planRoute,
+// meeting a rule for this hostname sitting behind a catch-all or a wildcard,
+// leaves it alone on a stated principle — "a rule Purser did not write is not
+// one it deletes, and it was already dead before this run" — and says so in the
+// plan. withoutRoute took every rule with the hostname and no path, reachable or
+// not, so the same rule was removed here without being mentioned. The two paths
+// now agree, and the dead ones are reported the way Inspect and planRoute
+// already report them.
+//
+// **A dead rule is not reliably somebody else's, and the first draft of this
+// said it was** (purser#56 review). assertWritable makes it impossible to write
+// a route into a region cloudflared never reaches — so it is provable at *write*
+// time and nowhere else, because shadowing is a property of the document rather
+// than of the rule. Insert `*.zerogravity.industries` above a specific rule and
+// a route Purser did write is dead, with the document still well-formed and
+// documentShape still passing. So the two counts get different treatment:
+//
+//   - Nothing reachable removed and something behind the shadow: **refused**.
+//     Purser cannot tell its own dead rule from a hand edit, and reporting
+//     success there has the orchestrator mark the row removed over a rule still
+//     in the file — recorded-not-removed, the mirror of PRSR-17's lie, and the
+//     well-formed version of the malformed-document case one branch up.
+//   - Something reachable removed *and* something behind it: the claim is true,
+//     the hostname is no longer served, and the leftover rides on
+//     Removal.Warning rather than inside Detail — it may be a route of ours that
+//     a later wildcard orphaned, and it is now tracked by nothing.
+//
+// It also refuses a malformed document up front rather than after the removal.
+// Without that, a document whose catch-all is not last — one this provisioner
+// declines to read *or* write on the Ensure path — reported "nothing there,
+// success" whenever the route was in the region it could not see, and the
+// orchestrator marked the row removed over a rule that is still in the file.
+// That is the revoked-not-recorded lie (PRSR-17) reached through a read.
+func (p *TunnelProvisioner) Teardown(ctx context.Context, t spinup.Target, rec model.ServiceResource) (spinup.Removal, error) {
+	if err := p.CanTeardown(t); err != nil {
+		return spinup.Removal{}, err
 	}
 	// The recorded coordinates win over the spec's, for the reason the interface
 	// takes a record at all: a route has no id, so its handle is (tunnel,
@@ -312,7 +366,7 @@ func (p *TunnelProvisioner) Teardown(ctx context.Context, t spinup.Target, rec m
 	tunnelID := firstNonEmpty(rec.ParentID, t.TunnelID)
 	host := firstNonEmpty(strings.ToLower(strings.TrimSpace(rec.Hostname)), t.Spec.Hostname)
 	if tunnelID == "" || host == "" {
-		return fmt.Errorf("cloudflare: cannot remove an ingress route without both a tunnel and a hostname (tunnel %q, hostname %q)", tunnelID, host)
+		return spinup.Removal{}, fmt.Errorf("cloudflare: cannot remove an ingress route without both a tunnel and a hostname (tunnel %q, hostname %q)", tunnelID, host)
 	}
 
 	p.docMu.Lock()
@@ -320,35 +374,105 @@ func (p *TunnelProvisioner) Teardown(ctx context.Context, t spinup.Target, rec m
 
 	before, err := p.getConfig(ctx, tunnelID)
 	if err != nil {
-		return err
+		return spinup.Removal{}, err
 	}
-	next, removed := withoutRoute(before.ingress, host)
+	// Before anything is concluded from it. A shape this provisioner will not
+	// write into is also one it cannot read an absence from: "no rule for this
+	// hostname" out of a document with a dead tail is not evidence, and reported
+	// as success it becomes a removal recorded over a live route. Refused
+	// (spinup.ErrRefused, carried by documentShape) so the orchestrator reports
+	// what needs fixing upstream rather than telling the operator to re-run.
+	if err := documentShape(before.ingress); err != nil {
+		return spinup.Removal{}, fmt.Errorf("cloudflare: tunnel %s: %w", tunnelID, err)
+	}
+
+	next, removed, behind := withoutRoute(before.ingress, host)
 	if removed == 0 {
-		return nil // nothing there — idempotent
+		if behind > 0 {
+			// Not "already gone". There is a rule for this hostname in the
+			// document and no way to tell whether it is one of ours that a
+			// later wildcard orphaned. Refused rather than failed: the read
+			// succeeded, and what needs deciding is upstream.
+			return spinup.Removal{}, fmt.Errorf("%w: cloudflare: tunnel %s serves no reachable route for %s, but %d rule(s) for it sit behind one that takes the hostname first — a rule Purser wrote can end up there if a wildcard was inserted above it later, so this is not evidence the route is gone; remove those rules or the shadow in the Zero Trust dashboard and re-run",
+				spinup.ErrRefused, tunnelID, host, behind)
+		}
+		return spinup.Removal{Detail: fmt.Sprintf("%s was not routed on tunnel %s", host, tunnelID)}, nil
 	}
 	if _, err := terminalIndex(next); err != nil {
-		return fmt.Errorf("cloudflare: refusing to write the ingress configuration for tunnel %s: %w", tunnelID, err)
+		return spinup.Removal{}, fmt.Errorf("cloudflare: refusing to write the ingress configuration for tunnel %s: %w", tunnelID, err)
 	}
 	if err := p.putConfig(ctx, tunnelID, before.config, next); err != nil {
-		return err
+		return spinup.Removal{}, err
 	}
 
 	after, err := p.getConfig(ctx, tunnelID)
 	if err != nil {
-		return fmt.Errorf("cloudflare: the ingress route for %s was removed but the configuration could not be read back to confirm — re-run to see what landed: %w", host, err)
+		return spinup.Removal{}, fmt.Errorf("cloudflare: the ingress route for %s was removed but the configuration could not be read back to confirm — re-run to see what landed: %w", host, err)
 	}
 	// Teardown reports success only when the resource is actually gone, so the
-	// read-back is the claim, not the PUT's 200.
-	// withoutRoute rather than scanRoute: the removal took every rule carrying
-	// the hostname, including any behind a catch-all, so the check that it is
-	// gone has to look at the same set rather than only the reachable one.
-	if _, left := withoutRoute(after.ingress, host); left > 0 {
-		return fmt.Errorf("cloudflare: %s is still routed on tunnel %s after the removal — another writer changed the shared configuration at the same time; re-run", host, tunnelID)
+	// read-back is the claim, not the PUT's 200. It asks withoutRoute rather
+	// than scanRoute for the reason it always did — the check has to look at
+	// exactly the set the removal took — which now means the reachable region,
+	// and *not* the dead rules the removal deliberately left standing.
+	if _, left, _ := withoutRoute(after.ingress, host); left > 0 {
+		return spinup.Removal{}, fmt.Errorf("cloudflare: %s is still routed on tunnel %s after the removal — another writer changed the shared configuration at the same time; re-run", host, tunnelID)
 	}
-	if note := concurrentWriteNote(before.version, after.version, tunnelID); note != "" {
-		log.Printf("cloudflare: %s", note)
+	detail := fmt.Sprintf("removed %d ingress rule(s) for %s from tunnel %s (%d rules now)", removed, host, tunnelID, len(next))
+	// Both warnings are about something that is *not* this resource, which is
+	// the whole basis of the Detail/Warning split — and both are returned rather
+	// than logged, as of PRSR-34. There is a report to put them in now, and
+	// `log` writes to the same stderr the CLI's own summary does, so a
+	// logged-and-reported warning prints twice: how a reader learns to discount
+	// the message that most needs believing when it fires (PRSR-31).
+	return spinup.Removal{
+		Detail:  detail,
+		Warning: joinNotes(leftoverNote(host, behind), concurrentWriteNote(before.version, after.version, tunnelID)),
+	}, nil
+}
+
+// CanTeardown answers from configuration alone, so a teardown *plan* can report
+// this step honestly without calling anything (spinup.TeardownChecker).
+//
+// It asks configured() rather than usable(), and the difference is the tunnel
+// id: usable() requires the one the spec resolved, and a teardown has no spec.
+// The tunnel it acts on is rec.ParentID — the one the route actually went into,
+// which is the whole reason migration 0007 records a parent.
+func (p *TunnelProvisioner) CanTeardown(spinup.Target) error {
+	if !p.configured() {
+		return p.teardownUnavailable()
 	}
 	return nil
+}
+
+// leftoverNote is the "and these were left standing" warning, in the wording
+// planRoute and inspectIngress already use for the same rules — so the same fact
+// reads the same way whichever direction the operator met it from.
+//
+// A Warning rather than a clause in Detail, and that is the finding rather than
+// a tidy-up (purser#56 review): the reachable route really is gone, so the step
+// succeeded, but one of the rules left behind may be a route *Purser* wrote that
+// a later wildcard orphaned — and after this run no service_resource row points
+// at it. That is trouble around a resource which is not the one this line
+// describes, which is exactly what Warning is for, and Detail is a column a
+// surface may truncate.
+func leftoverNote(host string, behind int) string {
+	if behind == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d ingress rule(s) for %s sit behind one that takes the hostname first and were left in place: they serve nothing while that shadow stands, and Purser cannot tell one it wrote from a hand edit — check them, because nothing records them now",
+		behind, host)
+}
+
+// joinNotes puts two warnings on one field without either swallowing the other.
+func joinNotes(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + " " + b
+	}
 }
 
 // --- the ingress document --------------------------------------------------
@@ -715,23 +839,59 @@ func shadowLabel(r ingressRule) string {
 	return "the terminal " + r.str("service") + " rule"
 }
 
-// withoutRoute drops every rule that is the hostname's own route, and reports
-// how many went.
+// withoutRoute drops the hostname's own route, and reports how many rules went
+// and how many were left behind a shadow.
 //
-// Only rules this provisioner would have written are removed: same hostname, no
-// path. A path-scoped rule for the hostname was somebody's deliberate, narrower
-// route, and deleting a record made by hand is not a thing re-running fixes.
-func withoutRoute(rules []ingressRule, host string) ([]ingressRule, int) {
-	next := make([]ingressRule, 0, len(rules))
-	removed := 0
-	for _, r := range rules {
+// Two exclusions, and they are the same exclusion twice: only rules this
+// provisioner would have written are removed.
+//
+//   - **Same hostname, no path.** A path-scoped rule for the hostname was
+//     somebody's deliberate, narrower route, and deleting a record made by hand
+//     is not a thing re-running fixes.
+//
+//   - **In front of the shadow.** A rule sitting behind the terminal catch-all or
+//     a wildcard that takes the hostname first is never matched. planRoute
+//     already declines to touch those and says so in the plan; this used to
+//     remove them silently, which is the disagreement PRSR-34 settled (PRSR-30
+//     review). They are counted and reported instead.
+//
+//     **They are not reliably somebody else's, and the first version of this
+//     said they were** (purser#56 review). The retired argument was that
+//     assertWritable refuses to write a route into a region cloudflared does not
+//     reach, so nothing here ever put one there — true at *write* time and
+//     nowhere else, because shadowing is a property of the **document**, not of
+//     the rule. Insert `*.zerogravity.industries` above a specific rule and a
+//     route Purser did write is dead, with the document still well-formed and
+//     documentShape still passing. That is why `behind` is returned rather than
+//     merely skipped, and why Teardown refuses when it is the only thing left:
+//     "nothing reachable here" is not evidence the route is gone. Do not
+//     reinstate the stronger claim without a counter-example for that sequence.
+//
+// It reads its stopping point through scanRoute, like every other walk of this
+// list, which is what keeps the read path and the write path agreeing about
+// where the reachable region ends.
+func withoutRoute(rules []ingressRule, host string) (next []ingressRule, removed, behind int) {
+	// A list with no shadow at all is malformed — a well-formed one ends in a
+	// catch-all, which shadows everything — and both callers refuse such a
+	// document before reaching here. Treating the whole list as reachable is the
+	// conservative reading for anyone who does not: it removes what it finds
+	// rather than quietly declaring rules dead on a document nobody understood.
+	dead := len(rules)
+	if scan := scanRoute(rules, host); scan.ShadowedBy >= 0 {
+		dead = scan.ShadowedBy
+	}
+	next = make([]ingressRule, 0, len(rules))
+	for i, r := range rules {
 		if isRoute(r, host) {
-			removed++
-			continue
+			if i < dead {
+				removed++
+				continue
+			}
+			behind++
 		}
 		next = append(next, r)
 	}
-	return next, removed
+	return next, removed, behind
 }
 
 // confirmRoute is the post-write assertion: the hostname is routed where the

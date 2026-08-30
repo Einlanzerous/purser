@@ -829,7 +829,7 @@ func TestTeardown_DeletesRecordedID(t *testing.T) {
 	api := &accessAPI{}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
-	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+	_, err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-1"})
 	if err != nil {
 		t.Fatalf("teardown: %v", err)
@@ -839,11 +839,60 @@ func TestTeardown_DeletesRecordedID(t *testing.T) {
 	}
 }
 
+// The Target a teardown carries is built from the *record*, so its spec is
+// empty — and that is the point rather than a shortfall. available() demands the
+// members group id only for a gated spec, and deleting an application needs no
+// group; a CanTeardown that asked for it would refuse to remove a bookmark tile
+// over a credential nothing on this path reads.
+func TestTeardown_NeedsNoAccessGroupToRemoveAnApplication(t *testing.T) {
+	api := &accessAPI{}
+	p := newAccessProv(t, api, AccessConfig{}) // no GroupID
+
+	// The teardown Target: two fields, both from the row.
+	tgt := spinup.Target{Spec: spinup.ServiceSpec{Key: "argosy", Hostname: testHost}}
+	if err := p.CanTeardown(tgt); err != nil {
+		t.Fatalf("CanTeardown: %v", err)
+	}
+	rm, err := p.Teardown(context.Background(), tgt, model.ServiceResource{
+		Hostname: testHost, ExternalID: "app-1",
+	})
+	if err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	if len(api.deleted) != 1 || api.deleted[0] != "app-1" {
+		t.Fatalf("deleted = %v, want the recorded id", api.deleted)
+	}
+	if !strings.Contains(rm.Detail, "app-1") || !strings.Contains(rm.Detail, testHost) {
+		t.Errorf("detail %q must name what went and where", rm.Detail)
+	}
+}
+
+// CanTeardown and Teardown must give the same answer, or a teardown plan
+// promises what --apply refuses — the property connector.CanDeprovision exists
+// for on offboard, one axis over.
+func TestTeardown_TheCheckerAgreesWithTheDoer(t *testing.T) {
+	api := &accessAPI{}
+	p := newAccessWithBase(t, api.server(t).URL, AccessConfig{}) // no token, no account
+	tgt := spinup.Target{Spec: spinup.ServiceSpec{Key: "argosy", Hostname: testHost}}
+
+	checkErr := p.CanTeardown(tgt)
+	_, doErr := p.Teardown(context.Background(), tgt, model.ServiceResource{ExternalID: "app-1"})
+	if !spinup.IsUnavailable(checkErr) || !spinup.IsUnavailable(doErr) {
+		t.Fatalf("check=%v do=%v; both must be ErrUnavailable", checkErr, doErr)
+	}
+	if checkErr.Error() != doErr.Error() {
+		t.Errorf("the two answers differ:\n  check: %v\n  do:    %v", checkErr, doErr)
+	}
+	if len(api.deleted) != 0 {
+		t.Error("an unconfigured provisioner deleted something")
+	}
+}
+
 func TestTeardown_RefusesWithoutARecordedID(t *testing.T) {
 	api := &accessAPI{}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
-	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+	_, err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{})
 	if err == nil {
 		t.Fatal("want a refusal rather than a guess by hostname")
@@ -859,10 +908,17 @@ func TestTeardown_AlreadyGoneIsSuccess(t *testing.T) {
 	api := &accessAPI{deleteStatus: http.StatusNotFound}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
-	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+	rm, err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-gone"})
 	if err != nil {
 		t.Fatalf("an app already deleted should be a success: %v", err)
+	}
+	// Said out loud rather than reported as a clean deletion. "We asked and were
+	// told no, then looked and it was gone" is a different thing to have
+	// happened, and it is the case no error code could answer: a delete that
+	// failed at the transport after Cloudflare had applied it.
+	if !strings.Contains(rm.Detail, "is gone") {
+		t.Errorf("detail %q should distinguish an already-gone app from one this run deleted", rm.Detail)
 	}
 }
 
@@ -878,7 +934,7 @@ func TestTeardown_StaleRecordWithLiveAppIsAnError(t *testing.T) {
 	}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
-	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+	_, err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-stale"})
 	if err == nil {
 		t.Fatal("a stale record over a live application must not report success")
@@ -1863,7 +1919,7 @@ func TestTeardown_ARecordedAppScopedToAPathIsStillThere(t *testing.T) {
 	}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
-	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+	_, err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-1"})
 	if err == nil {
 		t.Fatal("the recorded application still exists, so the delete must not report success")
@@ -1887,7 +1943,7 @@ func TestTeardown_ABypassOnAPathDoesNotBlockIt(t *testing.T) {
 	}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
-	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+	_, err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-gone"})
 	if err != nil {
 		t.Fatalf("a path-scoped application was never this spec's, so it cannot hold up its teardown: %v", err)
@@ -1985,7 +2041,7 @@ func TestTeardown_AnInconsistentApplicationCannotConfirmTheGateIsDown(t *testing
 	}
 	p := newAccessProv(t, api, AccessConfig{GroupID: testGroup})
 
-	err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
+	_, err := p.Teardown(context.Background(), spinup.Target{Spec: gatedSpec(t, "")},
 		model.ServiceResource{ExternalID: "app-recorded-and-gone"})
 	if err == nil {
 		t.Fatal("an application that may gate this hostname must not be read as nothing gating it")

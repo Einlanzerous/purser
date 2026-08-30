@@ -322,20 +322,42 @@ func (p *AccessProvisioner) Ensure(ctx context.Context, t spinup.Target) (spinup
 // asserts the thing Teardown actually claims. It also covers the case a code
 // test cannot — a delete that failed at the transport after Cloudflare had
 // already applied it.
-func (p *AccessProvisioner) Teardown(ctx context.Context, t spinup.Target, rec model.ServiceResource) error {
-	if err := p.available(t.Spec); err != nil {
-		return err
+func (p *AccessProvisioner) Teardown(ctx context.Context, t spinup.Target, rec model.ServiceResource) (spinup.Removal, error) {
+	if err := p.CanTeardown(t); err != nil {
+		return spinup.Removal{}, err
 	}
+	host := firstNonEmpty(strings.ToLower(strings.TrimSpace(rec.Hostname)), t.Spec.Hostname)
 	if rec.ExternalID == "" {
-		return fmt.Errorf("cloudflare: no recorded Access application id for %s — Purser deletes only ids it recorded, since an application found by hostname may be one somebody created by hand",
-			t.Spec.Hostname)
+		return spinup.Removal{}, fmt.Errorf("cloudflare: no recorded Access application id for %s — Purser deletes only ids it recorded, since an application found by hostname may be one somebody created by hand",
+			host)
 	}
 
 	path := fmt.Sprintf("/accounts/%s/access/apps/%s", p.cfg.AccountID, rec.ExternalID)
 	if _, err := p.api.do(ctx, http.MethodDelete, path, nil); err != nil {
-		return p.confirmGone(ctx, t.Spec.Hostname, rec.ExternalID, err)
+		if gone := p.confirmGone(ctx, host, rec.ExternalID, err); gone != nil {
+			return spinup.Removal{}, gone
+		}
+		// The delete errored and the re-read found nothing gating the hostname,
+		// so it really is gone — which covers the case no error code could: a
+		// delete that failed at the transport after Cloudflare had applied it.
+		// Said out loud rather than reported as a clean deletion, because "we
+		// asked and were told no, then looked and it was gone" is a different
+		// thing to have happened.
+		return spinup.Removal{Detail: fmt.Sprintf("Access application %s is gone — the delete reported %v, and a re-read found nothing serving %s", rec.ExternalID, err, host)}, nil
 	}
-	return nil
+	return spinup.Removal{Detail: fmt.Sprintf("deleted Access application %s (%s)", rec.ExternalID, host)}, nil
+}
+
+// CanTeardown answers from configuration alone, so a teardown *plan* can report
+// this step honestly without calling anything (spinup.TeardownChecker).
+//
+// It asks about the empty spec a teardown carries, which is the point rather
+// than a shortfall: available() requires the members group id only for a *gated*
+// spec, and deleting an application needs no group. A teardown that demanded the
+// variable would refuse to remove a bookmark tile over a credential nothing on
+// this path reads.
+func (p *AccessProvisioner) CanTeardown(t spinup.Target) error {
+	return p.available(t.Spec)
 }
 
 // confirmGone decides what a failed delete meant, by re-reading the account.
