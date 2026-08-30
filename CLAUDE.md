@@ -505,6 +505,28 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   A run that passed `--prune` reports `prune` instead, which **is** counted by
   `Pending`: that run asked for the removal, so it is work outstanding rather
   than a state.
+- **A prune removes only *this* service's resources.** `Ensure` builds its record
+  map from `ServiceResourcesForHostname`, which is keyed on hostname alone, so
+  without a check every active row there is a prune candidate whatever service it
+  is recorded to — and a spec naming `--access none` would delete *another*
+  service's Access application, leave its hostname resolving, and mark the row
+  removed so nothing mentions it again. That is the hole `teardown-service`'s
+  `checkOwnership` refuses on, reached through the additive command, and the
+  operator has already supplied the second coordinate that closes it.
+  It is **per-resource** (`StepRefused`, naming the owner) rather than the
+  whole-run refusal the teardown walk uses, and the difference is not a
+  softening. `Ensure`'s additive half is legitimate on a reassigned hostname —
+  an adopt rewrites a row and touches nothing upstream — and, decisively, a
+  whole-run refusal would be **unfixable**: nothing rebinds an *orphan's*
+  `service_key`, because only `ensureOne`'s adopt path rewrites a row and an
+  orphan is a kind the spec does not call for. The row would refuse for ever with
+  no command to type. The refusal names the two that work instead: that service's
+  own spec with `--prune`, or a teardown of the hostname as that service.
+  The CLI's summary line for `refused` says "a state Purser will not act from"
+  rather than "upstream … fix it there", which is what it said until a live run
+  printed that over an ownership refusal. The two cases share an instruction and
+  differ about *where*, so the summary gives the instruction and each finding's
+  own text gives the where.
 - **DETAIL describes the resource; ACTION carries the verb.** The prune line
   first read "… — removing it (app-77e1 …)", which is fine under `prune` and a
   lie under every other status the path produces, since `pruneOne` leaves Detail

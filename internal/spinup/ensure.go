@@ -197,8 +197,14 @@ const (
 	//
 	// Distinct from StepUnavailable in the other direction: unavailable is
 	// Purser's own configuration missing a credential, which the operator fixes
-	// here. Refused is upstream being in a shape nobody can safely write to,
-	// which they fix there.
+	// here. Refused is a state Purser will not act *from*, which they resolve
+	// somewhere else.
+	//
+	// Usually that state is upstream. PRSR-46 adds the one case where it is in
+	// Purser's own records: a `--prune` asked to remove a resource recorded to a
+	// *different* service. Same instruction either way, which is what makes it
+	// the same status — go and resolve the thing this run cannot decide, because
+	// re-running prints this until you do.
 	StepRefused StepStatus = "refused"
 	// StepFailed — the write was attempted and errored. Nothing is recorded,
 	// so a re-run reconsiders the step from scratch.
@@ -538,7 +544,13 @@ func (s *Service) pruneOne(ctx context.Context, t Target, kind model.ResourceKin
 		return f
 	}
 	if len(unmet) > 0 {
-		f.Status, f.Detail = StepBlocked, prunedBlockedDetail(unmet)
+		// The reason goes in Err, not over Detail. Every other decline in this
+		// function leaves Detail standing, so displacing it here would make
+		// `blocked` the one status whose line no longer says which resource it
+		// is about — and the id is the whole of what an operator checks a prune
+		// against, since there is no upstream read on this path (PRSR-46
+		// review). Err is printed in full below the table.
+		f.Status, f.Err = StepBlocked, prunedBlockedDetail(unmet)
 		return f
 	}
 	if !apply {
@@ -617,6 +629,34 @@ func notApplicable(kind model.ResourceKind, spec ServiceSpec, rec model.ServiceR
 	if !prune {
 		f.Status = StepOrphaned
 		f.Detail = fmt.Sprintf("%s, but Purser recorded one here on an earlier run and has not removed it — it is presumably still live", f.Detail)
+		return f
+	}
+	if rec.ServiceKey != spec.Key {
+		// **A prune may only remove this service's own resources** (PRSR-46
+		// review). `active` is built from ServiceResourcesForHostname, which is
+		// keyed on hostname alone, so without this every row at the hostname is
+		// a prune candidate whatever service it is recorded to — and a spec
+		// naming `--access none` would delete *another* service's Access
+		// application, leave its hostname resolving, and mark the row removed so
+		// nothing mentions it again. That is the exact hole `teardown-service`
+		// refuses on, reached through the additive command, and the operator has
+		// already supplied the second coordinate that closes it.
+		//
+		// Per-resource rather than refusing the whole run, which is the shape
+		// `checkOwnership` takes on the teardown walk. Two reasons. `Ensure`'s
+		// additive half is legitimate here — adopting a reassigned hostname
+		// rewrites a row and touches nothing upstream, and is deliberate
+		// behaviour — and, decisively, a whole-run refusal would be unfixable:
+		// nothing rebinds an *orphan's* service_key, because only ensureOne's
+		// adopt path rewrites a row and an orphan is a kind the spec does not
+		// call for. So the row would refuse for ever with no command to type,
+		// which is the prescribe-a-provable-no-op mistake. Naming the owner
+		// leaves two commands that do work — that service's own spec with
+		// --prune, or a teardown of the hostname as that service.
+		f.Status = StepRefused
+		f.Detail = fmt.Sprintf("%s, and Purser recorded one here%s", f.Detail, prunedTarget(rec))
+		f.Err = fmt.Sprintf("recorded to service %q, not %q — a spin-up removes only its own service's resources; remove it by running %s's spec with --prune, or `purser teardown-service --service %s --hostname %s`",
+			rec.ServiceKey, spec.Key, rec.ServiceKey, rec.ServiceKey, rec.Hostname)
 		return f
 	}
 	f.Status = StepPrune

@@ -236,8 +236,13 @@ func TestPrune_HeldBackWhenTheAdditivePassDidNotLand(t *testing.T) {
 		if f.Status != StepBlocked {
 			t.Errorf("%s: %s, want %s", k, f.Status, StepBlocked)
 		}
-		if !strings.Contains(f.Detail, string(model.ResourceDNSRecord)) {
-			t.Errorf("%s: the line must name what held it back, got %q", k, f.Detail)
+		// The reason goes in Err; Detail keeps naming the resource, so a blocked
+		// line still says which one it is about (PRSR-46 review).
+		if !strings.Contains(f.Err, string(model.ResourceDNSRecord)) {
+			t.Errorf("%s: the reason must name what held it back, got %q", k, f.Err)
+		}
+		if !strings.Contains(f.Detail, "id-"+string(k)) {
+			t.Errorf("%s: a blocked line must still say which resource it is about, got %q", k, f.Detail)
 		}
 	}
 	if route.teardowns != 0 || app.teardowns != 0 {
@@ -432,6 +437,94 @@ func TestPrune_ADeclinedPruneDoesNotStillReadAsARemoval(t *testing.T) {
 	// It still says what is recorded, which is what the operator checks against.
 	if !strings.Contains(f.Detail, "id-access_app") {
 		t.Errorf("detail %q should still name the resource", f.Detail)
+	}
+}
+
+// **A prune may only remove this service's own resources.** `active` is built
+// from a hostname-keyed lookup, so without the guard every row at the hostname is
+// a prune candidate whatever service it is recorded to — and a spec naming
+// `--access none` deletes *another* service's Access application, leaves its
+// hostname resolving, and marks the row removed so nothing mentions it again.
+// That is the hole `teardown-service` refuses on, reached through the additive
+// command (found in review of purser#58).
+func TestPrune_WillNotRemoveAnotherServicesResource(t *testing.T) {
+	st := newStore()
+	for _, k := range model.KindOrder {
+		st.put(model.ServiceResource{
+			ServiceKey: "argosy", Hostname: teardownHost, Kind: k,
+			ExternalID: "id-" + string(k), ParentID: "parent-" + string(k),
+		})
+	}
+	spec, err := ServiceSpec{
+		Key: "chronicle", Hostname: teardownHost,
+		Mode: ModeDirect, Upstream: "100.64.0.7", Access: AccessNone,
+	}.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := &fakeProv{kind: model.ResourceTunnelRoute}
+	app := &fakeProv{kind: model.ResourceAccessApp}
+	res, err := New(st, NewRegistry(route, app, dnsInPlace())).
+		Ensure(context.Background(), Request{Spec: spec, Apply: true, Prune: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, k := range []model.ResourceKind{model.ResourceTunnelRoute, model.ResourceAccessApp} {
+		f := findingFor(t, res, k)
+		if f.Status != StepRefused {
+			t.Errorf("%s: %s, want %s", k, f.Status, StepRefused)
+		}
+		// It names the owner, and the two commands that would actually remove
+		// it — a refusal with no way forward is the mistake this is not.
+		for _, want := range []string{`"argosy"`, "--prune", "teardown-service"} {
+			if !strings.Contains(f.Err, want) {
+				t.Errorf("%s: refusal does not mention %s: %q", k, want, f.Err)
+			}
+		}
+		if got := st.rows[key(teardownHost, k)].Status; got != model.ResourceActive {
+			t.Errorf("%s row is %q — nothing was removed, so nothing may be recorded as removed", k, got)
+		}
+	}
+	if route.teardowns != 0 || app.teardowns != 0 {
+		t.Errorf("another service's resource was deleted (route=%d app=%d)", route.teardowns, app.teardowns)
+	}
+	// It needs attention: the operator asked for a removal that did not happen.
+	if len(res.NeedsAttention()) != 2 {
+		t.Errorf("NeedsAttention has %d, want 2", len(res.NeedsAttention()))
+	}
+	// And the additive half is untouched — adopting a reassigned hostname
+	// rewrites a row and touches nothing upstream, which is deliberate. Refusing
+	// the whole run would also be unfixable: nothing rebinds an orphan's
+	// service_key, so the row would refuse for ever with no command to type.
+	if got := findingFor(t, res, model.ResourceDNSRecord).Status; got != StepAdopt {
+		t.Errorf("dns_record: %s, want %s — the additive half is legitimate here", got, StepAdopt)
+	}
+}
+
+// Without --prune the same disagreement is just an orphan: nothing was going to
+// be removed, so there is nothing to refuse.
+func TestPrune_AnotherServicesRowIsAnOrdinaryOrphanWithoutTheFlag(t *testing.T) {
+	st := newStore()
+	st.put(model.ServiceResource{
+		ServiceKey: "argosy", Hostname: teardownHost, Kind: model.ResourceAccessApp,
+		ExternalID: "app-1",
+	})
+	spec, err := ServiceSpec{
+		Key: "chronicle", Hostname: teardownHost,
+		Mode: ModeDirect, Upstream: "100.64.0.7", Access: AccessNone,
+	}.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := New(st, NewRegistry(&fakeProv{kind: model.ResourceTunnelRoute},
+		&fakeProv{kind: model.ResourceAccessApp}, dnsInPlace())).
+		Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := findingFor(t, res, model.ResourceAccessApp).Status; got != StepOrphaned {
+		t.Errorf("access_app: %s, want %s", got, StepOrphaned)
 	}
 }
 

@@ -342,4 +342,15 @@ func TestProvisionOutcome_APlanWithPrunesSaysSo(t *testing.T) {
 	if strings.Contains(provisionOutcome(plain), "removal") {
 		t.Errorf("outcome %q mentions removals on a run that has none", provisionOutcome(plain))
 	}
+
+	// Nor does passing the flag against a hostname with no orphans at all. The
+	// sentence is about the plan's contents, not the flag — announcing an action
+	// the plan will not take is the same fault as `prunedTarget`'s "removing it"
+	// one column over (PRSR-46 review).
+	noOrphans := &spinup.Result{Pruned: true, Findings: []spinup.StepFinding{
+		step(model.ResourceDNSRecord, spinup.StepCreate),
+	}}
+	if got := provisionOutcome(noOrphans); strings.Contains(got, "removal") {
+		t.Errorf("outcome %q announces removals on a --prune run that has none", got)
+	}
 }

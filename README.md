@@ -221,7 +221,8 @@ purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--a
 purser person list [--to svc1,svc2] [--type human|agent] [--all] [--json]   # the roster
 purser person show --email EMAIL [--json]                  # one person in full
 purser offboard --email EMAIL [--to svc1,svc2] [--apply]   # revoke access; previews by default
-purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply]
+purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply] [--prune]
+purser teardown-service --service KEY --hostname HOST [--apply]   # take the edge down; previews by default
 purser audit [--email EMAIL] [--to svc1,svc2]              # report drift, read-only
 purser reconcile --email EMAIL | --all [--to svc1,svc2]    # repair records
 purser migrate               # apply DB migrations and exit
@@ -417,12 +418,44 @@ own line rather than a shared count:
 | `unknown` | the state couldn't be read, so nothing was decided from it — re-run |
 | `blocked` | held back so the hostname isn't published in front of a step that didn't land |
 | `applied-not-recorded` | the edge changed and the row didn't — Purser can't tear down what it holds no id for |
+| `pruned-not-recorded` | a `--prune` removed it and the row didn't land — it's gone, and Purser's records say otherwise |
 
 `refused` and `unknown` are separate on purpose. Both decline to act, but a
-failed read means "run it again", and upstream being in a state Purser won't
-write to means "go and fix that, because running it again will print this until
-you do". Putting that difference in an error string would make it a second field
-a reader has to know to consult.
+failed read means "run it again", and a state Purser won't act from means "go and
+resolve that, because running it again will print this until you do". Putting
+that difference in an error string would make it a second field a reader has to
+know to consult.
+
+Two statuses are about resources the spec no longer calls for. `orphaned` is one
+Purser recorded here on an earlier run and this spec doesn't want — still live,
+and reported on its own line because nothing else in the report would mention it.
+It doesn't count as needing a human: the claim the exit code makes is "the spec
+is satisfied", not "nothing else is here". Passing `--prune` asks for it to be
+removed, at which point it reads `prune` and *is* work outstanding.
+
+A `--prune` only ever removes resources recorded to **this** service. One
+recorded to another is `refused`, naming the owner and the two commands that
+would remove it — running that service's own spec with `--prune`, or
+`teardown-service` as that service.
+
+### Taking an edge down
+
+`teardown-service` is the inverse of `provision-service`, and it works from
+Purser's records rather than from a spec: the recorded id is the only thing it
+may target, because deleting a resource somebody created by hand is not a mistake
+re-running fixes. It removes the DNS record first, so the hostname stops
+resolving, then the ingress route and the Access application — and holds the
+latter two back if the record didn't go, since removing a gate in front of a name
+that still resolves is the one outcome this axis must not produce quietly.
+
+It takes both `--service` and `--hostname`, and refuses the whole run if Purser's
+records attribute the hostname to a different service. A row proves Purser
+created something there; it does not prove the hostname is still that service's
+to remove, and two coordinates that must agree is the closest thing to an answer
+Purser can have from the outside.
+
+Like `offboard`, a dry run makes **no upstream call at all** — not even a
+read-only one. It has nothing to ask: the rows are the plan.
 
 The line runs through DNS as well as the tunnel, and both sides of it are live:
 several records answering for one hostname and none of them the spec's is

@@ -153,7 +153,13 @@ func printProvision(res *spinup.Result) {
 			n, plural2(n, "that step", "those steps"))
 	}
 	if n := c[spinup.StepRefused]; n > 0 {
-		fmt.Fprintf(os.Stderr, "%d refused — upstream is in a state Purser will not write to. Re-running repeats this until it is fixed there.\n", n)
+		// Deliberately not "upstream … fix it there", which this said until a
+		// live run printed it over an *ownership* refusal — a resource recorded
+		// to another service, which is in Purser's own records and nowhere near
+		// upstream (PRSR-46 review). The two cases share an instruction ("go and
+		// resolve it; re-running will not") and differ about where, so the line
+		// gives the instruction and each finding's own text gives the where.
+		fmt.Fprintf(os.Stderr, "%d refused — a state Purser will not act from. Re-running repeats this until it is resolved; each line below says what and where.\n", n)
 	}
 	if n := c[spinup.StepUnknown]; n > 0 {
 		fmt.Fprintf(os.Stderr, "%d could not be read, so nothing was decided from %s — re-run.\n",
@@ -237,11 +243,16 @@ func provisionOutcome(res *spinup.Result) string {
 	switch {
 	case res.Applied:
 		return fmt.Sprintf("Applied %d of %d.", res.Changed(), len(res.Findings))
-	case res.Pending() > 0 && res.Pruned:
-		// Worth spelling out separately: with --prune in play, "act on" covers
-		// deletions, and a plan that says only "act on 3 steps" over a line that
-		// is going to remove a live Access application is not a plan anybody
-		// should be reading in a hurry.
+	case res.Pending() > 0 && res.Counts()[spinup.StepPrune] > 0:
+		// Worth spelling out separately: with a prune in the plan, "act on"
+		// covers deletions, and a line that says only "act on 3 steps" over one
+		// that is going to remove a live Access application is not a plan
+		// anybody should be reading in a hurry.
+		//
+		// Conditioned on there being a `prune` finding rather than on the flag.
+		// `--prune` against a hostname with no orphans at all has no removals in
+		// it, and announcing them is the same fault this PR fixed one column
+		// over: naming an action the plan is not going to take (PRSR-46 review).
 		return fmt.Sprintf("Plan — nothing created, changed or removed. Re-run with --apply to act on %d step%s, removals included.",
 			res.Pending(), plural(res.Pending()))
 	case res.Pending() > 0:
