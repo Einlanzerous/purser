@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.0](https://github.com/Einlanzerous/purser/compare/v0.17.0...v0.18.0) (2026-08-31)
+
+
+### Features
+
+* **spinup:** orchestrate Teardown — the interface had it, nothing walked it (PRSR-34) ([#56](https://github.com/Einlanzerous/purser/issues/56)) ([dfccb0e](https://github.com/Einlanzerous/purser/commit/dfccb0efa1ba4df41faa6e310c213bd849a8c659))
+* **spinup:** provision-service --prune removes what the spec no longer calls for (PRSR-46) ([#58](https://github.com/Einlanzerous/purser/issues/58)) ([9104d7f](https://github.com/Einlanzerous/purser/commit/9104d7fc8417286903473411b1ab0869071d8142))
+
 ## [0.17.0](https://github.com/Einlanzerous/purser/compare/v0.16.0...v0.17.0) (2026-08-28)
 
 
