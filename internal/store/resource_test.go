@@ -353,3 +353,81 @@ func TestTeardownWalk_AFailedRemovalLeavesTheRowActive(t *testing.T) {
 		t.Errorf("row = %+v; a failed removal must leave it active so the next run retries", rows[0])
 	}
 }
+
+// --- pruning a narrowed spec, over the real table (PRSR-46) ------------------
+
+// A prune is a teardown reached from the additive command, so it writes the same
+// row transition through the same store method. What this checks is that it does
+// — over real SQL, on the one path where a removal is a *side effect* of a
+// spin-up rather than the thing being asked for.
+func TestPrune_MarksOnlyTheOrphanRemoved(t *testing.T) {
+	st := resourceStore(t)
+	ctx := context.Background()
+	const host = "argosy.zerogravity.industries"
+	for _, k := range model.KindOrder {
+		if _, err := st.UpsertServiceResource(ctx, model.ServiceResource{
+			ServiceKey: "argosy", Hostname: host, Kind: k, ExternalID: "id-" + string(k),
+		}); err != nil {
+			t.Fatalf("seed %s: %v", k, err)
+		}
+	}
+	spec, err := spinup.ServiceSpec{
+		Key: "argosy", Hostname: host,
+		Mode: spinup.ModeDirect, Upstream: "100.64.0.7", Access: spinup.AccessNone,
+	}.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The DNS provisioner reports what the row already says, so the additive pass
+	// lands and does not hold the prune back.
+	svc := spinup.New(st, spinup.NewRegistry(
+		&tearProv{kind: model.ResourceTunnelRoute},
+		&tearProv{kind: model.ResourceAccessApp},
+		&presentProv{tearProv: tearProv{kind: model.ResourceDNSRecord}, externalID: "id-dns_record"},
+	))
+
+	res, err := svc.Ensure(ctx, spinup.Request{Spec: spec, Apply: true, Prune: true})
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if res.Changed() != 2 {
+		t.Fatalf("changed=%d, want 2 (%v)", res.Changed(), res.NeedsAttention())
+	}
+
+	rows, err := st.ServiceResourcesForHostname(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byKind := map[model.ResourceKind]model.ServiceResource{}
+	for _, r := range rows {
+		byKind[r.Kind] = r
+	}
+	for _, k := range []model.ResourceKind{model.ResourceTunnelRoute, model.ResourceAccessApp} {
+		if got := byKind[k].Status; got != model.ResourceRemoved {
+			t.Errorf("%s is %q, want %q", k, got, model.ResourceRemoved)
+		}
+		if byKind[k].RemovedAt == nil {
+			t.Errorf("%s has no removed_at", k)
+		}
+	}
+	// The kind the spec still calls for is untouched — the hostname stays up,
+	// which is the whole difference between a prune and a teardown.
+	if got := byKind[model.ResourceDNSRecord].Status; got != model.ResourceActive {
+		t.Errorf("dns_record is %q, want %q — a prune must not take the hostname down", got, model.ResourceActive)
+	}
+	if byKind[model.ResourceDNSRecord].RemovedAt != nil {
+		t.Error("dns_record carries a removed_at")
+	}
+}
+
+// presentProv is a tearProv whose Inspect reports the resource already there and
+// already matching, so the additive pass reads `ok` and a prune is not held back
+// by a step that has nothing to do.
+type presentProv struct {
+	tearProv
+	externalID string
+}
+
+func (p *presentProv) Inspect(context.Context, spinup.Target) (spinup.State, error) {
+	return spinup.State{Exists: true, Matches: true, ExternalID: p.externalID, Detail: "already correct"}, nil
+}

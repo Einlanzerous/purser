@@ -127,7 +127,29 @@ const (
 	// one here on an earlier run and never removed it, so it is presumably still
 	// live. Distinct from skipped: the same line would otherwise say "nothing to
 	// think about" for a resource that is still serving traffic.
+	//
+	// Reported and not acted on, unless the run asked for it — see StepPrune.
 	StepOrphaned StepStatus = "orphaned"
+	// StepPrune — an orphan on a run that passed Prune, so this run removes it.
+	//
+	// A separate status from StepOrphaned rather than the same one plus a flag,
+	// and the distinction is not the one --apply makes. `--apply` never changes a
+	// status: `create` reads `create` on both paths, because the plan is the
+	// first half of the apply. `--prune` changes what the run is *asking for*,
+	// so an extra resource genuinely stops being "nothing will be done about
+	// this" and becomes "this is going". Those are different instructions to
+	// whoever reads the line, which is what a status is for (PRSR-46).
+	StepPrune StepStatus = "prune"
+	// StepPrunedNotRecorded — a prune removed the resource and the row saying so
+	// did not land.
+	//
+	// Not StepAppliedNotRecorded, which points the opposite way: that one means
+	// something was *created* and Purser holds no id for it, so a teardown would
+	// miss it until a later run adopts it back. This means something is *gone*
+	// and Purser holds a live-looking row for it, so a later run reads it as a
+	// resource to adopt and a later teardown targets an id nobody can delete.
+	// Same argument PRSR-34 made for keeping TeardownRemovedNotRecorded separate.
+	StepPrunedNotRecorded StepStatus = "pruned-not-recorded"
 	// StepBlocked — this step would have acted, and was held back because a step
 	// it depends on is not in place. See ServiceSpec.dependsOn.
 	//
@@ -177,6 +199,13 @@ const (
 	// Purser's own configuration missing a credential, which the operator fixes
 	// here. Refused is upstream being in a shape nobody can safely write to,
 	// which they fix there.
+	//
+	// Every one of these comes from a provisioner — IsRefused on an Inspect,
+	// Ensure or Teardown call. PRSR-46 briefly widened it to cover a `--prune`
+	// meeting another service's record, and that is no longer true: an ownership
+	// disagreement refuses the whole run with ErrHostnameNotThisService, before
+	// any step is decided, so it produces no finding at all (see
+	// refuseContested).
 	StepRefused StepStatus = "refused"
 	// StepFailed — the write was attempted and errored. Nothing is recorded,
 	// so a re-run reconsiders the step from scratch.
@@ -219,6 +248,16 @@ type Request struct {
 	// Apply turns the plan into writes. False is a pure dry run: every upstream
 	// call made is an Inspect, which mutates nothing.
 	Apply bool
+	// Prune asks the run to remove what the spec no longer calls for — the
+	// resources otherwise reported as `orphaned` and left alone (PRSR-46).
+	//
+	// A separate flag from Apply, and both are needed to remove anything. Apply
+	// is "act on this plan"; Prune is "and the plan includes taking things
+	// away", which is a different question and the only destructive thing this
+	// orchestrator does. An operator who wants the additive half and not the
+	// subtractive one — the overwhelmingly common case — never has to think
+	// about it.
+	Prune bool
 }
 
 // Result is the whole plan, or the whole apply.
@@ -227,6 +266,9 @@ type Result struct {
 	Spec     ServiceSpec
 	Findings []StepFinding
 	Applied  bool
+	// Pruned echoes the request's Prune, so a reader can tell an `orphaned` line
+	// that was never going to be acted on from one on a run that asked.
+	Pruned bool
 }
 
 // Counts summarizes findings by status, for a one-line summary.
@@ -264,7 +306,7 @@ func (r *Result) Pending() int {
 	n := 0
 	for _, f := range r.Findings {
 		switch f.Status {
-		case StepCreate, StepUpdate, StepAdopt, StepMissing:
+		case StepCreate, StepUpdate, StepAdopt, StepMissing, StepPrune:
 			if !f.Applied {
 				n++
 			}
@@ -297,31 +339,34 @@ func (r *Result) Pending() int {
 // "nothing else is here" — the honest weaker one, and the caller-facing wording
 // must not round it up.
 //
-// It is excluded because nothing here can act on it. `Ensure` only ever adds and
-// updates, and PRSR-34's `Teardown` walk is **whole-hostname** — driven by
-// (service, hostname), with every removal ordered behind the DNS record going
-// first. An orphan is a resource at a hostname that is *staying up*: a service
-// that was `--access gated` and is now `--access none`. Tearing the hostname
-// down to remove it is not what anybody means.
+// The exclusion has now outlived two different reasons for it, which is worth
+// recording because the durable one is the third and it is not about tooling at
+// all. It was first excluded because nothing orchestrated a teardown; then
+// because PRSR-34's walk is whole-hostname and an orphan sits at a hostname that
+// is *staying up*; and PRSR-46 has since given it a command (`--prune`), so
+// neither reason survives. It stays excluded anyway, because **an orphan does
+// not falsify the claim this method makes.** The claim is "the spec is
+// satisfied", and everything the spec asks for is in place — what is extra is
+// extra. Reading it as "and nothing else is here" is the rounding-up the doc
+// comment above forbids.
 //
-// So the exclusion survives PRSR-34, for a different reason than it was first
-// given: not "nothing orchestrates a teardown" but "no command removes one
-// resource from a live hostname". Counting it would make every run of a
-// deliberately narrowed spec report trouble and exit non-zero, for ever, with no
-// command to type — the prescribe-a-provable-no-op mistake `offboard`'s SSO
-// warning exists to avoid, which teaches an operator to ignore the signal that
-// matters. It is reported loudly on its own line instead, since nothing else in
-// the report would mention a resource that is still serving traffic.
+// That is also the answer to the obvious objection. Now that `--prune` exists
+// there *is* something to type, so the old "no command to type" argument would
+// have flipped this to counted; but a run that deliberately keeps a resource the
+// spec no longer names would then report trouble and exit non-zero for ever, and
+// an operator who is doing that on purpose is exactly who learns to ignore the
+// signal — `offboard`'s SSO warning is the precedent.
 //
-// Giving it a command is **PRSR-46**, which has a key rather than this sentence
-// because a deferral pointing at a closed ticket is how this project has twice
-// lost the remaining half of a piece of work (see PRSR-25, and PRSR-34's own
-// existence).
+// It is reported loudly on its own line either way, since nothing else in the
+// report would mention a resource that is still serving traffic. A run that
+// passed Prune reports `prune` instead, which *is* counted by Pending: that run
+// asked for the removal, so it is work outstanding rather than a state.
 func (r *Result) NeedsAttention() []StepFinding {
 	var out []StepFinding
 	for _, f := range r.Findings {
 		switch f.Status {
-		case StepUnavailable, StepRefused, StepUnknown, StepBlocked, StepFailed, StepAppliedNotRecorded:
+		case StepUnavailable, StepRefused, StepUnknown, StepBlocked, StepFailed,
+			StepAppliedNotRecorded, StepPrunedNotRecorded:
 			out = append(out, f)
 		}
 	}
@@ -391,23 +436,219 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 		}
 	}
 
-	res := &Result{Spec: spec, Applied: req.Apply}
 	// Findings so far, so a step can see whether the steps it depends on are in
 	// place. KindOrder is an apply order, so a dependency has always been
 	// decided by the time its dependent is reached.
+	// A prune on a hostname holding somebody else's resource is refused whole,
+	// before anything is read or written. See refuseContested.
+	if req.Prune {
+		if err := refuseContested(spec, active); err != nil {
+			return nil, err
+		}
+	}
+
 	done := make(map[model.ResourceKind]StepFinding, len(model.KindOrder))
 	for _, kind := range model.KindOrder {
 		rec, hasRec := active[kind]
 		var f StepFinding
 		if !spec.callsFor(kind) {
-			f = notApplicable(kind, spec, rec, hasRec, s.registry)
+			f = notApplicable(kind, spec, rec, hasRec, s.registry, req.Prune)
 		} else {
 			f = s.ensureOne(ctx, target, kind, rec, hasRec, req.Apply, unmetDeps(spec, kind, done))
 		}
 		done[kind] = f
-		res.Findings = append(res.Findings, f)
+	}
+
+	// Pruning runs after the whole additive pass, and the order is the reason it
+	// works rather than a tidiness (PRSR-46).
+	//
+	// The case that decides it is a service moving from tunnelled to direct: the
+	// ingress route becomes an orphan while the DNS step *repoints* the record
+	// from <tunnel>.cfargotunnel.com to the direct upstream. Drop the route first
+	// and the hostname 502s until the record catches up; repoint first and the
+	// route is already serving nobody when it goes. Running the additive pass to
+	// completion gets that for free, on every spec, without a second ordering
+	// rule to keep in step with KindOrder.
+	if req.Prune {
+		for _, kind := range model.TeardownOrder() {
+			if done[kind].Status != StepPrune {
+				continue
+			}
+			done[kind] = s.pruneOne(ctx, target, kind, active[kind], done[kind], req.Apply, unmetPruneDeps(spec, done))
+		}
+	}
+
+	// Built at the end rather than appended as we go, so the report stays in
+	// KindOrder while the prune pass above walks TeardownOrder. A reader gets one
+	// line per kind in the order a spin-up applies them, which is the order every
+	// other surface on this axis lists them in.
+	res := &Result{Spec: spec, Applied: req.Apply, Pruned: req.Prune}
+	for _, kind := range model.KindOrder {
+		res.Findings = append(res.Findings, done[kind])
 	}
 	return res, nil
+}
+
+// refuseContested rejects a prune of a hostname holding a resource this spec
+// does not call for and does not own (PRSR-46, settled over three review rounds).
+//
+// **A prune may only remove this service's own resources.** `active` is built
+// from ServiceResourcesForHostname, which is keyed on hostname alone, so without
+// this every row there is a prune candidate whatever service it is recorded to —
+// and a spec naming `--access none` would delete *another* service's Access
+// application, leave its hostname resolving, and mark the row removed so nothing
+// mentions it again. That is the hole `checkOwnership` refuses on for a
+// teardown, reached through the additive command.
+//
+// **Whole-run, and before anything is read or written**, which two narrower
+// shapes were tried and abandoned first. Refusing each orphan on its own left
+// `Ensure`'s additive pass free to run, and every row-writing branch of
+// ensureOne calls s.record, which stamps this spec's service_key: so the run
+// rebound one kind while refusing the others, producing exactly the
+// half-reassigned hostname `checkOwnership` refuses a whole teardown on — for
+// *both* keys. It manufactured, in the act of refusing, the condition that stops
+// the remedy its own message names. Holding only the adopt then fixed one branch
+// of four and left `update` doing the same — and `update` is the likelier input,
+// since a hostname genuinely held by another service has a record that does not
+// match this spec.
+//
+// The objection that sent it down that road was wrong, and is recorded so nobody
+// re-derives it: a whole-run refusal looked unfixable, because nothing rebinds an
+// *orphan's* service_key and so the row would refuse for ever. It overlooked the
+// remedy this refusal names. `teardown-service --service <owner>` removes the
+// hostname's resources, and it works precisely because nothing was written —
+// every row still names one service. Refusing early is what keeps that true; the
+// narrower shapes are what broke it.
+//
+// Only orphans make a hostname contested. A *called-for* kind whose row names
+// another service is the ordinary reassignment an adopt exists to rebind, which
+// is deliberate — and on the paths that write upstream it is PRSR-48, not this.
+func refuseContested(spec ServiceSpec, active map[model.ResourceKind]model.ServiceResource) error {
+	var theirs []string
+	for _, kind := range model.KindOrder {
+		if spec.callsFor(kind) {
+			continue
+		}
+		if rec, ok := active[kind]; ok && rec.ServiceKey != spec.Key {
+			theirs = append(theirs, fmt.Sprintf("%s is recorded to %q", kind, rec.ServiceKey))
+		}
+	}
+	if len(theirs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %q asks to prune %s, but %s — a spin-up removes only its own service's resources; remove them as their owner (`purser teardown-service --service <owner> --hostname %s`), or re-run without --prune to leave them alone",
+		ErrHostnameNotThisService, spec.Key, spec.Hostname, strings.Join(theirs, ", "), spec.Hostname)
+}
+
+// unmetPruneDeps returns the steps this spec *does* call for that did not land.
+//
+// It is one rule covering both prunable kinds, and it is deliberately stronger
+// than a per-kind dependency list would be. `--prune` means "make the edge match
+// this spec"; if the additive half of that spec did not land, the edge is not the
+// one the spec describes, and removing things on the strength of a spec only
+// half-applied is acting on a state nobody has.
+//
+// The concrete case is the one the ordering above is for: a tunnelled → direct
+// switch whose DNS repoint failed leaves the record pointing at the tunnel, so
+// dropping the now-"orphaned" route takes a working service down. The general
+// rule catches that without needing to know it, which is what makes it safer than
+// enumerating the pairs — the enumeration is the thing that goes stale when a
+// fourth kind arrives.
+func unmetPruneDeps(spec ServiceSpec, done map[model.ResourceKind]StepFinding) []model.ResourceKind {
+	var unmet []model.ResourceKind
+	for _, kind := range model.KindOrder {
+		if !spec.callsFor(kind) {
+			continue
+		}
+		if f, decided := done[kind]; !decided || !f.inPlace() {
+			unmet = append(unmet, kind)
+		}
+	}
+	return unmet
+}
+
+// prunedBlockedDetail explains which steps held a prune back.
+func prunedBlockedDetail(unmet []model.ResourceKind) string {
+	names := make([]string, len(unmet))
+	for i, k := range unmet {
+		names[i] = string(k)
+	}
+	return fmt.Sprintf("held back: %s did not land, so this spec is not the edge yet and removing what it no longer names would act on a state nobody has",
+		strings.Join(names, " and "))
+}
+
+// pruneOne removes one orphan, or — without apply — reports that it would.
+//
+// It is the only destructive thing this orchestrator does, and it does it
+// through the same two calls `Teardown` uses: the provisioner's Teardown for the
+// edge, and MarkServiceResourceRemoved for the row, in that order and never the
+// other way round. A removal that didn't happen must never be recorded as one
+// (PRSR-17), so every unhappy path below leaves the row active for the next run.
+func (s *Service) pruneOne(ctx context.Context, t Target, kind model.ResourceKind, rec model.ServiceResource, f StepFinding, apply bool, unmet []model.ResourceKind) StepFinding {
+	prov, ok := s.registry.Get(kind)
+	if !ok {
+		// Still there, and the row still says so. Never "nothing to do".
+		f.Status = StepUnavailable
+		f.Err = fmt.Sprintf("no provisioner registered for %q in this build", kind)
+		return f
+	}
+	// Asked before the dry run returns and contacting nothing, so a plan cannot
+	// promise a removal --apply then declines — the property TeardownChecker
+	// exists for (PRSR-34), which this path inherits by being a teardown.
+	if err := CanTeardown(prov, t); err != nil {
+		if IsRefused(err) {
+			f.Status, f.Err = StepRefused, err.Error()
+			return f
+		}
+		f.Status, f.Err = StepUnavailable, err.Error()
+		return f
+	}
+	if len(unmet) > 0 {
+		// The reason goes in Err, not over Detail. Every other decline in this
+		// function leaves Detail standing, so displacing it here would make
+		// `blocked` the one status whose line no longer says which resource it
+		// is about — and the id is the whole of what an operator checks a prune
+		// against, since there is no upstream read on this path (PRSR-46
+		// review). Err is printed in full below the table.
+		f.Status, f.Err = StepBlocked, prunedBlockedDetail(unmet)
+		return f
+	}
+	if !apply {
+		return f // still StepPrune: this is what --apply would remove
+	}
+
+	rm, err := prov.Teardown(ctx, t, rec)
+	switch {
+	case IsUnavailable(err):
+		f.Status, f.Err = StepUnavailable, err.Error()
+		return f
+	case IsRefused(err):
+		// Upstream is in a shape no provisioner may act on — the tunnel's
+		// ingress document, mostly. Re-running repeats this until it is fixed
+		// there, and nothing was removed either way.
+		f.Status, f.Err = StepRefused, err.Error()
+		return f
+	case err != nil:
+		f.Status, f.Err = StepFailed, err.Error()
+		return f
+	}
+	if rm.Detail != "" {
+		// Overwritten: the line described what was recorded, and after the call
+		// the useful thing is what happened to it.
+		f.Detail = rm.Detail
+	}
+	if rm.Warning != "" {
+		f.Warning = rm.Warning
+	}
+
+	if err := s.store.MarkServiceResourceRemoved(ctx, rec.ID); err != nil {
+		// Gone upstream, live in the records — the opposite advice from failed,
+		// and never swallowed into it.
+		f.Status, f.Err = StepPrunedNotRecorded, err.Error()
+		return f
+	}
+	f.Applied = true
+	return f
 }
 
 // unmetDeps returns the prerequisites of kind that this run has not put in
@@ -436,17 +677,51 @@ func blockedDetail(unmet []model.ResourceKind) string {
 // notApplicable reports a kind this spec doesn't call for — and says so louder
 // when Purser recorded one here anyway, since that resource is presumably still
 // live and nothing else in the report would mention it.
-func notApplicable(kind model.ResourceKind, spec ServiceSpec, rec model.ServiceResource, hasRec bool, reg *Registry) StepFinding {
+func notApplicable(kind model.ResourceKind, spec ServiceSpec, rec model.ServiceResource, hasRec bool, reg *Registry, prune bool) StepFinding {
 	f := StepFinding{Kind: kind, DisplayName: string(kind), Status: StepSkipped, Detail: spec.skipReason(kind)}
 	if p, ok := reg.Get(kind); ok {
 		f.DisplayName = p.DisplayName()
 	}
-	if hasRec {
-		f.Status = StepOrphaned
-		f.ExternalID = rec.ExternalID
-		f.Detail = fmt.Sprintf("%s, but Purser recorded one here on an earlier run and has not removed it — it is presumably still live", f.Detail)
+	if !hasRec {
+		return f
 	}
+	f.ExternalID = rec.ExternalID
+	if !prune {
+		f.Status = StepOrphaned
+		f.Detail = fmt.Sprintf("%s, but Purser recorded one here on an earlier run and has not removed it — it is presumably still live", f.Detail)
+		return f
+	}
+	// No ownership branch here: refuseContested has already rejected the whole
+	// run if any orphan at this hostname belongs to somebody else, so anything
+	// reaching this line is this service's to remove.
+	f.Status = StepPrune
+	f.Detail = fmt.Sprintf("%s, and Purser recorded one here on an earlier run%s", f.Detail, prunedTarget(rec))
 	return f
+}
+
+// prunedTarget names the recorded resource, since on this line there is no
+// upstream read to describe — the row is the whole of what the operator has to
+// check the plan against, exactly as on the teardown walk.
+//
+// It describes the resource and never the action, which is the rule the rest of
+// this report follows: DETAIL is what is there, ACTION is what happens to it.
+// Writing "— removing it" here read fine under `prune` and became a lie under
+// every other status the prune path can produce, since pruneOne leaves Detail
+// alone when it declines. A live run against an unconfigured deployment printed
+// `unavailable` beside "removing it (app-77e1 …)" — a plan promising in one
+// column what it refuses in the next (PRSR-46, found by running the binary).
+func prunedTarget(rec model.ServiceResource) string {
+	switch {
+	case rec.ExternalID != "" && rec.ParentID != "":
+		return fmt.Sprintf(" (%s in %s)", rec.ExternalID, rec.ParentID)
+	case rec.ExternalID != "":
+		return fmt.Sprintf(" (%s)", rec.ExternalID)
+	case rec.ParentID != "":
+		// A tunnel route, which has no id of its own: its handle is
+		// (tunnel, hostname), so naming the tunnel is naming the resource.
+		return fmt.Sprintf(" (in %s)", rec.ParentID)
+	}
+	return ""
 }
 
 // ensureOne decides and, under apply, performs one step.

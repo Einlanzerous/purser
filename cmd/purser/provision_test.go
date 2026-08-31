@@ -275,3 +275,82 @@ func TestProvisionOutcome(t *testing.T) {
 		})
 	}
 }
+
+// --- prune (PRSR-46) --------------------------------------------------------
+
+// An orphan still exits zero, with or without --prune in play. It does not
+// falsify the claim the exit code makes, which is that the spec is satisfied —
+// "and nothing else is here" is the rounding-up Result.NeedsAttention forbids.
+// A run that deliberately keeps a resource the spec no longer names would
+// otherwise exit non-zero for ever.
+func TestProvisionExit_AnOrphanIsStillClean(t *testing.T) {
+	res := &spinup.Result{Findings: []spinup.StepFinding{
+		step(model.ResourceTunnelRoute, spinup.StepOrphaned),
+		step(model.ResourceAccessApp, spinup.StepOK),
+		step(model.ResourceDNSRecord, spinup.StepOK),
+	}}
+	if got := provisionExit(res); got != 0 {
+		t.Errorf("exit %d, want 0", got)
+	}
+	// A *planned* prune is likewise clean — previewing succeeded at previewing —
+	// but it is work outstanding, so it counts toward Pending where an orphan
+	// does not.
+	planned := &spinup.Result{Pruned: true, Findings: []spinup.StepFinding{
+		step(model.ResourceTunnelRoute, spinup.StepPrune),
+		step(model.ResourceDNSRecord, spinup.StepOK),
+	}}
+	if got := provisionExit(planned); got != 0 {
+		t.Errorf("planned prune: exit %d, want 0", got)
+	}
+	if planned.Pending() != 1 {
+		t.Errorf("Pending()=%d, want 1", planned.Pending())
+	}
+	if res.Pending() != 0 {
+		t.Errorf("an orphan nobody asked about counts as pending: %d", res.Pending())
+	}
+}
+
+// The resource is gone and Purser holds a live-looking row for it, which a later
+// run reads as something to adopt. Somebody has to put that back.
+func TestProvisionExit_PrunedNotRecordedIsNotClean(t *testing.T) {
+	res := &spinup.Result{Applied: true, Pruned: true, Findings: []spinup.StepFinding{
+		step(model.ResourceAccessApp, spinup.StepPrunedNotRecorded),
+		step(model.ResourceDNSRecord, spinup.StepOK),
+	}}
+	if got := provisionExit(res); got != 1 {
+		t.Errorf("exit %d, want 1", got)
+	}
+}
+
+// A plan whose pending work includes deletions says so. "Act on 3 steps" over a
+// line that is going to remove a live Access application is not a sentence
+// anybody should read in a hurry.
+func TestProvisionOutcome_APlanWithPrunesSaysSo(t *testing.T) {
+	res := &spinup.Result{Pruned: true, Findings: []spinup.StepFinding{
+		step(model.ResourceAccessApp, spinup.StepPrune),
+		step(model.ResourceDNSRecord, spinup.StepOK),
+	}}
+	got := provisionOutcome(res)
+	if !strings.Contains(got, "removal") {
+		t.Errorf("outcome %q must say the pending work includes removals", got)
+	}
+
+	// And without --prune the wording is unchanged, since nothing is going.
+	plain := &spinup.Result{Findings: []spinup.StepFinding{
+		step(model.ResourceAccessApp, spinup.StepCreate),
+	}}
+	if strings.Contains(provisionOutcome(plain), "removal") {
+		t.Errorf("outcome %q mentions removals on a run that has none", provisionOutcome(plain))
+	}
+
+	// Nor does passing the flag against a hostname with no orphans at all. The
+	// sentence is about the plan's contents, not the flag — announcing an action
+	// the plan will not take is the same fault as `prunedTarget`'s "removing it"
+	// one column over (PRSR-46 review).
+	noOrphans := &spinup.Result{Pruned: true, Findings: []spinup.StepFinding{
+		step(model.ResourceDNSRecord, spinup.StepCreate),
+	}}
+	if got := provisionOutcome(noOrphans); strings.Contains(got, "removal") {
+		t.Errorf("outcome %q announces removals on a --prune run that has none", got)
+	}
+}
