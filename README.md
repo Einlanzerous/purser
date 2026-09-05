@@ -221,7 +221,7 @@ purser person add --name NAME --email EMAIL [--type human|agent] [--rename] [--a
 purser person list [--to svc1,svc2] [--type human|agent] [--all] [--json]   # the roster
 purser person show --email EMAIL [--json]                  # one person in full
 purser offboard --email EMAIL [--to svc1,svc2] [--apply]   # revoke access; previews by default
-purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply] [--prune]
+purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply] [--prune] [--reassign-from KEY]
 purser teardown-service --service KEY --hostname HOST [--apply]   # take the edge down; previews by default
 purser audit [--email EMAIL] [--to svc1,svc2]              # report drift, read-only
 purser reconcile --email EMAIL | --all [--to svc1,svc2]    # repair records
@@ -433,10 +433,17 @@ It doesn't count as needing a human: the claim the exit code makes is "the spec
 is satisfied", not "nothing else is here". Passing `--prune` asks for it to be
 removed, at which point it reads `prune` and *is* work outstanding.
 
-A `--prune` only ever removes resources recorded to **this** service. One
-recorded to another is `refused`, naming the owner and the two commands that
-would remove it — running that service's own spec with `--prune`, or
-`teardown-service` as that service.
+A spin-up writes only **this** service's edge. A hostname whose records name
+another service is refused outright — on the plan as much as the apply, before
+anything upstream is contacted — because the additive steps are keyed on
+hostname and would otherwise write this spec onto that service's resources: a
+`bookmark` spec against somebody's *gated* application strips its gate and
+leaves it resolving. The refusal names the owner and the two ways forward. If
+the hostname is genuinely moving, `--reassign-from KEY` names the previous
+owner, and every row recorded to it moves with the hostname (an orphan
+included, so nothing is left half-owned); if it is being retired,
+`teardown-service` as that service removes it. A `--prune` is covered by the
+same rule, so it only ever removes resources recorded to this service.
 
 ### Taking an edge down
 
@@ -665,10 +672,13 @@ construct_net/Tailscale isolation).
   `email` are required and a request without either is a `400`)
 - `GET  /v1/invites/{id}` — status
 - `POST /v1/spinups` — `{ "service", "hostname", "mode", "upstream", "access",
-  "display_name", "logo", "tunnel", "apply" }` — stand up a service's edge.
-  Omitting `apply` returns a plan and writes nothing. `logo` is a ref rather than
-  a URL — `"placard"` (the default; resolve the mark by service key), `"none"`
-  (clear the icon), or an explicit `https://` URL. The old `logo_url` is refused
+  "display_name", "logo", "tunnel", "apply", "prune", "reassign_from" }` — stand
+  up a service's edge. Omitting `apply` returns a plan and writes nothing;
+  `prune` also removes what the spec no longer calls for; a hostname whose
+  records name another service is a `409` unless `reassign_from` names it.
+  `logo` is a ref rather than a URL — `"placard"` (the default; resolve the
+  mark by service key), `"none"` (clear the icon), or an explicit `https://`
+  URL. The old `logo_url` is refused
   with a `400` naming the replacement rather than ignored, since a dropped field
   would silently discard the caller's icon.
 

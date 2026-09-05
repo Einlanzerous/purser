@@ -1151,5 +1151,22 @@ an envelope is the one nobody will think to re-check.
   `destinations` (12130); the branch stays, as the safe direction. And
   **`removed_at` stamps the first transition, not each one** — deliberate,
   mirrored by `deprovisioned_at`, and untested for a second real removal, so a
-  hostname torn down twice reports the first date. That is **PRSR-49**, on
+    hostname torn down twice reports the first date. That is **PRSR-49**, on
   both axes, and not changed here.
+
+- ~~**PRSR-48** — a spin-up rewrites another service's Access application.~~
+  **Done, 2026-09-05.** `Ensure` was keyed on hostname and never consulted
+  `service_key`: a matching upstream was the deliberate reassignment adopt, and
+  a differing one was an `update` that `--apply` wrote onto another service's
+  edge — a bookmark spec against somebody's gated application stripped its
+  policies and left it resolving. `checkSpecOwnership` now asks the teardown's
+  question one command over and refuses the whole run before any `Inspect`,
+  plan and apply alike (`ErrHostnameNotThisService`, 409), which subsumes
+  PRSR-46's prune-only check. `--reassign-from KEY` / `reassign_from` is the
+  stated way to move a hostname: rows recorded to exactly that service are
+  treated as the spec's own, adopt and update proceed as before, and orphans
+  are re-attributed too so the hostname is never left half-owned. The three
+  shapes the ticket weighed — refuse, warn, refuse only gate-removing writes —
+  were put to the owner; refuse-with-a-named-previous-owner was taken because
+  a warning on a self-concealing outcome is what operators learn to skim, and a
+  per-write rule for "can remove access" goes stale the moment a kind is added.

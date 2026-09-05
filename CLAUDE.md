@@ -535,12 +535,44 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   and it works **precisely because nothing was written** — every row still names
   one service. Refusing early is what keeps that true; the narrower shapes are
   what broke it.
-  Only orphans make a hostname contested. A *called-for* kind whose row names
-  another service is the ordinary reassignment an adopt exists to rebind, which
-  is deliberate. **On the paths that write upstream that is not safe either** — a
-  `--access bookmark` spec against another service's *gated* application strips
-  its policies and leaves it resolving — but that is **PRSR-48**, reachable
-  without `--prune` at all, and deliberately not fixed here.
+    That check asked the question of orphans only, on the grounds that a
+  *called-for* kind whose row names another service is the reassignment an
+  adopt exists to rebind. It is now asked of every row, by
+  `checkSpecOwnership` — see the next bullet — and `refuseContested` is gone:
+  a prune is covered by the general rule rather than being a special case of it.
+- **A spin-up writes only its own service's edge, and a hostname moves only
+  when its previous owner is named** (PRSR-48). `Ensure` is keyed on hostname:
+  `ensureOne` asks the provisioner what is there and makes it match the spec,
+  and never consulted `service_key`. When upstream already matched, the
+  mismatch was the deliberate reassignment adopt. When it did not, the same
+  mismatch was an `update`, and `--apply` wrote one service's spec onto
+  another's resources — a `--access bookmark` spec against somebody's *gated*
+  application strips its policies and leaves it resolving, which is a service
+  admitting everyone with nothing anywhere reporting it. The plan did say
+  `update`, which on a service you meant to update is not a line that invites
+  suspicion: PRSR-41's lesson, met from the other side.
+  So `checkSpecOwnership` asks the teardown's question one command over, and
+  refuses the **whole run, before any `Inspect`**, on the plan as much as the
+  apply, when any active row at the hostname names a service the request did
+  not — `ErrHostnameNotThisService` again, exit 2 / 409, so all three surfaces
+  answer the same way and the comparison is stated once (`recordedToOthers`).
+  Whole-run for the reason PRSR-46 found over three rounds: every row-writing
+  branch of `ensureOne` stamps this spec's `service_key`, so a run that refused
+  one kind and ran the rest manufactures the half-owned hostname that refuses
+  both owners' teardowns. `--reassign-from KEY` (`reassign_from` over HTTP) is
+  the stated way to move a hostname: rows recorded to exactly that service are
+  treated as the spec's own, so adopt rebinds and update writes as before, and
+  **orphans move too** (`rebindOrphan`, a row write and nothing upstream) so
+  the hostname is never left half-owned — the run after a move needs no flag,
+  and a teardown as the new owner works. Two coordinates that must agree, the
+  second one typed rather than inferred: `offboard`'s shape, and the person
+  axis's rule that only `person add --rename` may change a name. Naming a
+  previous owner that holds nothing here is not an error, so re-running the
+  command that moved a hostname says `ok`; naming the spec's own service is
+  `ErrReassignFromSelf` (400), refused rather than ignored because a flag that
+  does nothing is likelier a wrong key. Under `--prune` the orphan is
+  re-attributed *first* and pruned second, so a prune that does not land leaves
+  a row its new owner can still remove.
 - **DETAIL describes the resource; ACTION carries the verb.** The prune line
   first read "… — removing it (app-77e1 …)", which is fine under `prune` and a
   lie under every other status the path produces, since `pruneOne` leaves Detail
@@ -1387,6 +1419,11 @@ its tests cover a repeat teardown and a stand-back-up — but not a second *real
 removal, so a hostname stood up, torn down, stood up and torn down again keeps
 the first date, and `gone`'s "already removed, on …" names it. Both axes. Filed
 as **PRSR-49**; not changed here.
+
+**PRSR-48 closed the additive path's ownership hole** (2026-09-05), the one
+PRSR-46 named and deliberately left: `provision-service` refuses a hostname
+whose rows name another service, and `--reassign-from` is how a hostname moves.
+See the invariant above.
 
 **PRSR-41 was found by running the binary** — the third time on this axis that
 has caught something reading could not (PRSR-31's outcome line, PRSR-38's

@@ -510,7 +510,8 @@ func TestSpinup_PrunedIsEchoed(t *testing.T) {
 
 // A prune of a hostname holding another service's resource is a 409, matching
 // POST /v1/teardowns' reading of the same sentinel: the request is well-formed
-// and it is the state that refuses it (PRSR-46).
+// and it is the state that refuses it (PRSR-46) — and since PRSR-48 so is the
+// same request without prune, unless reassign_from names the owner.
 func TestSpinup_PruningAnotherServicesHostnameIs409(t *testing.T) {
 	st := newMemStore()
 	prov := &stubProv{kind: model.ResourceTunnelRoute}
@@ -550,16 +551,100 @@ func TestSpinup_PruningAnotherServicesHostnameIs409(t *testing.T) {
 		t.Error("the refusal acted")
 	}
 
-	// Without prune the same request is an ordinary 200 — nothing was going to
-	// be removed, so there is nothing to refuse.
-	delete(body, "prune")
+	// Without prune the same request used to be an ordinary 200 — nothing was
+	// going to be removed. Since PRSR-48 it is the same 409: the additive steps
+	// are what write onto another service's edge, and they run without prune.
+	body["prune"] = false
 	buf, _ = json.Marshal(body)
 	resp2, err := srv.Client().Post(srv.URL+"/v1/spinups", "application/json", bytes.NewReader(buf))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp2.Body.Close() }()
-	if resp2.StatusCode != http.StatusOK {
-		t.Errorf("status %d without prune, want 200", resp2.StatusCode)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d without prune, want 409 since PRSR-48", resp2.StatusCode)
+	}
+
+	// Naming the previous owner is what permits it, prune and all.
+	body["prune"], body["reassign_from"] = true, "argosy"
+	buf, _ = json.Marshal(body)
+	resp3, err := srv.Client().Post(srv.URL+"/v1/spinups", "application/json", bytes.NewReader(buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp3.Body.Close() }()
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("status %d with reassign_from, want 200", resp3.StatusCode)
+	}
+}
+
+// A spin-up writes only its own service's edge (PRSR-48). A hostname whose
+// active rows are recorded to another service is a 409 — the request is
+// well-formed and it is the *state* that refuses it, the reading the teardown
+// route gives the same sentinel — and nothing is written or contacted.
+func TestSpinup_AnotherServicesHostnameIs409(t *testing.T) {
+	srv, st := spinupServer(t)
+	seedRows(st, "argosy", "argosy.zerogravity.industries")
+
+	code, body := postSpinup(t, srv, map[string]any{
+		"service": "interlock", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"apply": true,
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("status %d, want 409: %v", code, body)
+	}
+	if msg, _ := body["error"].(string); !strings.Contains(msg, "reassign_from") || !strings.Contains(msg, `"argosy"`) {
+		t.Errorf("the refusal should name the owner and the field that permits a move: %q", msg)
+	}
+	for _, r := range st.rows {
+		if r.ServiceKey != "argosy" {
+			t.Errorf("%s was re-attributed to %q despite the refusal", r.Kind, r.ServiceKey)
+		}
+	}
+}
+
+// Naming the previous owner is what permits the move, and every row recorded to
+// it moves with the hostname — the tunnel route this direct spec does not call
+// for included, so the hostname is never left half-owned.
+func TestSpinup_ReassignFromMovesTheHostname(t *testing.T) {
+	srv, st := spinupServer(t)
+	seedRows(st, "argosy", "argosy.zerogravity.industries")
+
+	code, body := postSpinup(t, srv, map[string]any{
+		"service": "interlock", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"apply": true, "reassign_from": "argosy",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %v", code, body)
+	}
+	for _, r := range st.rows {
+		if r.ServiceKey != "interlock" || r.Status != model.ResourceActive {
+			t.Errorf("%s is %s/%q after the move, want active and interlock's", r.Kind, r.Status, r.ServiceKey)
+		}
+	}
+	// And the same request again needs no reassign_from: nothing names argosy now.
+	code, body = postSpinup(t, srv, map[string]any{
+		"service": "interlock", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"apply": true,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("the run after a move still refuses: %d %v", code, body)
+	}
+}
+
+// Reassigning from the spec's own service means nothing and is the caller's
+// mistake, so it is a 400 rather than silently ignored.
+func TestSpinup_ReassignFromSelfIs400(t *testing.T) {
+	srv, _ := spinupServer(t)
+	code, body := postSpinup(t, srv, map[string]any{
+		"service": "interlock", "hostname": "interlock.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"reassign_from": "interlock",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %v", code, body)
 	}
 }
