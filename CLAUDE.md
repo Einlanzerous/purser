@@ -791,7 +791,13 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   by name on a bookmark conversion), so reading a subset is an enumeration gap
   rather than a judgement call. All seven live apps agree across all three
   (checked 2026-08-26, bypass included), which is an observation about today and
-  not a guarantee — and this predicate gates a full-replacement PUT.
+  not a guarantee — and this predicate gates a full-replacement PUT. PRSR-47
+  found the mechanism: Cloudflare **normalises `self_hosted_domains` to
+  `destinations[].uri` on write** (two disagreeing bodies came back agreeing,
+  and a `domain` absent from `destinations` is refused with 12130), so
+  `hostAmbiguous` cannot be produced through the API as of 2026-09-05. The
+  branch stays: that is also an observation about today, and refusing is the
+  safe direction.
   **A path-carrying spelling disqualifies only when nothing names the host
   whole** — asked **per field**, not over the two lists pooled. The naive "any
   same-host path means not ours" is wrong the other way and worse: an app with
@@ -969,8 +975,12 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   the tile is square is a fact about Cloudflare, this is the package that talks to
   Cloudflare, and this is the last point before the URL is written.
 - **The Access teardown confirms absence by reading, not by an error code.**
-  `dnsRecordNotFound` works because 81044 was observed; there is no observed
-  Access equivalent, and the rule above forbids guessing one. So a failed delete
+  `dnsRecordNotFound` works because 81044 was observed; when this was written
+  there was no observed Access equivalent, and the rule above forbids guessing
+  one. There is one now — PRSR-47 saw **11021
+  `access.api.error.unknown_application`** on both GET and DELETE of a deleted
+  application — and the re-read is kept anyway, because it asserts what
+  `Teardown` actually claims rather than what one code says. So a failed delete
   re-reads the hostname: nothing there means it really is gone, something there
   means the gate is still up and the record is wrong, and a failed re-read means
   unverifiable — which is never absent. That is stronger than a code test, not a
@@ -1322,10 +1332,9 @@ front instead of reading an absence out of one. And running the binary turned up
 a third: the tunnel's `unavailable` message was telling an operator taking a
 service *down* to go and add its ingress rule.
 
-One caveat it does **not** retire: nothing on the teardown path has contacted
-Cloudflare. PRSR-40 and PRSR-42 retired that for the write verbs; the way down is
-still fake-only, and both of its two silent-success bugs were found by argument
-rather than by observation. **PRSR-47** holds the live run.
+The caveat it left — nothing on the teardown path had contacted Cloudflare,
+and both of its silent-success bugs were found by argument rather than by
+observation — is retired by **PRSR-47**, below.
 
 **PRSR-46 gives the orphan a command**: `provision-service --prune`, plus
 `"prune": true` on `POST /v1/spinups`. It closes the gap PRSR-34 left open and
@@ -1333,6 +1342,51 @@ named — `Ensure` reported a resource the spec no longer called for, exited zer
 and there was nothing to type. See the invariants above for the two things that
 make it safe rather than merely possible: it runs after the additive pass, and it
 is held back when any step the spec *does* call for did not land.
+
+**PRSR-47 retired the last fake-only caveat on this axis (2026-09-05).** Every
+verb this axis owns has now executed against Cloudflare **in both directions and
+through both callers** — `purser teardown-service --apply` and
+`provision-service --prune --apply` — via the real binary (0.18.0), a throwaway
+Postgres, and `PURSER_CF_TUNNEL_ID` pointed at a disposable tunnel seeded with a
+verbatim copy of production's ingress document, on a disposable hostname. The
+estate diffed byte-identical afterwards, `updated_at` and the prod tunnel's sha
+included. What was observed rather than argued:
+
+- **`removed == 0 && behind > 0` refused on a real document.** A
+  `*.zerogravity.industries` rule inserted *after* the route was written —
+  the sequence PRSR-34 reasoned about and PRSR-42 could not stage — came back
+  `refused`, the document was untouched at its version, and the row stayed
+  active. Removing the wildcard by hand and re-running removed the route and
+  restored the document to the seed's sha.
+- **Ordering, timestamped:** a poll saw the DNS record answer 81044 0.6 s
+  before the Access application answered 11021.
+- **Idempotence:** a third `--apply` under an *invalid* API token reported three
+  `gone` and exited 0, so no upstream call was made — a claim the fake could
+  only assert.
+- **81044 through the walk** marked the row removed; **`confirmGone`** refused
+  over a hand-made whole-host application ("the record was wrong and the gate
+  is still up"), and after that application was deleted the re-read path
+  reported the removal and marked the row.
+- **`blocked` behind a real DNS failure**, twice: the recorded id answering for
+  another hostname (the name-mismatch guard), and a 9106 authentication
+  failure. All three rows stayed active both times.
+- **The prune caller.** `ErrHostnameNotThisService` fired on a real hostname
+  under an invalid token, so it contacted nothing. Cloudflare rejected a
+  proxied repoint to `10.0.0.1` with **9003 "Target … is not allowed for a
+  proxied record"**, and `unmetPruneDeps` held both prunes with the route still
+  serving — the "repoint failed upstream" case, produced by Cloudflare rather
+  than a fake. The real prune then repointed the record *before* the route
+  dropped and the application went, which the poll showed and the CLI table
+  cannot: it prints in `KindOrder`, so the two `prune ✓` rows sit above the
+  `update ✓` they ran after.
+
+It also found one thing by running the binary that reading did not — the sixth
+time on this axis: **`removed_at` stamps the first transition, not each one.**
+`COALESCE(removed_at, now())` is deliberate and mirrors `deprovisioned_at`, and
+its tests cover a repeat teardown and a stand-back-up — but not a second *real*
+removal, so a hostname stood up, torn down, stood up and torn down again keeps
+the first date, and `gone`'s "already removed, on …" names it. Both axes. Filed
+as **PRSR-49**; not changed here.
 
 **PRSR-41 was found by running the binary** — the third time on this axis that
 has caught something reading could not (PRSR-31's outcome line, PRSR-38's
