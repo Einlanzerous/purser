@@ -1098,9 +1098,58 @@ an envelope is the one nobody will think to re-check.
 - **PRSR-44** — the aspect check in Placard's own `checker`, PRSR-43's
   authoring-end half. Purser reports a mark a square tile will crop; Placard is
   where a bad mark could be caught before any consumer points at it.
-- **PRSR-34** — orchestrating `Teardown`. The interface method exists and the
-  resource table exists to give it concrete ids to target rather than a hostname
-  to guess from, but nothing walks it. Its ordering is almost certainly the
-  inverse of the table above — remove the DNS record first, so the hostname stops
-  resolving, before pulling the route or the gate — and the open question is
-  whether a recorded hostname is still that service's to remove.
+- ~~**PRSR-34** — orchestrating `Teardown`.~~ **Done, 2026-08-30 (purser#56).**
+  `internal/spinup/teardown.go`, `purser teardown-service`, `POST /v1/teardowns`.
+  The ordering is `KindOrder` reversed and *derived* from it, with the route and
+  the gate **blocked** behind the DNS removal rather than merely ordered after
+  it. "Is this hostname still someone's?" is answered by requiring `--service`
+  beside `--hostname` and refusing the whole run when any active row disagrees
+  (`ErrHostnameNotThisService`, 409) — `offboard`'s two-coordinate shape. A dry
+  run makes no provisioner call at all; `TeardownChecker` is what lets such a
+  plan still not promise what `--apply` refuses. CLAUDE.md carries the
+  invariants.
+
+- ~~**PRSR-46** — the orphan's command.~~ **Done, 2026-08-30 (purser#58).**
+  `provision-service --prune` (and `"prune": true` on `POST /v1/spinups`)
+  removes what a narrowed spec no longer calls for. It runs *after* the whole
+  additive pass — so a tunnelled → direct switch repoints the record before the
+  route goes — and is held back when any step the spec *does* call for did not
+  land. A hostname whose orphans are recorded to another service refuses the
+  whole run through the same sentinel as a teardown.
+
+- ~~**PRSR-47** — the teardown walk against the live API.~~ **Done, 2026-09-05.**
+  The last fake-only caveat on the axis. Every verb this axis owns has now run
+  against Cloudflare in both directions and through both callers —
+  `teardown-service --apply` and `--prune --apply` — via the real binary
+  (0.18.0), a throwaway Postgres, and `PURSER_CF_TUNNEL_ID` pointed at a
+  disposable tunnel seeded with a verbatim copy of production's ingress
+  document, on `prsr47-probe.zerogravity.industries`. The estate diffed
+  byte-identical afterwards, `updated_at` and the prod tunnel's sha included.
+
+  Observed, not argued: `removed == 0 && behind > 0` **refused on a real
+  document** after a `*.zerogravity.industries` rule was inserted above the
+  route (document untouched, row active; removing the wildcard and re-running
+  restored the seed's sha); a poll saw the DNS record answer 81044 0.6 s before
+  the application answered 11021; a third `--apply` under an *invalid* token
+  reported three `gone` and exited 0, so it made no call; 81044 through the
+  walk marked the row removed; `confirmGone` refused over a hand-made
+  whole-host application and then passed via the re-read once it was deleted;
+  `blocked` held both other removals behind a real DNS failure, twice (a
+  recorded id answering for another hostname, and 9106). On the prune caller,
+  `ErrHostnameNotThisService` fired on a real hostname contacting nothing;
+  Cloudflare rejected a proxied repoint to `10.0.0.1` with **9003**, which
+  held both prunes with the route still serving — the "repoint failed
+  upstream" case, produced by Cloudflare; and the real prune repointed the
+  record before the route dropped.
+
+  Three things it corrected. Cloudflare **does** have an observed
+  not-found code for Access — **11021 `access.api.error.unknown_application`**
+  on GET and DELETE — and `confirmGone` keeps re-reading anyway, because the
+  re-read asserts what `Teardown` claims. `hostAmbiguous` **cannot be produced
+  through the API today**: Cloudflare normalises `self_hosted_domains` to
+  `destinations[].uri` on write and refuses a `domain` absent from
+  `destinations` (12130); the branch stays, as the safe direction. And
+  **`removed_at` stamps the first transition, not each one** — deliberate,
+  mirrored by `deprovisioned_at`, and untested for a second real removal, so a
+  hostname torn down twice reports the first date. That is **PRSR-49**, on
+  both axes, and not changed here.
