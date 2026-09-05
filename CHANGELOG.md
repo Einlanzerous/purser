@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/Einlanzerous/purser/compare/v0.18.0...v0.18.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **spinup:** refuse a hostname recorded to another service, and add --reassign-from (PRSR-48) ([#60](https://github.com/Einlanzerous/purser/issues/60)) ([b96e70d](https://github.com/Einlanzerous/purser/commit/b96e70d4601ff89ff1c88a2b26179c6192d35ee5))
+
 ## [0.18.0](https://github.com/Einlanzerous/purser/compare/v0.17.0...v0.18.0) (2026-08-31)
 
 
