@@ -2,6 +2,7 @@ package spinup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -258,6 +259,23 @@ type Request struct {
 	// subtractive one — the overwhelmingly common case — never has to think
 	// about it.
 	Prune bool
+	// ReassignFrom names the service this hostname is being moved away from
+	// (PRSR-48). Empty on every ordinary run.
+	//
+	// A spin-up writes only its own service's edge: an active row at the
+	// hostname recorded to any other service refuses the whole run, on the plan
+	// as well as the apply and before any Inspect (see checkSpecOwnership).
+	// Naming the previous owner is the stated way past that. Rows recorded to
+	// exactly this key are then treated as the spec's own, so a resource that
+	// already matches is adopted — a row rebind, nothing upstream — and one that
+	// differs is updated, which is what moving a hostname means. It is
+	// offboard's shape: two coordinates that must agree, the second one typed
+	// rather than inferred, and the person axis's rule that only `person add
+	// --rename` may change a name, with a hostname in place of the name.
+	//
+	// Naming a service that holds nothing here is not an error, so re-running
+	// the command that moved a hostname reports `ok` rather than refusing.
+	ReassignFrom string
 }
 
 // Result is the whole plan, or the whole apply.
@@ -409,6 +427,10 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	from := normalizeKey(req.ReassignFrom)
+	if from != "" && from == spec.Key {
+		return nil, ErrReassignFromSelf
+	}
 
 	target := Target{Spec: spec}
 	if spec.Mode == ModeTunnelled {
@@ -441,10 +463,8 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 	// decided by the time its dependent is reached.
 	// A prune on a hostname holding somebody else's resource is refused whole,
 	// before anything is read or written. See refuseContested.
-	if req.Prune {
-		if err := refuseContested(spec, active); err != nil {
-			return nil, err
-		}
+	if err := checkSpecOwnership(spec, active, from); err != nil {
+		return nil, err
 	}
 
 	done := make(map[model.ResourceKind]StepFinding, len(model.KindOrder))
@@ -453,6 +473,12 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 		var f StepFinding
 		if !spec.callsFor(kind) {
 			f = notApplicable(kind, spec, rec, hasRec, s.registry, req.Prune)
+			if hasRec && rec.ServiceKey != spec.Key {
+				// Only reachable under a permitted reassignment — any other
+				// owner refused above — so this is the previous owner's orphan,
+				// and it moves with the hostname.
+				f, active[kind] = s.rebindOrphan(ctx, target, kind, rec, f, req.Apply)
+			}
 		} else {
 			f = s.ensureOne(ctx, target, kind, rec, hasRec, req.Apply, unmetDeps(spec, kind, done))
 		}
@@ -489,55 +515,94 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 	return res, nil
 }
 
-// refuseContested rejects a prune of a hostname holding a resource this spec
-// does not call for and does not own (PRSR-46, settled over three review rounds).
+// ErrReassignFromSelf is a request naming the spec's own service as the one a
+// hostname is being reassigned from. A hostname moves from somebody else or not
+// at all, and a flag that means nothing is likelier a wrong key than a no-op —
+// so it is refused rather than ignored, and it is a sentinel so the HTTP
+// surface can call it the caller's mistake (400) without matching on a message.
+var ErrReassignFromSelf = errors.New("spinup: reassign-from names this spec's own service — a hostname is reassigned from somebody else, or not at all")
+
+// checkSpecOwnership refuses a spin-up of a hostname whose active rows are
+// recorded to a service the request did not name (PRSR-48, and the prune half
+// PRSR-46 settled first).
 //
-// **A prune may only remove this service's own resources.** `active` is built
-// from ServiceResourcesForHostname, which is keyed on hostname alone, so without
-// this every row there is a prune candidate whatever service it is recorded to —
-// and a spec naming `--access none` would delete *another* service's Access
-// application, leave its hostname resolving, and mark the row removed so nothing
-// mentions it again. That is the hole `checkOwnership` refuses on for a
-// teardown, reached through the additive command.
+// Ensure is keyed on hostname: ensureOne asks the provisioner what is there and
+// makes it match the spec, and until PRSR-48 never consulted service_key. When
+// upstream already matched, the mismatch was the deliberate reassignment adopt.
+// When it did not, the same mismatch was an `update`, and --apply wrote one
+// service's spec onto another service's resources — a `--access bookmark` spec
+// against somebody's *gated* application strips its policies and leaves it
+// resolving, which is a service admitting everyone with nothing anywhere
+// reporting it. The plan did say `update`, which on a service you meant to
+// update is not a line that invites suspicion: PRSR-41's lesson, met from the
+// other side.
 //
-// **Whole-run, and before anything is read or written**, which two narrower
-// shapes were tried and abandoned first. Refusing each orphan on its own left
-// `Ensure`'s additive pass free to run, and every row-writing branch of
-// ensureOne calls s.record, which stamps this spec's service_key: so the run
-// rebound one kind while refusing the others, producing exactly the
-// half-reassigned hostname `checkOwnership` refuses a whole teardown on — for
-// *both* keys. It manufactured, in the act of refusing, the condition that stops
-// the remedy its own message names. Holding only the adopt then fixed one branch
-// of four and left `update` doing the same — and `update` is the likelier input,
-// since a hostname genuinely held by another service has a record that does not
-// match this spec.
+// So the question a teardown asks is asked here too, one command over: every
+// active row must name this spec's service or the one the request says the
+// hostname is moving from, and any other refuses the **whole run, before
+// anything is read or written**. Whole-run rather than per-step for the reason
+// PRSR-46 found over three review rounds — every row-writing branch of
+// ensureOne stamps this spec's service_key, so a run that refused one kind and
+// ran the rest produced a half-reassigned hostname that refuses *both* owners'
+// teardowns, manufacturing in the act of refusing the condition that stops the
+// remedy its own message names. Refusing early is what keeps "every row names
+// one service" true, and that is what makes the remedies the message names
+// work afterwards. The prune-only refusal this replaces asked the same question
+// of orphans alone; this asks it of every row, so a prune is covered without
+// having to be a special case.
 //
-// The objection that sent it down that road was wrong, and is recorded so nobody
-// re-derives it: a whole-run refusal looked unfixable, because nothing rebinds an
-// *orphan's* service_key and so the row would refuse for ever. It overlooked the
-// remedy this refusal names. `teardown-service --service <owner>` removes the
-// hostname's resources, and it works precisely because nothing was written —
-// every row still names one service. Refusing early is what keeps that true; the
-// narrower shapes are what broke it.
-//
-// Only orphans make a hostname contested. A *called-for* kind whose row names
-// another service is the ordinary reassignment an adopt exists to rebind, which
-// is deliberate — and on the paths that write upstream it is PRSR-48, not this.
-func refuseContested(spec ServiceSpec, active map[model.ResourceKind]model.ServiceResource) error {
-	var theirs []string
-	for _, kind := range model.KindOrder {
-		if spec.callsFor(kind) {
-			continue
-		}
-		if rec, ok := active[kind]; ok && rec.ServiceKey != spec.Key {
-			theirs = append(theirs, fmt.Sprintf("%s is recorded to %q", kind, rec.ServiceKey))
-		}
-	}
-	if len(theirs) == 0 {
+// A hostname genuinely moving between services still ends in an adopt, it just
+// has to be asked for — see Request.ReassignFrom.
+func checkSpecOwnership(spec ServiceSpec, active map[model.ResourceKind]model.ServiceResource, from string) error {
+	wrong := recordedToOthers(active, spec.Key, from)
+	if len(wrong) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%w: %q asks to prune %s, but %s — a spin-up removes only its own service's resources; remove them as their owner (`purser teardown-service --service <owner> --hostname %s`), or re-run without --prune to leave them alone",
-		ErrHostnameNotThisService, spec.Key, spec.Hostname, strings.Join(theirs, ", "), spec.Hostname)
+	if from != "" {
+		return fmt.Errorf("%w: %q asks to spin up %s as reassigned from %q, but %s — every active row must name one of those two services. If the hostname is moving from somebody else, name them; if the rows disagree with each other, remove the hostname as its owner first (`purser teardown-service --service <owner> --hostname %s`)",
+			ErrHostnameNotThisService, spec.Key, spec.Hostname, from, strings.Join(wrong, ", "), spec.Hostname)
+	}
+	return fmt.Errorf("%w: %q asks to spin up %s, but %s — a spin-up writes only its own service's edge. If the hostname is moving to %q, say so by naming the previous owner (--reassign-from, or reassign_from over HTTP); if it is being retired, remove it as its owner (`purser teardown-service --service <owner> --hostname %s`); otherwise check the spelling",
+		ErrHostnameNotThisService, spec.Key, spec.Hostname, strings.Join(wrong, ", "), spec.Key, spec.Hostname)
+}
+
+// rebindOrphan re-attributes a resource the spec does not call for to the
+// spec's service, under a reassignment that named its previous owner.
+//
+// An orphan is a kind ensureOne never visits, so nothing else rewrites its row.
+// A reassignment that moved the called-for kinds and left this one behind
+// would produce exactly the half-owned hostname checkSpecOwnership and
+// checkOwnership both refuse on: the next spin-up refuses until the previous
+// owner is typed again, and a teardown refuses for either owner. Moving every
+// row together is what "the hostname is reassigned" means.
+//
+// The row moves first and a prune, if asked for, runs afterwards on the moved
+// row — so a prune that does not land leaves an orphan its new owner can still
+// remove, rather than one nobody can. A row write and nothing upstream, an
+// adopt's shape, and ticked the way an adopt is when it is the whole of what
+// happened to this kind; under a prune the tick is the prune's to give.
+//
+// DETAIL describes the resource and ACTION carries the verb (PRSR-46): the line
+// says whose the row is and that the reassignment moves it, and the tick says
+// whether that has happened. A failed write gets the description back without
+// the clause, so `failed` never sits beside a line saying the row moved — found
+// by running the binary, where the first wording said "re-attributed" on a plan.
+func (s *Service) rebindOrphan(ctx context.Context, t Target, kind model.ResourceKind, rec model.ServiceResource, f StepFinding, apply bool) (StepFinding, model.ServiceResource) {
+	recorded := fmt.Sprintf("%s; recorded to %q", f.Detail, rec.ServiceKey)
+	f.Detail = fmt.Sprintf("%s, moving to %q with the hostname", recorded, t.Spec.Key)
+	if !apply {
+		return f, rec
+	}
+	moved, err := s.record(ctx, t, kind, rec.ExternalID, rec.ParentID)
+	if err != nil {
+		// Nothing upstream was touched: an ordinary failure to write a row.
+		f.Status, f.Detail, f.Err = StepFailed, recorded, err.Error()
+		return f, rec
+	}
+	if f.Status == StepOrphaned {
+		f.Applied = true
+	}
+	return f, moved
 }
 
 // unmetPruneDeps returns the steps this spec *does* call for that did not land.

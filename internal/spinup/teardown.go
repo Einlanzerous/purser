@@ -385,19 +385,38 @@ func (s *Service) Teardown(ctx context.Context, req TeardownRequest) (*TeardownR
 // changed hands, which is a thing that legitimately happened and not a reason to
 // refuse taking down what is there now.
 func checkOwnership(key, hostname string, active map[model.ResourceKind]model.ServiceResource) error {
-	var wrong []string
-	for _, kind := range model.KindOrder {
-		rec, ok := active[kind]
-		if !ok || rec.ServiceKey == key {
-			continue
-		}
-		wrong = append(wrong, fmt.Sprintf("%s is recorded to %q", kind, rec.ServiceKey))
-	}
+	wrong := recordedToOthers(active, key)
 	if len(wrong) == 0 {
 		return nil
 	}
 	return fmt.Errorf("%w: a teardown of %s was asked for as %q, but %s — refusing to remove a hostname Purser attributes to another service; run a spin-up for whoever owns it, or fix the rows, so that two answers agree before anything is deleted",
 		ErrHostnameNotThisService, hostname, key, strings.Join(wrong, ", "))
+}
+
+// recordedToOthers lists the active rows recorded to none of the allowed
+// services, in KindOrder, each as `<kind> is recorded to "<key>"` — the
+// comparison the teardown's refusal and the spin-up's (checkSpecOwnership,
+// PRSR-48) share, stated once so the two surfaces cannot drift about what
+// "recorded to another service" means. An empty allowed key matches nothing.
+func recordedToOthers(active map[model.ResourceKind]model.ServiceResource, allowed ...string) []string {
+	var wrong []string
+	for _, kind := range model.KindOrder {
+		rec, ok := active[kind]
+		if !ok || permitted(rec.ServiceKey, allowed) {
+			continue
+		}
+		wrong = append(wrong, fmt.Sprintf("%s is recorded to %q", kind, rec.ServiceKey))
+	}
+	return wrong
+}
+
+func permitted(key string, allowed []string) bool {
+	for _, a := range allowed {
+		if a != "" && a == key {
+			return true
+		}
+	}
+	return false
 }
 
 // teardownOne decides and, under apply, performs one removal.

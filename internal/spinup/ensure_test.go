@@ -777,7 +777,8 @@ func TestEnsure_PartialResourceKeepsTheKnownID(t *testing.T) {
 }
 
 // A hostname reassigned to another service must be re-attributed, or
-// ServiceResourcesFor answers for the old owner for ever.
+// ServiceResourcesFor answers for the old owner for ever. Since PRSR-48 the
+// reassignment is asked for by naming the previous owner; the adopt is the same.
 func TestEnsure_ReassignedHostnameIsAdopted(t *testing.T) {
 	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; s.Key = "interlock"; return s }()
 	st := newStore()
@@ -787,7 +788,8 @@ func TestEnsure_ReassignedHostnameIsAdopted(t *testing.T) {
 	})
 	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
 
-	res, err := New(st, NewRegistry(dns)).Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	res, err := New(st, NewRegistry(dns)).Ensure(context.Background(),
+		Request{Spec: spec, Apply: true, ReassignFrom: "argosy"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -797,6 +799,196 @@ func TestEnsure_ReassignedHostnameIsAdopted(t *testing.T) {
 	}
 	if got := st.rows[key(spec.Hostname, model.ResourceDNSRecord)].ServiceKey; got != "interlock" {
 		t.Errorf("service_key = %q, want the spec's owner", got)
+	}
+}
+
+// A spin-up writes only its own service's edge (PRSR-48). A hostname whose
+// active rows are recorded to another service refuses the whole run — on the
+// plan as much as the apply, and before any Inspect — because the additive path
+// is keyed on hostname and would otherwise write this spec onto that service's
+// resources. The case with teeth is the one staged here: a bookmark spec
+// against somebody's gated application, which without the guard is an `update`
+// that strips the gate and leaves the hostname resolving.
+func TestEnsure_AnotherServicesHostnameIsRefusedBeforeAnyCall(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessBookmark; s.Key = "interlock"; return s }()
+	st := newStore()
+	st.put(model.ServiceResource{ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceAccessApp, ExternalID: "app-1"})
+	st.put(model.ServiceResource{ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceDNSRecord, ExternalID: "rec-1", ParentID: "zone-1"})
+	app := &fakeProv{kind: model.ResourceAccessApp,
+		state:   State{Exists: true, Matches: false, ExternalID: "app-1", Detail: "gated by the members group"},
+		ensured: Resource{ExternalID: "app-1", Detail: "now a bookmark"}}
+	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
+	svc := New(st, NewRegistry(app, dns))
+
+	for _, apply := range []bool{false, true} {
+		_, err := svc.Ensure(context.Background(), Request{Spec: spec, Apply: apply})
+		if !errors.Is(err, ErrHostnameNotThisService) {
+			t.Fatalf("apply=%v: want ErrHostnameNotThisService, got %v", apply, err)
+		}
+		for _, want := range []string{`"argosy"`, `"interlock"`, "--reassign-from", "teardown-service"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal does not mention %q: %v", want, err)
+			}
+		}
+	}
+	if app.inspects != 0 || dns.inspects != 0 || app.ensures != 0 {
+		t.Errorf("the refusal contacted a provisioner (inspects app=%d dns=%d, ensures=%d)", app.inspects, dns.inspects, app.ensures)
+	}
+	if st.upserts != 0 {
+		t.Errorf("the refusal wrote %d rows", st.upserts)
+	}
+}
+
+// The previous owner has to be the one the rows name. Reassigning from the
+// wrong service is the same refusal, so a mistyped key cannot open a hostname
+// that a different service holds.
+func TestEnsure_ReassignFromTheWrongOwnerStillRefuses(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; s.Key = "interlock"; return s }()
+	st := newStore()
+	st.put(model.ServiceResource{ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceDNSRecord, ExternalID: "rec-1", ParentID: "zone-1"})
+	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
+
+	_, err := New(st, NewRegistry(dns)).Ensure(context.Background(),
+		Request{Spec: spec, Apply: true, ReassignFrom: "lyceum"})
+	if !errors.Is(err, ErrHostnameNotThisService) {
+		t.Fatalf("want ErrHostnameNotThisService, got %v", err)
+	}
+	for _, want := range []string{`"argosy"`, `"lyceum"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not name %s: %v", want, err)
+		}
+	}
+	if dns.inspects != 0 || st.upserts != 0 {
+		t.Errorf("the refusal acted (inspects=%d upserts=%d)", dns.inspects, st.upserts)
+	}
+}
+
+// Naming a previous owner that holds nothing here is not an error: the command
+// that moved a hostname, re-run with the same flags, reports ok rather than
+// refusing — which is what every other re-run on this axis does.
+func TestEnsure_ReassignFromNothingIsAnOrdinaryRun(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; s.Key = "interlock"; return s }()
+	st := newStore()
+	st.put(model.ServiceResource{ServiceKey: "interlock", Hostname: spec.Hostname, Kind: model.ResourceDNSRecord, ExternalID: "rec-1", ParentID: "zone-1"})
+	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
+
+	res, err := New(st, NewRegistry(dns)).Ensure(context.Background(),
+		Request{Spec: spec, Apply: true, ReassignFrom: "argosy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceDNSRecord, StepOK)
+}
+
+// Reassigning a hostname from the spec's own service means nothing, and is
+// refused rather than ignored: a flag that does nothing is likelier a wrong key
+// than a no-op, and the caller should hear so.
+func TestEnsure_ReassignFromSelfIsRefused(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Key = "interlock"; return s }()
+	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
+	_, err := New(newStore(), NewRegistry(dns)).Ensure(context.Background(),
+		Request{Spec: spec, ReassignFrom: " Interlock "})
+	if !errors.Is(err, ErrReassignFromSelf) {
+		t.Fatalf("want ErrReassignFromSelf, got %v", err)
+	}
+	if dns.inspects != 0 {
+		t.Error("a refused request contacted a provisioner")
+	}
+}
+
+// A reassignment moves every row at the hostname, orphans included. Left
+// behind, an orphan recorded to the old owner makes the hostname half-owned:
+// the next spin-up refuses until the flag is typed again, and a teardown
+// refuses for either owner. So it is re-attributed — a row write and nothing
+// upstream — and the run after it needs no flag at all.
+func TestEnsure_ReassignFromMovesOrphansToo(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; s.Key = "interlock"; return s }()
+	st := newStore()
+	st.put(model.ServiceResource{ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceDNSRecord, ExternalID: "rec-1", ParentID: "zone-1"})
+	st.put(model.ServiceResource{ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceAccessApp, ExternalID: "app-1"})
+	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
+	app := &fakeProv{kind: model.ResourceAccessApp}
+	svc := New(st, NewRegistry(dns, app))
+
+	plan, err := svc.Ensure(context.Background(), Request{Spec: spec, ReassignFrom: "argosy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, plan, model.ResourceDNSRecord, StepAdopt)
+	if f := wantStatus(t, plan, model.ResourceAccessApp, StepOrphaned); f.Applied || !strings.Contains(f.Detail, `moving to "interlock"`) {
+		t.Errorf("plan: orphan applied=%v detail=%q", f.Applied, f.Detail)
+	}
+	if st.upserts != 0 {
+		t.Errorf("a plan wrote %d rows", st.upserts)
+	}
+
+	res, err := svc.Ensure(context.Background(), Request{Spec: spec, Apply: true, ReassignFrom: "argosy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceDNSRecord, StepAdopt)
+	if f := wantStatus(t, res, model.ResourceAccessApp, StepOrphaned); !f.Applied {
+		t.Error("the orphan's re-attribution was not applied")
+	}
+	if app.teardowns != 0 || app.ensures != 0 {
+		t.Errorf("re-attributing an orphan touched upstream (teardowns=%d ensures=%d)", app.teardowns, app.ensures)
+	}
+	for _, k := range []model.ResourceKind{model.ResourceDNSRecord, model.ResourceAccessApp} {
+		if got := st.rows[key(spec.Hostname, k)].ServiceKey; got != "interlock" {
+			t.Errorf("%s is recorded to %q after the reassignment", k, got)
+		}
+	}
+
+	again, err := svc.Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	if err != nil {
+		t.Fatalf("the run after a reassignment still needs the flag: %v", err)
+	}
+	wantStatus(t, again, model.ResourceDNSRecord, StepOK)
+	if f := wantStatus(t, again, model.ResourceAccessApp, StepOrphaned); f.Applied {
+		t.Error("an orphan already attributed to this service was re-written")
+	}
+}
+
+// With --prune the old owner's orphan is removed rather than kept — and it is
+// re-attributed first, so a prune that does not land leaves a row the new owner
+// can still remove, rather than one that refuses both owners' teardowns.
+func TestEnsure_ReassignFromThenPruneRemovesTheOldOwnersOrphan(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; s.Key = "interlock"; return s }()
+	seed := func(app *fakeProv) (*fakeStore, *Service) {
+		st := newStore()
+		st.put(model.ServiceResource{ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceDNSRecord, ExternalID: "rec-1", ParentID: "zone-1"})
+		st.put(model.ServiceResource{ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceAccessApp, ExternalID: "app-1"})
+		return st, New(st, NewRegistry(present(model.ResourceDNSRecord, "rec-1", "zone-1"), app))
+	}
+
+	app := &fakeProv{kind: model.ResourceAccessApp, removed: Removal{Detail: "deleted"}}
+	st, svc := seed(app)
+	res, err := svc.Ensure(context.Background(), Request{Spec: spec, Apply: true, Prune: true, ReassignFrom: "argosy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := wantStatus(t, res, model.ResourceAccessApp, StepPrune); !f.Applied {
+		t.Error("the prune was not applied")
+	}
+	if app.teardowns != 1 {
+		t.Errorf("teardowns = %d, want 1", app.teardowns)
+	}
+	if row := st.rows[key(spec.Hostname, model.ResourceAccessApp)]; row.Status != model.ResourceRemoved {
+		t.Errorf("row status = %q, want removed", row.Status)
+	}
+
+	failing := &fakeProv{kind: model.ResourceAccessApp, teardownErr: errors.New("upstream said no")}
+	st, svc = seed(failing)
+	res, err = svc.Ensure(context.Background(), Request{Spec: spec, Apply: true, Prune: true, ReassignFrom: "argosy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, res, model.ResourceAccessApp, StepFailed)
+	if row := st.rows[key(spec.Hostname, model.ResourceAccessApp)]; row.Status != model.ResourceActive || row.ServiceKey != "interlock" {
+		t.Errorf("after a failed prune the row is %s/%q, want active and the new owner's", row.Status, row.ServiceKey)
+	}
+	if _, err := svc.Teardown(context.Background(), TeardownRequest{ServiceKey: "interlock", Hostname: spec.Hostname}); err != nil {
+		t.Errorf("the new owner cannot tear the hostname down after a failed prune: %v", err)
 	}
 }
 
