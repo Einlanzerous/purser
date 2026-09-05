@@ -535,7 +535,7 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   and it works **precisely because nothing was written** — every row still names
   one service. Refusing early is what keeps that true; the narrower shapes are
   what broke it.
-    That check asked the question of orphans only, on the grounds that a
+  That check asked the question of orphans only, on the grounds that a
   *called-for* kind whose row names another service is the reassignment an
   adopt exists to rebind. It is now asked of every row, by
   `checkSpecOwnership` — see the next bullet — and `refuseContested` is gone:
@@ -562,17 +562,33 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   both owners' teardowns. `--reassign-from KEY` (`reassign_from` over HTTP) is
   the stated way to move a hostname: rows recorded to exactly that service are
   treated as the spec's own, so adopt rebinds and update writes as before, and
-  **orphans move too** (`rebindOrphan`, a row write and nothing upstream) so
-  the hostname is never left half-owned — the run after a move needs no flag,
-  and a teardown as the new owner works. Two coordinates that must agree, the
+    **orphans move too** (`rebindOrphan`, a row write and nothing upstream), so a
+  reassignment never *leaves* the hostname half-owned — the run after a move
+  needs no flag, and a teardown as the new owner works. A partial failure still
+  can, since a called-for kind moves only through `ensureOne`'s row-writing
+  branches and a failed `Inspect` writes none; re-running with the same
+  previous owner repairs it, because both keys are then permitted. Rows that
+  name **two** other services — what that leaves behind if nobody re-runs —
+  can be moved or torn down as no single owner, so that refusal names the one
+  command that permits two keys: a spin-up as one of them naming the other,
+  which collapses the rows onto one key (purser#60 review; a teardown was the
+  first wording, and would itself have refused). Two coordinates that must agree, the
   second one typed rather than inferred: `offboard`'s shape, and the person
   axis's rule that only `person add --rename` may change a name. Naming a
   previous owner that holds nothing here is not an error, so re-running the
   command that moved a hostname says `ok`; naming the spec's own service is
   `ErrReassignFromSelf` (400), refused rather than ignored because a flag that
   does nothing is likelier a wrong key. Under `--prune` the orphan is
-  re-attributed *first* and pruned second, so a prune that does not land leaves
-  a row its new owner can still remove.
+    re-attributed *first* and pruned second, so a prune that does not land leaves
+  a row its new owner can still remove. A rebind is work `--apply` does, so
+  `Pending` counts an `orphaned` line carrying one (`StepFinding.Rebind`): a
+  plan whose only work is a row moving must not say "nothing to do" over it.
+  **The guard is keyed on rows**, so a hostname Purser has *never* recorded is
+  not guarded by it: `findApp` still selects whatever whole-host application
+  serves the name and a bookmark spec still converts it, reported as `update`.
+  The plan naming the application is the whole defence there, as it is for any
+  hand-made resource this axis meets — the row is what makes ownership
+  checkable, and only Purser writes rows.
 - **DETAIL describes the resource; ACTION carries the verb.** The prune line
   first read "… — removing it (app-77e1 …)", which is fine under `prune` and a
   lie under every other status the path produces, since `pruneOne` leaves Detail

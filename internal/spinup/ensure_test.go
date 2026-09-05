@@ -915,8 +915,13 @@ func TestEnsure_ReassignFromMovesOrphansToo(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantStatus(t, plan, model.ResourceDNSRecord, StepAdopt)
-	if f := wantStatus(t, plan, model.ResourceAccessApp, StepOrphaned); f.Applied || !strings.Contains(f.Detail, `moving to "interlock"`) {
-		t.Errorf("plan: orphan applied=%v detail=%q", f.Applied, f.Detail)
+	if f := wantStatus(t, plan, model.ResourceAccessApp, StepOrphaned); f.Applied || !f.Rebind || !strings.Contains(f.Detail, `moving to "interlock"`) {
+		t.Errorf("plan: orphan applied=%v rebind=%v detail=%q", f.Applied, f.Rebind, f.Detail)
+	}
+	// The rebind is work --apply does, so the plan must count it rather than
+	// report "nothing to do" over a line saying a row is moving.
+	if got := plan.Pending(); got != 2 {
+		t.Errorf("pending = %d, want 2 (the adopt and the orphan's rebind)", got)
 	}
 	if st.upserts != 0 {
 		t.Errorf("a plan wrote %d rows", st.upserts)
@@ -944,8 +949,51 @@ func TestEnsure_ReassignFromMovesOrphansToo(t *testing.T) {
 		t.Fatalf("the run after a reassignment still needs the flag: %v", err)
 	}
 	wantStatus(t, again, model.ResourceDNSRecord, StepOK)
-	if f := wantStatus(t, again, model.ResourceAccessApp, StepOrphaned); f.Applied {
+	if f := wantStatus(t, again, model.ResourceAccessApp, StepOrphaned); f.Applied || f.Rebind {
 		t.Error("an orphan already attributed to this service was re-written")
+	}
+	if again.Pending() != 0 {
+		t.Errorf("pending = %d after the move, want 0", again.Pending())
+	}
+}
+
+// A hostname whose rows disagree with *each other* — one kind recorded to one
+// service and another to a second, which a partial failure can leave behind —
+// cannot be moved or torn down as any single owner, since checkOwnership
+// refuses both. The refusal has to name a remedy that works (purser#60 review):
+// a spin-up as one of those owners naming the other, which is the one command
+// that permits two keys and collapses the rows onto one.
+func TestEnsure_TwoPreviousOwnersNamesTheCollapseThatWorks(t *testing.T) {
+	spec := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; s.Key = "interlock"; return s }()
+	st := newStore()
+	st.put(model.ServiceResource{ServiceKey: "argosy", Hostname: spec.Hostname, Kind: model.ResourceDNSRecord, ExternalID: "rec-1", ParentID: "zone-1"})
+	st.put(model.ServiceResource{ServiceKey: "lyceum", Hostname: spec.Hostname, Kind: model.ResourceAccessApp, ExternalID: "app-1"})
+	dns := present(model.ResourceDNSRecord, "rec-1", "zone-1")
+	svc := New(st, NewRegistry(dns, &fakeProv{kind: model.ResourceAccessApp}))
+
+	for _, from := range []string{"", "argosy"} {
+		_, err := svc.Ensure(context.Background(), Request{Spec: spec, Apply: true, ReassignFrom: from})
+		if !errors.Is(err, ErrHostnameNotThisService) {
+			t.Fatalf("from=%q: want ErrHostnameNotThisService, got %v", from, err)
+		}
+		// Owners are listed in KindOrder, so the Access app's owner comes first.
+		if msg := err.Error(); !strings.Contains(msg, "--service lyceum --reassign-from argosy") || strings.Contains(msg, "teardown-service") {
+			t.Errorf("from=%q: the refusal must name the collapse and not a teardown that would refuse: %v", from, msg)
+		}
+	}
+	// The named remedy runs as written, and afterwards one owner holds every
+	// row — so the move the operator wanted goes through.
+	collapse := func() ServiceSpec { s := directSpec(); s.Access = AccessNone; s.Key = "lyceum"; return s }()
+	if _, err := svc.Ensure(context.Background(), Request{Spec: collapse, Apply: true, ReassignFrom: "argosy"}); err != nil {
+		t.Fatalf("the collapse the refusal names is itself refused: %v", err)
+	}
+	for _, k := range []model.ResourceKind{model.ResourceDNSRecord, model.ResourceAccessApp} {
+		if got := st.rows[key(spec.Hostname, k)].ServiceKey; got != "lyceum" {
+			t.Errorf("%s is recorded to %q after the collapse, want lyceum", k, got)
+		}
+	}
+	if _, err := svc.Ensure(context.Background(), Request{Spec: spec, Apply: true, ReassignFrom: "lyceum"}); err != nil {
+		t.Errorf("the move after the collapse is refused: %v", err)
 	}
 }
 

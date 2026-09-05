@@ -1151,7 +1151,7 @@ an envelope is the one nobody will think to re-check.
   `destinations` (12130); the branch stays, as the safe direction. And
   **`removed_at` stamps the first transition, not each one** — deliberate,
   mirrored by `deprovisioned_at`, and untested for a second real removal, so a
-    hostname torn down twice reports the first date. That is **PRSR-49**, on
+  hostname torn down twice reports the first date. That is **PRSR-49**, on
   both axes, and not changed here.
 
 - ~~**PRSR-48** — a spin-up rewrites another service's Access application.~~

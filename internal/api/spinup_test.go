@@ -611,6 +611,27 @@ func TestSpinup_ReassignFromMovesTheHostname(t *testing.T) {
 	srv, st := spinupServer(t)
 	seedRows(st, "argosy", "argosy.zerogravity.industries")
 
+	// The plan says the orphan's row is moving and counts it as work to do —
+	// a caller reading pending=0 over a rebind would be told there is nothing
+	// to apply.
+	code, plan := postSpinup(t, srv, map[string]any{
+		"service": "interlock", "hostname": "argosy.zerogravity.industries",
+		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",
+		"reassign_from": "argosy",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("plan status %d: %v", code, plan)
+	}
+	if plan["pending"].(float64) != 3 {
+		t.Errorf("plan pending = %v, want 3 (two adopts and the tunnel orphan's rebind)", plan["pending"])
+	}
+	for _, f := range plan["findings"].([]any) {
+		f := f.(map[string]any)
+		if f["kind"] == string(model.ResourceTunnelRoute) && (f["status"] != "orphaned" || f["rebind"] != true) {
+			t.Errorf("tunnel orphan on the plan: status=%v rebind=%v, want orphaned with rebind", f["status"], f["rebind"])
+		}
+	}
+
 	code, body := postSpinup(t, srv, map[string]any{
 		"service": "interlock", "hostname": "argosy.zerogravity.industries",
 		"mode": "direct", "upstream": "100.64.0.7", "access": "bookmark",

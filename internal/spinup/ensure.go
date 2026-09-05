@@ -206,7 +206,7 @@ const (
 	// meeting another service's record, and that is no longer true: an ownership
 	// disagreement refuses the whole run with ErrHostnameNotThisService, before
 	// any step is decided, so it produces no finding at all (see
-	// refuseContested).
+	// checkSpecOwnership, which since PRSR-48 asks it of every run).
 	StepRefused StepStatus = "refused"
 	// StepFailed — the write was attempted and errored. Nothing is recorded,
 	// so a re-run reconsiders the step from scratch.
@@ -239,7 +239,19 @@ type StepFinding struct {
 	// Applied reports that this run changed something — upstream, the record, or
 	// both. Always false on a dry run.
 	Applied bool
-	Err     string
+	// Rebind reports that this run re-attributes the row to the spec's service
+	// under a permitted reassignment (PRSR-48). Set on the plan as well as the
+	// apply, and Applied says whether it happened.
+	//
+	// A bool beside the status rather than a status, and deliberately not the
+	// shape PRSR-21 removed from the person axis: `orphaned` stays true of the
+	// resource after the row moves — the spec does not call for it and it is
+	// presumably still live — and the summary that counts orphans must go on
+	// counting this one. Nothing about the status's meaning changes; only
+	// Pending has to know that --apply has a row to write here, which is what
+	// Applied is already shaped for.
+	Rebind bool
+	Err    string
 }
 
 // Request is one spin-up.
@@ -326,6 +338,14 @@ func (r *Result) Pending() int {
 		switch f.Status {
 		case StepCreate, StepUpdate, StepAdopt, StepMissing, StepPrune:
 			if !f.Applied {
+				n++
+			}
+		case StepOrphaned:
+			// Ordinarily nothing --apply does; under a permitted reassignment
+			// the row moves, and a plan whose only work is that must not say
+			// "nothing to do" over a line saying a row is moving (purser#60
+			// review — PRSR-31's outcome-line lesson, again).
+			if f.Rebind && !f.Applied {
 				n++
 			}
 		}
@@ -458,15 +478,15 @@ func (s *Service) Ensure(ctx context.Context, req Request) (*Result, error) {
 		}
 	}
 
-	// Findings so far, so a step can see whether the steps it depends on are in
-	// place. KindOrder is an apply order, so a dependency has always been
-	// decided by the time its dependent is reached.
-	// A prune on a hostname holding somebody else's resource is refused whole,
-	// before anything is read or written. See refuseContested.
+	// A hostname whose rows name a service the request did not is refused
+	// whole, before anything is read or written — see checkSpecOwnership.
 	if err := checkSpecOwnership(spec, active, from); err != nil {
 		return nil, err
 	}
 
+	// Findings so far, so a step can see whether the steps it depends on are in
+	// place. KindOrder is an apply order, so a dependency has always been
+	// decided by the time its dependent is reached.
 	done := make(map[model.ResourceKind]StepFinding, len(model.KindOrder))
 	for _, kind := range model.KindOrder {
 		rec, hasRec := active[kind]
@@ -558,12 +578,39 @@ func checkSpecOwnership(spec ServiceSpec, active map[model.ResourceKind]model.Se
 	if len(wrong) == 0 {
 		return nil
 	}
-	if from != "" {
-		return fmt.Errorf("%w: %q asks to spin up %s as reassigned from %q, but %s — every active row must name one of those two services. If the hostname is moving from somebody else, name them; if the rows disagree with each other, remove the hostname as its owner first (`purser teardown-service --service <owner> --hostname %s`)",
-			ErrHostnameNotThisService, spec.Key, spec.Hostname, from, strings.Join(wrong, ", "), spec.Hostname)
+	// The remedy depends on how many other services the rows name, and it has
+	// to be one that works (purser#60 review): checkOwnership refuses a teardown
+	// for *either* owner of a hostname whose rows disagree with each other, so
+	// telling somebody to tear it down as its owner sends them to a second
+	// refusal. What does work there is a spin-up as one of those owners naming
+	// the other, which collapses the rows onto one key — the only command that
+	// permits two keys at once.
+	owners := otherOwners(active, spec.Key)
+	if len(owners) > 1 {
+		return fmt.Errorf("%w: %q asks to spin up %s, but %s — the rows disagree with each other about who holds it, so no single owner can move it or tear it down. Collapse them first by spinning up as one of those services naming the other (`purser provision-service --service %s --reassign-from %s …`), then move the hostname from that one",
+			ErrHostnameNotThisService, spec.Key, spec.Hostname, strings.Join(wrong, ", "), owners[0], owners[1])
 	}
-	return fmt.Errorf("%w: %q asks to spin up %s, but %s — a spin-up writes only its own service's edge. If the hostname is moving to %q, say so by naming the previous owner (--reassign-from, or reassign_from over HTTP); if it is being retired, remove it as its owner (`purser teardown-service --service <owner> --hostname %s`); otherwise check the spelling",
-		ErrHostnameNotThisService, spec.Key, spec.Hostname, strings.Join(wrong, ", "), spec.Key, spec.Hostname)
+	owner := owners[0]
+	if from != "" {
+		return fmt.Errorf("%w: %q asks to spin up %s as reassigned from %q, but %s and nothing here is recorded to %q. If the hostname is moving from %q, name them instead (--reassign-from %s); otherwise check the spelling",
+			ErrHostnameNotThisService, spec.Key, spec.Hostname, from, strings.Join(wrong, ", "), from, owner, owner)
+	}
+	return fmt.Errorf("%w: %q asks to spin up %s, but %s — a spin-up writes only its own service's edge. If the hostname is moving to %q, say so by naming the previous owner (--reassign-from %s, or reassign_from over HTTP); if it is being retired, remove it as its owner (`purser teardown-service --service %s --hostname %s`); otherwise check the spelling",
+		ErrHostnameNotThisService, spec.Key, spec.Hostname, strings.Join(wrong, ", "), spec.Key, owner, owner, spec.Hostname)
+}
+
+// otherOwners lists the distinct services the hostname's active rows are
+// recorded to, other than key, in KindOrder.
+func otherOwners(active map[model.ResourceKind]model.ServiceResource, key string) []string {
+	var out []string
+	for _, kind := range model.KindOrder {
+		rec, ok := active[kind]
+		if !ok || rec.ServiceKey == key || permitted(rec.ServiceKey, out) {
+			continue
+		}
+		out = append(out, rec.ServiceKey)
+	}
+	return out
 }
 
 // rebindOrphan re-attributes a resource the spec does not call for to the
@@ -575,6 +622,14 @@ func checkSpecOwnership(spec ServiceSpec, active map[model.ResourceKind]model.Se
 // checkOwnership both refuse on: the next spin-up refuses until the previous
 // owner is typed again, and a teardown refuses for either owner. Moving every
 // row together is what "the hostname is reassigned" means.
+//
+// That closes the half-owned state as a thing a *refusal* manufactures; a
+// partial failure can still reach it, because a called-for kind moves only
+// through ensureOne's row-writing branches and an Inspect that fails at the
+// transport writes none. It is recoverable without any hand SQL: re-running
+// with the same previous owner permits both keys, so the rows that did not
+// move then do — which is why naming a previous owner that holds nothing is
+// deliberately not an error.
 //
 // The row moves first and a prune, if asked for, runs afterwards on the moved
 // row — so a prune that does not land leaves an orphan its new owner can still
@@ -590,6 +645,7 @@ func checkSpecOwnership(spec ServiceSpec, active map[model.ResourceKind]model.Se
 func (s *Service) rebindOrphan(ctx context.Context, t Target, kind model.ResourceKind, rec model.ServiceResource, f StepFinding, apply bool) (StepFinding, model.ServiceResource) {
 	recorded := fmt.Sprintf("%s; recorded to %q", f.Detail, rec.ServiceKey)
 	f.Detail = fmt.Sprintf("%s, moving to %q with the hostname", recorded, t.Spec.Key)
+	f.Rebind = true
 	if !apply {
 		return f, rec
 	}
@@ -756,9 +812,11 @@ func notApplicable(kind model.ResourceKind, spec ServiceSpec, rec model.ServiceR
 		f.Detail = fmt.Sprintf("%s, but Purser recorded one here on an earlier run and has not removed it — it is presumably still live", f.Detail)
 		return f
 	}
-	// No ownership branch here: refuseContested has already rejected the whole
-	// run if any orphan at this hostname belongs to somebody else, so anything
-	// reaching this line is this service's to remove.
+	// No ownership branch here: checkSpecOwnership has already refused the
+	// whole run unless every row at this hostname names this service or the
+	// previous owner the request named — and a previous owner's row is
+	// re-attributed by rebindOrphan before pruneOne reads it, so what is pruned
+	// is this service's.
 	f.Status = StepPrune
 	f.Detail = fmt.Sprintf("%s, and Purser recorded one here on an earlier run%s", f.Detail, prunedTarget(rec))
 	return f

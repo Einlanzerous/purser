@@ -441,7 +441,8 @@ hostname and would otherwise write this spec onto that service's resources: a
 leaves it resolving. The refusal names the owner and the two ways forward. If
 the hostname is genuinely moving, `--reassign-from KEY` names the previous
 owner, and every row recorded to it moves with the hostname (an orphan
-included, so nothing is left half-owned); if it is being retired,
+included, so a move never leaves the hostname half-owned; if a step fails
+mid-move, re-running with the same flag finishes it); if it is being retired,
 `teardown-service` as that service removes it. A `--prune` is covered by the
 same rule, so it only ever removes resources recorded to this service.
 
