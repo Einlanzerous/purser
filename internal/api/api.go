@@ -223,6 +223,13 @@ type spinupRequest struct {
 	// behaviour it was written for, and the one destructive thing this endpoint
 	// can do takes two fields nobody sets by accident.
 	Prune bool `json:"prune"`
+	// ReassignFrom names the service the hostname is moving away from
+	// (PRSR-48). A hostname whose active rows are recorded to another service
+	// is refused (409) unless that service is named here, in which case every
+	// row recorded to it moves with the hostname. Empty on every ordinary
+	// request, and a caller written against an earlier release gets the
+	// refusal rather than the rewrite it used to get.
+	ReassignFrom string `json:"reassign_from"`
 }
 
 func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
@@ -259,7 +266,7 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.spin.Ensure(r.Context(), spinup.Request{Spec: spec, Apply: req.Apply, Prune: req.Prune})
+	res, err := s.spin.Ensure(r.Context(), spinup.Request{Spec: spec, Apply: req.Apply, Prune: req.Prune, ReassignFrom: req.ReassignFrom})
 	if err != nil {
 		// Everything a provisioner did or failed to do is a finding, so this is
 		// only reached for a request that could not be attempted: an
@@ -268,15 +275,17 @@ func (s *Server) handleSpinup(w http.ResponseWriter, r *http.Request) {
 		// outage. They are told apart by the spec having already validated
 		// above, which is what leaves the tunnel ref as the one caller-side
 		// refusal Ensure can still raise.
-		if errors.Is(err, spinup.ErrTunnelUnconfigured) {
+		if errors.Is(err, spinup.ErrTunnelUnconfigured) || errors.Is(err, spinup.ErrReassignFromSelf) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if errors.Is(err, spinup.ErrHostnameNotThisService) {
-			// A `prune` asked to remove a resource this hostname's records
-			// attribute to another service (PRSR-46). 409 rather than 400, for
-			// the reading POST /v1/teardowns gives the same sentinel: the
-			// request is well-formed and it is the *state* that refuses it.
+			// The hostname's records attribute a resource to a service the
+			// request did not name (PRSR-46 for a prune, PRSR-48 for every
+			// run). 409 rather than 400, for the reading POST /v1/teardowns
+			// gives the same sentinel: the request is well-formed and it is
+			// the *state* that refuses it, and the fix is to look at who owns
+			// the hostname — `reassign_from` if it is moving.
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}

@@ -10,7 +10,7 @@ import (
 	"github.com/Einlanzerous/purser/internal/spinup"
 )
 
-const provisionUsage = "usage: purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply] [--prune]"
+const provisionUsage = "usage: purser provision-service --service KEY --hostname HOST --mode tunnelled|direct --upstream UPSTREAM --access gated|bookmark|none [--tunnel prod] [--logo placard|none|URL] [--apply] [--prune] [--reassign-from KEY]"
 
 // runProvisionService is `purser provision-service`: stand up the edge for a
 // service — its DNS record, its Cloudflare Access application, and (when it is
@@ -34,6 +34,17 @@ const provisionUsage = "usage: purser provision-service --service KEY --hostname
 // third appends to a document holding every other service's routes on that
 // tunnel, and that is the mistake re-running does not fix.
 //
+// A hostname whose records name another service is refused (PRSR-48): the
+// additive path is keyed on hostname and would otherwise write this spec onto
+// that service's edge — a bookmark spec against somebody's gated application
+// strips its gate and leaves it resolving. Moving a hostname is asked for by
+// naming the previous owner:
+//
+//	purser provision-service --service interlock \
+//	  --hostname interlock.zerogravity.industries \
+//	  --mode direct --upstream 100.64.0.7 --access none \
+//	  --reassign-from argosy --apply
+//
 // The spec is flags rather than a file. Config here is env-only by house
 // convention, and a spec is not configuration — it is an argument, written
 // rarely and read carefully, which is the same reason a tunnelled spec has to
@@ -50,7 +61,8 @@ func runProvisionService(args []string) {
 		logo     = fs.String("logo", "", "launcher icon: placard (default — resolve it by service key), none (clear it), or an https url")
 		tunnel   = fs.String("tunnel", "", "which tunnel carries it: prod (required for --mode tunnelled, refused for direct)")
 		apply    = fs.Bool("apply", false, "actually create and update; without it this is a plan")
-		prune    = fs.Bool("prune", false, "also remove what this spec no longer calls for — the resources otherwise reported as `orphaned`; needs --apply to act")
+		prune    = fs.Bool("prune", false, "also remove what this spec no longer calls for — the resources otherwise reported as 'orphaned'; needs --apply to act")
+		from     = fs.String("reassign-from", "", "the service this hostname is moving away from; without it, a hostname whose records name another service is refused")
 	)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, provisionUsage)
@@ -68,6 +80,11 @@ func runProvisionService(args []string) {
 		fmt.Fprintln(os.Stderr, "as `orphaned` and left exactly where it is. --prune removes it, after")
 		fmt.Fprintln(os.Stderr, "the additive steps have landed, and is the only thing this command")
 		fmt.Fprintln(os.Stderr, "can do that takes something away.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "A spin-up writes only its own service's edge. A hostname whose records")
+		fmt.Fprintln(os.Stderr, "name another service is refused outright; if it is genuinely moving,")
+		fmt.Fprintln(os.Stderr, "--reassign-from KEY names the previous owner and every row recorded to")
+		fmt.Fprintln(os.Stderr, "it moves with the hostname.")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(args)
@@ -103,7 +120,7 @@ func runProvisionService(args []string) {
 	// os.Exit skips deferred calls and this command has non-zero exits that are
 	// not crashes, so the pool is closed explicitly rather than by a defer only
 	// the error paths would reach — the arrangement offboard uses.
-	code := provisionService(ctx, a, spinup.Request{Spec: spec, Apply: *apply, Prune: *prune})
+	code := provisionService(ctx, a, spinup.Request{Spec: spec, Apply: *apply, Prune: *prune, ReassignFrom: *from})
 	a.cleanup()
 	os.Exit(code)
 }

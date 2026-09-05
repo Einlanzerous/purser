@@ -482,7 +482,7 @@ func TestPrune_RefusesAHostnameHoldingAnotherServicesResource(t *testing.T) {
 	if !errors.Is(err, ErrHostnameNotThisService) {
 		t.Fatalf("want ErrHostnameNotThisService, got %v", err)
 	}
-	for _, want := range []string{`"argosy"`, "chronicle", "teardown-service", "without --prune"} {
+	for _, want := range []string{`"argosy"`, "chronicle", "teardown-service", "--reassign-from"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal does not mention %q: %v", want, err)
 		}
@@ -510,9 +510,13 @@ func TestPrune_RefusesAHostnameHoldingAnotherServicesResource(t *testing.T) {
 	}
 }
 
-// Without --prune the same disagreement is just an orphan: nothing was going to
-// be removed, so there is nothing to refuse.
-func TestPrune_AnotherServicesRowIsAnOrdinaryOrphanWithoutTheFlag(t *testing.T) {
+// Without --prune the same disagreement used to be an ordinary orphan, on the
+// grounds that nothing was going to be removed. Since PRSR-48 it refuses
+// regardless of the flag: the additive pass is what writes this spec onto
+// another service's edge, and it runs without --prune — so the check no longer
+// waits for a prune to be asked for. Naming the previous owner is what turns
+// the same rows back into an ordinary orphan, now the new owner's.
+func TestPrune_AnotherServicesRowRefusesWithoutTheFlagToo(t *testing.T) {
 	st := newStore()
 	st.put(model.ServiceResource{
 		ServiceKey: "argosy", Hostname: teardownHost, Kind: model.ResourceAccessApp,
@@ -525,14 +529,21 @@ func TestPrune_AnotherServicesRowIsAnOrdinaryOrphanWithoutTheFlag(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := New(st, NewRegistry(&fakeProv{kind: model.ResourceTunnelRoute},
-		&fakeProv{kind: model.ResourceAccessApp}, dnsInPlace())).
-		Ensure(context.Background(), Request{Spec: spec, Apply: true})
+	svc := New(st, NewRegistry(&fakeProv{kind: model.ResourceTunnelRoute},
+		&fakeProv{kind: model.ResourceAccessApp}, dnsInPlace()))
+
+	if _, err := svc.Ensure(context.Background(), Request{Spec: spec, Apply: true}); !errors.Is(err, ErrHostnameNotThisService) {
+		t.Fatalf("want ErrHostnameNotThisService without the flag, got %v", err)
+	}
+	res, err := svc.Ensure(context.Background(), Request{Spec: spec, Apply: true, ReassignFrom: "argosy"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := findingFor(t, res, model.ResourceAccessApp).Status; got != StepOrphaned {
 		t.Errorf("access_app: %s, want %s", got, StepOrphaned)
+	}
+	if got := st.rows[key(teardownHost, model.ResourceAccessApp)].ServiceKey; got != "chronicle" {
+		t.Errorf("the orphan is still recorded to %q; a reassignment moves every row", got)
 	}
 }
 

@@ -203,7 +203,11 @@ type stepDTO struct {
 	Warning    string `json:"warning,omitempty"`
 	ExternalID string `json:"external_id,omitempty"`
 	Applied    bool   `json:"applied"`
-	Error      string `json:"error,omitempty"`
+	// Rebind says this run re-attributes the row to the requesting service
+	// under `reassign_from` (PRSR-48) — the one thing `apply` does to an
+	// `orphaned` line, and what `pending` is counting when it counts one.
+	Rebind bool   `json:"rebind,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 func newSpinupResponse(res *spinup.Result) spinupResponse {
@@ -239,6 +243,7 @@ func newSpinupResponse(res *spinup.Result) spinupResponse {
 			Warning:     f.Warning,
 			ExternalID:  f.ExternalID,
 			Applied:     f.Applied,
+			Rebind:      f.Rebind,
 			Error:       f.Err,
 		})
 	}
