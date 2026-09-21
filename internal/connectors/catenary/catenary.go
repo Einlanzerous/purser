@@ -133,14 +133,10 @@ type errorBody struct {
 // resolved "created vs existing vs reactivated" into `outcome` before
 // responding.
 //
-// `outcome: reactivated` and any `note` are carried into Result.Instructions
-// rather than dropped, because the operator reading the credential block never
-// sees Catenary's own response — only what this connector reports. A
-// reactivation means a previously offboarded person was just let back in
-// (every earlier device, token and pending invitation was revoked first, on
-// Catenary's side, inside the same transaction); a note means Catenary
-// assigned a suffixed handle because an email-less person already held the
-// plain one, and the operator may need `catenary user set-email`.
+// outcome: reactivated and note are DELIBERATELY NOT carried into
+// Result.Instructions, despite PRSR-50's own brief asking for exactly that —
+// see result's doc comment for why, and PR #64's review thread for the
+// finding that caught it before it shipped.
 func (c *Connector) Provision(ctx context.Context, in connector.Input) (connector.Result, error) {
 	email := strings.ToLower(strings.TrimSpace(in.Email))
 	if email == "" {
@@ -172,26 +168,38 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 // anywhere here — Catenary honors it on creation only, so a re-invite with a
 // different PersonName does not change what a caller with an existing account
 // already sees on their profile.
+//
+// outcome: reactivated and note are NOT folded into Instructions, though
+// PRSR-50's own description and comment both say to do exactly that ("the
+// operator may need `catenary user set-email`"). Result.Instructions is
+// recipient-facing, not operator-facing: internal/invite/service.go copies it
+// (and Extra) verbatim onto ServiceOutcome, and
+// internal/invite/credential.go's RenderCredentialBlock — the ONLY thing
+// `--deliver email` ever sends — renders both directly into the message the
+// invited person receives. There is no successful-outcome channel to the
+// operator at all today; RenderOperatorNote only ever reads Status/Error, for
+// failed and unavailable outcomes.
+//
+// So carrying the note as written would mail the invited person Catenary's
+// admin remediation ("run `catenary user set-email`") plus another account
+// holder's plain handle — exactly the kind of leak
+// "the credential block is the recipient's; the operator note is the
+// operator's" (this repo's own CLAUDE.md) exists to prevent, and exactly the
+// failure shape PRSR-19 already fixed once for a different connector. Caught
+// in PR #64's review before merge. Fixing this properly needs a real
+// operator-note channel in internal/invite (connector.Result is explicitly
+// out of scope for this ticket to change) — that decision belongs to
+// whoever owns internal/invite, not to this connector, so outcome and note
+// are silently dropped here rather than either leaked or invented a home for.
 func result(er ensureResponse) connector.Result {
-	var b strings.Builder
-	b.WriteString("Install Catenary, then paste this enrollment token on the sign-in screen — ")
-	b.WriteString("it redeems once, into your first device. Add further devices from an ")
-	b.WriteString("already-signed-in one.")
-	if er.Outcome == "reactivated" {
-		b.WriteString(" This account was previously offboarded and has just been reactivated: ")
-		b.WriteString("every earlier device, token and pending invitation was already revoked, ")
-		b.WriteString("so this token starts them fresh.")
-	}
-	if er.Note != "" {
-		b.WriteString(" Note from Catenary: ")
-		b.WriteString(er.Note)
-	}
 	return connector.Result{
-		ExternalID:   er.Account.ID,
-		Username:     er.Account.Handle,
-		Secret:       er.EnrollmentToken,
-		SecretLabel:  "enrollment token (single-use, redeems into your first device)",
-		Instructions: b.String(),
+		ExternalID:  er.Account.ID,
+		Username:    er.Account.Handle,
+		Secret:      er.EnrollmentToken,
+		SecretLabel: "enrollment token (single-use, redeems into your first device)",
+		Instructions: "Install Catenary, then paste this enrollment token on the sign-in screen — " +
+			"it redeems once, into your first device. Add further devices from an " +
+			"already-signed-in one.",
 	}
 }
 

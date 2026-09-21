@@ -159,7 +159,30 @@ func TestProvision_DisplayNameIsHonoredOnCreationOnly(t *testing.T) {
 
 // outcome: reactivated must reach the operator, because it means a previously
 // offboarded person was just let back in.
-func TestProvision_CarriesReactivatedOutcomeIntoInstructions(t *testing.T) {
+func TestProvision_ReactivatesTheAccount(t *testing.T) {
+	c, fake := newFixture(t)
+	a := fake.seed("nadia@example.com", "nadia", "Nadia Ruiz")
+	a.Status = "deactivated"
+
+	if _, err := c.Provision(context.Background(), connector.Input{Email: "nadia@example.com"}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if fake.account("nadia@example.com").Status != "active" {
+		t.Error("a reactivated account must be active again")
+	}
+}
+
+// outcome: reactivated must NOT reach Result.Instructions. PRSR-50's own
+// description and comment both ask for exactly that ("the operator may need
+// `catenary user set-email`"), but Result.Instructions is recipient-facing —
+// internal/invite/credential.go's RenderCredentialBlock, the only thing
+// `--deliver email` ever sends, renders it directly into the message the
+// invited person receives (internal/invite/service.go copies it verbatim
+// onto ServiceOutcome). A reactivation is exactly the kind of thing the
+// invitee should not learn from their own welcome email: it says their
+// account was previously offboarded. Caught in PR #64's review; see
+// result's doc comment in catenary.go.
+func TestProvision_ReactivatedOutcomeDoesNotReachInstructions(t *testing.T) {
 	c, fake := newFixture(t)
 	a := fake.seed("nadia@example.com", "nadia", "Nadia Ruiz")
 	a.Status = "deactivated"
@@ -168,17 +191,22 @@ func TestProvision_CarriesReactivatedOutcomeIntoInstructions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	if !strings.Contains(res.Instructions, "reactivat") {
-		t.Errorf("Instructions should name the reactivation, got %q", res.Instructions)
-	}
-	if fake.account("nadia@example.com").Status != "active" {
-		t.Error("a reactivated account must be active again")
+	if strings.Contains(strings.ToLower(res.Instructions), "reactivat") || strings.Contains(strings.ToLower(res.Instructions), "offboard") {
+		t.Errorf("Instructions is recipient-facing and must not mention the reactivation, got %q", res.Instructions)
 	}
 }
 
-// note is how the operator learns Catenary assigned a suffixed handle because
-// an email-less person already held the plain one — invisible otherwise.
-func TestProvision_CarriesNoteIntoInstructions(t *testing.T) {
+// note must NOT reach Result.Instructions (or Extra — also recipient-facing,
+// same rendering path) for the same reason: it names another account's plain
+// handle and an admin CLI command, neither of which is the invited person's
+// business. See TestProvision_ReactivatedOutcomeDoesNotReachInstructions and
+// result's doc comment in catenary.go. There is currently no channel from a
+// successful Provision to Purser's own operator note
+// (internal/invite.RenderOperatorNote only ever reads Status/Error, for
+// failed/unavailable outcomes) — so the note is silently dropped here rather
+// than leaked, and surfacing it properly is a decision for whoever owns
+// internal/invite, not this connector.
+func TestProvision_NoteDoesNotReachInstructionsOrExtra(t *testing.T) {
 	c, fake := newFixture(t)
 	fake.occupyHandle("nadia") // an email-less person already holds it
 
@@ -189,8 +217,14 @@ func TestProvision_CarriesNoteIntoInstructions(t *testing.T) {
 	if res.Username != "nadia-2" {
 		t.Errorf("expected the suffixed handle, got %q", res.Username)
 	}
-	if !strings.Contains(res.Instructions, "nadia-2") || !strings.Contains(res.Instructions, "set-email") {
-		t.Errorf("Instructions should carry the note verbatim enough to act on, got %q", res.Instructions)
+	if strings.Contains(res.Instructions, "nadia") && res.Username != "nadia" {
+		t.Errorf("Instructions must not name the other account's plain handle, got %q", res.Instructions)
+	}
+	if strings.Contains(res.Instructions, "set-email") {
+		t.Errorf("Instructions must not carry an admin CLI instruction to the recipient, got %q", res.Instructions)
+	}
+	if len(res.Extra) != 0 {
+		t.Errorf("Extra is recipient-facing too; the note must not be smuggled through it, got %v", res.Extra)
 	}
 }
 
