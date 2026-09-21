@@ -79,6 +79,7 @@ Argosy is on the direct path with its own login (no Cloudflare Access).
 | `cloudflare` | add email to a shared Access group (email-OTP SSO)               | ✅ when a CF API token is configured; else prints the manual dashboard step |
 | `lyceum`     | create user (email set) → mint a single-use 7-day `lyc_` invite   | ✅ when `PURSER_LYCEUM_OWNER_TOKEN` is set **and** Lyceum runs with `LYCEUM_AUTH=true`; else registers Unavailable |
 | `argosy`     | create account (email login) → return the one-time password       | ✅ when `PURSER_ARGOSY_PROVISION_TOKEN` matches the argosy service's `ARGOSY_PROVISION_TOKEN`; else registers Unavailable |
+| `catenary`   | `POST /accounts` (ensure/reactivate) → return the enrollment token | ✅ when `PURSER_CATENARY_BASE_URL` and `PURSER_CATENARY_PROVISION_TOKEN` are set (matching the catenary service's `CATENARY_PROVISION_TOKEN`); else registers Unavailable |
 
 ### Lyceum setup
 
@@ -126,6 +127,22 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 Argosy is on the direct path (Traefik, no Cloudflare Access), so `--to argosy`
 needs no paired `cloudflare` grant: the invitee signs in with their email and
 the one-time password, then pairs devices from the app.
+
+### Catenary setup
+
+Catenary's provisioning surface is a second, **unrouted** `http.Server`
+(`CATENARY_PROVISION_ADDR`) — it has no Traefik router and the chat client
+never reaches it, so `PURSER_CATENARY_BASE_URL` has no default the way
+Argosy's and Lyceum's do. Point it at `http://catenary:<CATENARY_PROVISION_ADDR
+port>` on `construct_net`, and set `PURSER_CATENARY_PROVISION_TOKEN` to
+Catenary's own `CATENARY_PROVISION_TOKEN` (a Signet-generated secret, ≥ 32
+bytes) — presented verbatim, never trimmed.
+
+The connector is checked against Catenary's pinned `provision/openapi.yaml`
+(tag `provision-v1`) rather than a hand-shaped double; see
+`internal/connectors/catenary/testdata/README.md` for the vendored copy's
+provenance. Live provisioning/reconcile/deprovision against a deployed
+Catenary is CANT-133, not this ticket (PRSR-50).
 
 ## Onboarding bundles
 

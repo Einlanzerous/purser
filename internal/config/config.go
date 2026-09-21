@@ -21,6 +21,7 @@ type Config struct {
 	Cloudflare CloudflareConfig
 	Lyceum     LyceumConfig
 	Argosy     ArgosyConfig
+	Catenary   CatenaryConfig
 	Placard    PlacardConfig
 	SMTP       SMTPConfig
 	Bundles    BundleConfig
@@ -183,6 +184,28 @@ type SwitchyardConfig struct {
 // Configured reports whether the Switchyard connector can run.
 func (c SwitchyardConfig) Configured() bool { return c.BaseURL != "" && c.Token != "" }
 
+// CatenaryConfig configures the Catenary connector (PRSR-50).
+type CatenaryConfig struct {
+	// BaseURL is Catenary's provisioning surface — its own http.Server on
+	// CATENARY_PROVISION_ADDR, never the routed listener the chat client uses.
+	//
+	// Deliberately UNDEFAULTED, unlike Argosy/Lyceum/Switchyard above: those
+	// services each have one fixed, estate-wide port, but
+	// CATENARY_PROVISION_ADDR has none — Catenary's own deploy docs give it
+	// only as an example ("e.g. :4013") and an unset value there means the
+	// listener doesn't exist at all. Guessing a default here risks the same
+	// mistake CloudflareConfig's ZoneID/TunnelID avoid by staying undefaulted:
+	// a wrong-but-plausible value pointed at nothing, or at the wrong thing,
+	// with no operator ever having typed it.
+	BaseURL string // PURSER_CATENARY_BASE_URL (internal API base)
+	// ProvisionToken is CATENARY_PROVISION_TOKEN, generated in Signet, at
+	// least 32 bytes, and presented verbatim — never trimmed or transformed.
+	ProvisionToken string // PURSER_CATENARY_PROVISION_TOKEN
+}
+
+// Configured reports whether the Catenary connector can run.
+func (c CatenaryConfig) Configured() bool { return c.BaseURL != "" && c.ProvisionToken != "" }
+
 // CloudflareConfig configures the Cloudflare Access connector.
 type CloudflareConfig struct {
 	APIToken   string // PURSER_CF_API_TOKEN
@@ -298,6 +321,12 @@ func Load() Config {
 			BaseURL:        envOr("PURSER_ARGOSY_BASE_URL", "http://argosy:8096"),
 			ProvisionToken: os.Getenv("PURSER_ARGOSY_PROVISION_TOKEN"),
 			AppURL:         envOr("PURSER_ARGOSY_URL", "https://argosy.zerogravity.industries"),
+		},
+		Catenary: CatenaryConfig{
+			BaseURL: os.Getenv("PURSER_CATENARY_BASE_URL"),
+			// No trimming: read as-is, and Configured()/New() check for
+			// emptiness only — never strings.TrimSpace on the value itself.
+			ProvisionToken: os.Getenv("PURSER_CATENARY_PROVISION_TOKEN"),
 		},
 		Placard: PlacardConfig{
 			BaseURL: envOr("PURSER_PLACARD_URL", "http://placard:4009"),

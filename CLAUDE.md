@@ -21,7 +21,7 @@ there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
   provision_task, service_resource), 1:1 with the schema.
 - `internal/connector/` — the `Connector` interface + `Registry` +
   `Unavailable` (registered-but-unconfigured) + `ErrPending`.
-- `internal/connectors/{switchyard,cloudflare,lyceum,argosy}/` — per-service connectors.
+- `internal/connectors/{switchyard,cloudflare,lyceum,argosy,catenary}/` — per-service connectors.
   `cloudflare/` serves **both** axes: the Access `Connector` (person × service)
   and, on the spin-up axis, `DNSProvisioner` (PRSR-28, `dns.go`),
   `AccessProvisioner` (PRSR-29, `access.go`) and `TunnelProvisioner` (PRSR-30,
@@ -1475,3 +1475,23 @@ MCP token holds no `users:manage`. The `purser` agent user itself has existed
 since 2026-08-01. Check what `PURSER_SWITCHYARD_TOKEN` actually holds before
 repeating either answer — the board and the thread disagree, and this file has
 been wrong about it in both directions.
+
+**PRSR-50 gives Purser a fifth connector: `catenary`**, cross-repo from
+CANT-33/CANT-131's pinned `provision/openapi.yaml` (tag `provision-v1`). Three
+operations rather than the other four's create/lookup/revoke-with-fan-out
+shape — `POST /accounts` (ensure/reactivate, one idempotent call, no
+409-then-reissue), `GET /accounts?email=` (`Reconcile`, keyed on
+`status == "active"`, never row existence), `POST /accounts/{id}/deactivate`
+(one request, one transaction, idempotent). Unlike Switchyard/Cloudflare/
+Lyceum, `Deprovision`'s offboard is atomic upstream, so the ordering hazard
+`catenary/spike/r6-purser` (IDEA-29) found for a fan-out revoke cannot occur
+here — R6's stub predates the real API and is retired by this connector. The
+double is checked against the vendored, pinned contract
+(`internal/connectors/catenary/testdata/`) rather than hand-shaped, the first
+connector in this repo held to that standard. `PURSER_CATENARY_BASE_URL` has
+no default (see the invariant on undefaulted, account/deployment-specific
+config, one entry over from `PURSER_CF_ZONE_ID`/`PURSER_CF_TUNNEL_ID`) — the
+provisioning listener has no fixed estate-wide port and is never routed.
+`construct-server`-side wiring (the compose entry, the listener's own network
+exposure) is SERV-202; the live drill against a deployed Catenary is CANT-133.
+Neither is done here.

@@ -1,0 +1,376 @@
+openapi: "3.0.3"
+info:
+  title: "Catenary provisioning surface"
+  version: "provision-v1"
+  description: |
+    The internal-only surface Purser's `catenary` connector calls to create, look up and
+    deactivate accounts. CANT-131, row 2 of CANT-33's approved plan.
+
+    HAND-WRITTEN, AND THE ONLY HAND-WRITTEN CONTRACT IN THIS REPOSITORY. Everything under
+    `schema/` is generated from the wire schema there, and a staleness guard fails the build on
+    a hand edit. This file is not: no generator reads or writes it, it contributes no
+    conformance vectors, and all three conformance runners still report 85. That is the plan's
+    own decision — no client ever calls this surface, and putting it in the wire schema would
+    emit TypeScript and Dart for an API the clients are forbidden to touch.
+
+    WHAT KEEPS IT HONEST INSTEAD. `server/spec/provision_test.go` parses this document and
+    drives every operation below against the REAL handlers, both ways: a field a handler emits
+    that this file does not describe fails, and a field this file marks required that a handler
+    omits fails. It runs in CI, in the same package and with the same parser
+    (kin-openapi v0.135.0) that already validates the generated wire document.
+
+    VERSIONED BY TAG, NOT BY THIS STRING ALONE. `info.version` is `provision-v1`, and the git
+    tag `provision-v1` is cut by a person when this lands — PRSR-50 pins the tag, which is
+    invariant 4's arrangement for the ASR service pointed the other way round. A breaking change
+    here is `provision-v2` and a second tag, never an edit under the same one.
+
+    THE CREDENTIAL. Every operation takes `Authorization: Bearer <CATENARY_PROVISION_TOKEN>`,
+    a static secret generated in Signet, at least 32 bytes, compared constant-time over SHA-256
+    digests. Nothing in the database can grant it. It can obtain an enrollment token for any
+    person the service holds, which is a device enrolled as them, so it is the most powerful
+    credential in the service. A missing, malformed or wrong credential is one `401` with one
+    body, identical for all three.
+
+    THE PORT. This surface has its own `http.Server` on `CATENARY_PROVISION_ADDR`, `expose`d on
+    `construct_net` and never under `ports:`, with no Traefik router, service URL or label
+    pointing at it. `deploy/README.md` carries that decision and SERV-202 makes the
+    `construct-server` change. The routed listener serves none of these paths, and this one
+    serves nothing else: `/sync`, `/ws`, `/enroll`, `/refresh`, `/healthz` and `/readyz` are all
+    unknown here.
+
+    WHAT IS NOT DESCRIBED HERE, BECAUSE IT IS NOT AN OPERATION. A request to a path this
+    document does not list, or to a path it lists with a method it does not list for that path,
+    never reaches a handler: net/http answers `404` or `405` (with an `Allow` header) and a
+    plain-text body. A path that is not in canonical form — `//accounts`, say — is answered with
+    net/http's own `307` to the canonical one, method and body preserved. All three are behind
+    the credential like everything else, so a caller without it gets `401` and learns none of
+    them. Every response this document DOES describe is JSON.
+
+security:
+  - provisionToken: []
+
+paths:
+  /accounts:
+    post:
+      operationId: "ensureAccount"
+      summary: "Create a person, find an active one, or reactivate a deactivated one"
+      description: |
+        ONE IDEMPOTENT CALL. Afterwards the account exists, is active, and holds exactly one
+        redeemable enrollment token — the one in this response, which supersedes any unredeemed
+        token the person already had. There is no `409`-then-reissue second step.
+
+        `outcome` is how the caller tells the three apart, and `reactivated` is the one that
+        matters to an operator: Purser skips a service only while its account row is active, so
+        any later invite naming Catenary — a bundle re-run, a re-hire, a retry — un-offboards a
+        person. The connector carries it, and `note`, into `Result.Instructions`.
+
+        The handle is derived from the email's local part by the store and de-duplicated; it is
+        never supplied by the caller. `display_name` is set on creation only — this call never
+        renames an existing person, whatever name it carries.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnsureRequest"
+      responses:
+        "200":
+          description: |
+            The person already existed. `outcome` is `existing` for an active account or
+            `reactivated` for one this call brought back — in which case every device, token and
+            pending invitation the account held was revoked first, inside the same transaction.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnsureResponse"
+        "201":
+          description: "A new person was created. `outcome` is `created`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnsureResponse"
+        "400":
+          description: "The body is unparseable, carries a field this document does not describe, is over 4096 bytes, or `email` is not an address."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "The credential is missing, malformed or wrong. One body for all three."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: "The store refused for a reason that is this service's own fault."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    get:
+      operationId: "lookupAccount"
+      summary: "Look one person up by email"
+      description: |
+        Purser's `Reconcile`. READ-ONLY: it creates nothing, mints nothing, rotates nothing and
+        invalidates nothing, and it takes no lock — PRSR-15's contract for a look-up, and the
+        store's own tests are the oracle for it.
+
+        `Exists` for the connector means `status == active`, never "a row came back".
+
+        A MISSING `email` PARAMETER IS `400`; AN ADDRESS NOBODY HOLDS IS `404` — including an
+        address that is not well-formed. The surface does not run a second copy of the store's
+        own address rule: two normalisers that have to agree are one that will not, and a
+        malformed address genuinely resolves nobody, which is a true `404` for a read.
+      parameters:
+        - name: "email"
+          in: "query"
+          required: true
+          description: "The address to look up. Matched case-insensitively."
+          schema:
+            type: "string"
+            minLength: 1
+      responses:
+        "200":
+          description: "The person exists. `status` says whether they can still get in, and `live_devices` from how many places."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LookupResponse"
+        "400":
+          description: "The `email` query parameter is absent or empty."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "The credential is missing, malformed or wrong. One body for all three."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "No person holds that address. A bot cannot be found here at all — a bot holds no email."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: "The store refused for a reason that is this service's own fault."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /accounts/{id}/deactivate:
+    post:
+      operationId: "deactivateAccount"
+      summary: "End one person's access to this service, everywhere, at once"
+      description: |
+        ONE REQUEST, ONE TRANSACTION, ALL OR NONE: `users.deactivated_at`, then the person's
+        refresh tokens, access tokens and devices, then any unredeemed invitation, then one
+        revocation notification that severs every live socket the account holds on every
+        instance. Nothing is deleted — Purser's `Deprovision` means revoke (PRSR-17), and
+        messages stay attributed.
+
+        IDEMPOTENT. A second call is `204` as well. It is not a no-op: if the account was
+        already deactivated but still held a live credential — a device that enrolled in a race
+        with the first call — this call revokes it and publishes, because the notification is
+        the only thing that severs that socket.
+
+        `id` is `account.id` from `ensureAccount`, which is what the connector records as
+        `Result.ExternalID`.
+      parameters:
+        - name: "id"
+          in: "path"
+          required: true
+          description: "The person's UUID, as `account.id` reported it."
+          schema:
+            $ref: "#/components/schemas/Uuid"
+      responses:
+        "204":
+          description: "The person can no longer get in from anywhere. No body."
+        "401":
+          description: "The credential is missing, malformed or wrong. One body for all three."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: |
+            There is no person with that id to act on — BYTE-IDENTICAL for three cases that the
+            caller cannot tell apart and must not: an id nothing holds, an id that belongs to a
+            BOT (a service account is out of reach of this surface, and that it is one is not
+            something this surface will confirm), and an id that is not a UUID at all.
+
+            A `404` for an id PURSER ITSELF RECORDED is an error to show an operator, not
+            success: accounts here are never deleted, so a recorded id cannot legitimately
+            vanish.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: "The store refused for a reason that is this service's own fault."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  securitySchemes:
+    provisionToken:
+      type: "http"
+      scheme: "bearer"
+      description: "CATENARY_PROVISION_TOKEN, generated in Signet, at least 32 bytes, presented verbatim."
+
+  schemas:
+    # Uuid, Timestamp and Token are DELIBERATE COPIES of the wire schema's own three
+    # primitives (schema/openapi.yaml), pattern for pattern. They are copied rather than
+    # shared because this document is not part of the wire schema and no generator joins
+    # them — and they are copied rather than loosened because the patterns are what give
+    # the contract test teeth: it validates the REAL emitted values against them, so an
+    # id that came out uppercase or a timestamp at the wrong precision fails in CI.
+    Uuid:
+      type: "string"
+      format: "uuid"
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      description: "Lowercase hyphenated UUID, as the wire schema's own Uuid defines it."
+
+    Timestamp:
+      type: "string"
+      format: "date-time"
+      pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+      description: "RFC 3339, UTC, exactly three fractional digits, literal Z — the wire schema's own Timestamp, so these sort chronologically as strings."
+
+    Token:
+      type: "string"
+      pattern: "^[A-Za-z0-9_-]{43}$"
+      description: "A credential in this service's one encoding: 32 bytes from a CSPRNG, base64url without padding, exactly 43 characters."
+
+    EnsureRequest:
+      type: "object"
+      additionalProperties: false
+      required:
+        - "email"
+      properties:
+        email:
+          type: "string"
+          minLength: 3
+          description: "The person's address, and the key Purser and Catenary identify them by. Matched case-insensitively; stored lower-cased."
+        display_name:
+          type: "string"
+          description: "What other members see. OPTIONAL: with none, the store falls back to the derived handle — never to the email, which no wire type carries. Set on creation only; this call never renames."
+      description: "UNKNOWN FIELDS ARE REFUSED with 400, not ignored. A `handle`, a `role` or a `projects` here would read at the Purser end as something this service honoured, and it honours none of them."
+
+    Account:
+      type: "object"
+      additionalProperties: false
+      required:
+        - "id"
+        - "email"
+        - "handle"
+        - "display_name"
+        - "status"
+      properties:
+        id:
+          $ref: "#/components/schemas/Uuid"
+        email:
+          type: "string"
+        handle:
+          type: "string"
+          maxLength: 32
+          description: "Derived from the email's local part by the server and de-duplicated. The connector reports it as `Result.Username`."
+        display_name:
+          type: "string"
+        status:
+          type: "string"
+          enum:
+            - "active"
+            - "deactivated"
+
+    EnsureResponse:
+      type: "object"
+      additionalProperties: false
+      required:
+        - "account"
+        - "enrollment_token"
+        - "enrollment_expires_at"
+        - "outcome"
+      properties:
+        account:
+          $ref: "#/components/schemas/Account"
+        enrollment_token:
+          allOf:
+            - $ref: "#/components/schemas/Token"
+          description: "Redeems ONCE, at POST /enroll, into a device enrolled as this person. The connector reports it as `Result.Secret`. It is in this response and in no log line."
+        enrollment_expires_at:
+          $ref: "#/components/schemas/Timestamp"
+        outcome:
+          type: "string"
+          enum:
+            - "created"
+            - "existing"
+            - "reactivated"
+        note:
+          type: "string"
+          description: |
+            OPTIONAL, AND OMITTED RATHER THAN EMPTY. Present only on the never-adopt path: the
+            store refuses to hand back an existing email-less person on a handle match, so it
+            creates a suffixed handle and this sentence names both — "assigned alice-2 because
+            alice has no email; if that is the same person, run `catenary user set-email`". The
+            connector carries it into `Result.Instructions`, because the operator who caused it
+            is the only one who can act on it.
+
+    LookupResponse:
+      type: "object"
+      additionalProperties: false
+      required:
+        - "id"
+        - "email"
+        - "handle"
+        - "display_name"
+        - "status"
+        - "live_devices"
+      properties:
+        id:
+          $ref: "#/components/schemas/Uuid"
+        email:
+          type: "string"
+        handle:
+          type: "string"
+          maxLength: 32
+        display_name:
+          type: "string"
+        status:
+          type: "string"
+          enum:
+            - "active"
+            - "deactivated"
+        live_devices:
+          type: "integer"
+          minimum: 0
+          description: "How many unrevoked devices the person holds, counted at the moment of the call rather than stored."
+      description: "FLAT where EnsureResponse nests its account, deliberately: a look-up has the account and one derived count, and this is the shape PRSR-50 is written against."
+
+    Error:
+      type: "object"
+      additionalProperties: false
+      required:
+        - "error"
+      properties:
+        error:
+          type: "string"
+          enum:
+            - "unauthorized"
+            - "no such account"
+            - "request is not valid"
+            - "email is not a valid address"
+            - "the email query parameter is required"
+            - "internal error"
+          description: |
+            A CLOSED SET, and two of the values are load-bearing rather than descriptive.
+            `unauthorized` is the door's one refusal, identical for a missing credential, a
+            malformed header and a wrong token. `no such account` is the one not-found,
+            identical for an unknown id, a bot's id and an id that is not a UUID — a caller
+            that could tell those apart could learn which ids name service accounts.
