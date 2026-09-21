@@ -10,6 +10,7 @@
 #   2. postgres env     : add - PURSER_DB_PASSWORD=${PURSER_DB_PASSWORD}
 #   3. .env / .env.example : PURSER_DB_PASSWORD, PURSER_SWITCHYARD_TOKEN,
 #                            PURSER_LYCEUM_OWNER_TOKEN, ARGOSY_PROVISION_TOKEN,
+#                            PURSER_CATENARY_BASE_URL, CATENARY_PROVISION_TOKEN,
 #                            PURSER_CF_* , PURSER_SMTP_* , PURSER_API_TOKEN
 # Then: docker compose up -d postgres && make db-init && docker compose up -d purser
 
@@ -55,6 +56,17 @@
       - PURSER_ARGOSY_BASE_URL=http://argosy:8096
       - PURSER_ARGOSY_PROVISION_TOKEN=${ARGOSY_PROVISION_TOKEN:-}
       - PURSER_ARGOSY_URL=https://argosy.zerogravity.industries
+      # Catenary connector (PRSR-50): ensure/reactivate an account, return the
+      # enrollment token. Must match the catenary service's
+      # CATENARY_PROVISION_TOKEN, presented verbatim. Unset here => connector
+      # registers Unavailable. BaseURL has NO in-code default, unlike the
+      # connectors above: catenary's provisioning listener
+      # (CATENARY_PROVISION_ADDR) has no fixed estate-wide port and is never
+      # routed — it's a second, unrouted http.Server the chat client never
+      # reaches — so this must be set explicitly to whatever port that
+      # deployment's CATENARY_PROVISION_ADDR actually listens on.
+      - PURSER_CATENARY_BASE_URL=${PURSER_CATENARY_BASE_URL:-}
+      - PURSER_CATENARY_PROVISION_TOKEN=${CATENARY_PROVISION_TOKEN:-}
       # Placard (IDEA-22), where `provision-service` resolves a service's
       # launcher icon from, so a spec names a service instead of carrying a
       # hand-typed CDN path (PRSR-37). No token — /api/services is a public

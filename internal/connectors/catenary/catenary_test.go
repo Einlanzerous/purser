@@ -110,6 +110,45 @@ func TestProvision_ReturnsExactlyOneEnrollmentToken(t *testing.T) {
 	}
 }
 
+// enrollment_expires_at is a real, per-call deadline, and must reach the
+// recipient — a decoded-and-discarded expiry leaves someone who opens the
+// invite late with an opaque redeem failure and nothing in the block to
+// explain it (review finding on PR #64).
+func TestProvision_SurfacesTheEnrollmentExpiry(t *testing.T) {
+	c, _ := newFixture(t)
+
+	res, err := c.Provision(context.Background(), connector.Input{Email: "nadia@example.com"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if !strings.Contains(res.SecretLabel, "expires") {
+		t.Errorf("SecretLabel should name the expiry, got %q", res.SecretLabel)
+	}
+	if !strings.Contains(res.Instructions, "expires") || !strings.Contains(res.Instructions, "UTC") {
+		t.Errorf("Instructions should name the expiry, got %q", res.Instructions)
+	}
+}
+
+// A malformed or absent expiry must never fail an otherwise-successful
+// Provision — it is decoration on the result, not a field anything
+// downstream depends on.
+func TestProvision_MalformedExpiryIsNotFatal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"account":{"id":"11111111-2222-4333-8444-555555555555","email":"a@example.com","handle":"a","display_name":"","status":"active"},"enrollment_token":"` + mintToken() + `","enrollment_expires_at":"not-a-timestamp","outcome":"created"}`))
+	}))
+	defer srv.Close()
+	c, _ := New(Config{BaseURL: srv.URL, ProvisionToken: testToken})
+
+	res, err := c.Provision(context.Background(), connector.Input{Email: "a@example.com"})
+	if err != nil {
+		t.Fatalf("Provision must succeed despite a malformed expiry: %v", err)
+	}
+	if strings.Contains(res.Instructions, "expires") {
+		t.Errorf("an unparseable expiry must not be surfaced as if it parsed, got %q", res.Instructions)
+	}
+}
+
 // A re-invite of an existing account must hand over something fresh and
 // redeemable — a single-use token that has already been redeemed can't be
 // handed out again, so Provision re-issues rather than failing.

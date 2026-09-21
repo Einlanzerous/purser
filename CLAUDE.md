@@ -1489,9 +1489,12 @@ here — R6's stub predates the real API and is retired by this connector. The
 double is checked against the vendored, pinned contract
 (`internal/connectors/catenary/testdata/`) rather than hand-shaped, the first
 connector in this repo held to that standard. `PURSER_CATENARY_BASE_URL` has
-no default (see the invariant on undefaulted, account/deployment-specific
-config, one entry over from `PURSER_CF_ZONE_ID`/`PURSER_CF_TUNNEL_ID`) — the
-provisioning listener has no fixed estate-wide port and is never routed.
-`construct-server`-side wiring (the compose entry, the listener's own network
+no default, unlike Argosy/Lyceum/Switchyard's: the provisioning listener
+(`CATENARY_PROVISION_ADDR`) has no fixed estate-wide port and is never
+routed, so guessing one risks pointing at nothing, or at the wrong thing,
+with no operator having typed it — the same shape of reasoning that keeps
+`PURSER_CF_ZONE_ID`/`PURSER_CF_TUNNEL_ID` undefaulted above, though not the
+same invariant (those two stay out of the Access connector's readiness check
+for a different reason). `construct-server`-side wiring (the compose entry, the listener's own network
 exposure) is SERV-202; the live drill against a deployed Catenary is CANT-133.
 Neither is done here.

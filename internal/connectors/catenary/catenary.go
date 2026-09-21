@@ -80,6 +80,10 @@ func (c *Connector) Key() string         { return "catenary" }
 func (c *Connector) DisplayName() string { return "Catenary" }
 func (c *Connector) Icon() string        { return "🚋" }
 
+// timestampLayout matches components.schemas.Timestamp in provision-v1: RFC
+// 3339, UTC, exactly three fractional digits, literal Z.
+const timestampLayout = "2006-01-02T15:04:05.000Z"
+
 // account is components.schemas.Account in provision-v1.
 type account struct {
 	ID          string `json:"id"`
@@ -192,14 +196,29 @@ func (c *Connector) Provision(ctx context.Context, in connector.Input) (connecto
 // whoever owns internal/invite, not to this connector, so outcome and note
 // are silently dropped here rather than either leaked or invented a home for.
 func result(er ensureResponse) connector.Result {
+	secretLabel := "enrollment token (single-use, redeems into your first device)"
+	instructions := "Install Catenary, then paste this enrollment token on the sign-in screen — " +
+		"it redeems once, into your first device. Add further devices from an " +
+		"already-signed-in one."
+
+	// enrollment_expires_at is a real, per-call deadline (unlike Lyceum's fixed
+	// 7 days), so it is parsed and surfaced rather than decoded and discarded —
+	// otherwise a recipient who opens the invite late gets an opaque redeem
+	// failure with nothing in the block to explain it. A parse failure is never
+	// fatal to Provision: this is decoration on an already-successful result,
+	// not a field anything downstream depends on.
+	if exp, err := time.Parse(timestampLayout, er.EnrollmentExpiresAt); err == nil {
+		when := exp.UTC().Format("2006-01-02 15:04 UTC")
+		secretLabel += ", expires " + when
+		instructions += " It expires " + when + " — after that, ask for a new invite."
+	}
+
 	return connector.Result{
-		ExternalID:  er.Account.ID,
-		Username:    er.Account.Handle,
-		Secret:      er.EnrollmentToken,
-		SecretLabel: "enrollment token (single-use, redeems into your first device)",
-		Instructions: "Install Catenary, then paste this enrollment token on the sign-in screen — " +
-			"it redeems once, into your first device. Add further devices from an " +
-			"already-signed-in one.",
+		ExternalID:   er.Account.ID,
+		Username:     er.Account.Handle,
+		Secret:       er.EnrollmentToken,
+		SecretLabel:  secretLabel,
+		Instructions: instructions,
 	}
 }
 

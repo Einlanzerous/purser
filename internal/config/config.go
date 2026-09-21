@@ -58,10 +58,15 @@ const DefaultBundleName = "media"
 //     Cloudflare is in here because Lyceum sits behind the Access gate; without
 //     it the person clears no edge and can't reach Lyceum at all. Argosy is on
 //     the direct path and needs no Access grant, but the overlap is free.
-//   - all: everything, for people who'd actually want Switchyard too.
+//   - all: everything, for people who'd actually want Switchyard too. Kept
+//     literally exhaustive over the registered connectors on purpose — a
+//     name that reads as "everything" but quietly excludes the newest one
+//     is worse than no bundle at all, so a fifth connector (catenary,
+//     PRSR-50) means updating this line rather than "all" drifting into
+//     "most".
 var builtinBundles = map[string]Bundle{
 	"media": {Services: []string{"cloudflare", "lyceum", "argosy"}},
-	"all":   {Services: []string{"cloudflare", "switchyard", "lyceum", "argosy"}},
+	"all":   {Services: []string{"cloudflare", "switchyard", "lyceum", "argosy", "catenary"}},
 }
 
 // bundleEnvPrefix is the env namespace a bundle definition lives under.
