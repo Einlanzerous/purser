@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.0](https://github.com/Einlanzerous/purser/compare/v0.18.1...v0.19.0) (2026-09-22)
+
+
+### Features
+
+* **connectors:** catenary connector against the pinned provisioning contract (PRSR-50) ([#64](https://github.com/Einlanzerous/purser/issues/64)) ([73a6604](https://github.com/Einlanzerous/purser/commit/73a66044b522b0417f2d0ced239c706f94aed2ce))
+
+
+### Bug Fixes
+
+* **deploy:** build the runtime on alpine 3.23, not the EOL 3.20 (SERV-170) ([#62](https://github.com/Einlanzerous/purser/issues/62)) ([f2889cb](https://github.com/Einlanzerous/purser/commit/f2889cbcadf616cd98bd79124646b630f7250cbc))
+
 ## [0.18.1](https://github.com/Einlanzerous/purser/compare/v0.18.0...v0.18.1) (2026-09-05)
 
 
