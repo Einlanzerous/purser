@@ -63,6 +63,7 @@ connector honest.
 | `cloudflare` | Adds the email to a shared Access group (email-OTP SSO gate)         | ✅ live when a CF API token is configured; otherwise prints the manual dashboard step |
 | `lyceum`     | `POST /admin/users` (email set) → single-use 7-day `lyc_` invite      | ✅ live when an owner session token is configured and `LYCEUM_AUTH=true`; otherwise registers Unavailable |
 | `argosy`     | `POST /api/v1/admin/accounts` (email login) → one-time password       | ✅ live when the provisioning token matches argosy's `ARGOSY_PROVISION_TOKEN`; otherwise registers Unavailable |
+| `catenary`   | `POST /accounts` (ensure/reactivate) → one enrollment token           | ✅ live when the provisioning token matches catenary's `CATENARY_PROVISION_TOKEN`; otherwise registers Unavailable (PRSR-50) |
 
 Switchyard is the account inside the app; Cloudflare Access is the SSO gate in
 front of it. A typical human invite targets **both**: Cloudflare grants the
@@ -431,6 +432,7 @@ leaves the account standing. Revoking is reversible, it preserves authorship, an
 | `cloudflare` | remove the email from the Access group | already a pure access grant |
 | `lyceum` | `DELETE /admin/users/{id}` | **the exception** — its admin API has no disable |
 | `argosy` | none | no delete, disable, or token invalidation exists |
+| `catenary` | `POST /accounts/{id}/deactivate` | one request, one transaction, ends access everywhere at once; accounts are never deleted |
 
 Lyceum is documented as deleting rather than being quietly folded in, because the
 interface's gentler wording would otherwise imply a reversibility it hasn't got.

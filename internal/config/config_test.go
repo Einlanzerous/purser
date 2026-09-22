@@ -15,8 +15,8 @@ func TestLoadBundles_BuiltinsWhenUnset(t *testing.T) {
 		t.Errorf("media bundle: %v", media.Services)
 	}
 	all, ok := bc.Named["all"]
-	if !ok || len(all.Services) != 4 {
-		t.Errorf("expected a built-in all bundle with 4 services, got %+v", all)
+	if !ok || len(all.Services) != 5 {
+		t.Errorf("expected a built-in all bundle with 5 services (one per registered connector), got %+v", all)
 	}
 	// media is the smaller grant, so an unqualified invite can't hand out
 	// Switchyard by accident.

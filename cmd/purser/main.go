@@ -34,6 +34,7 @@ import (
 	"github.com/Einlanzerous/purser/internal/config"
 	"github.com/Einlanzerous/purser/internal/connector"
 	"github.com/Einlanzerous/purser/internal/connectors/argosy"
+	"github.com/Einlanzerous/purser/internal/connectors/catenary"
 	"github.com/Einlanzerous/purser/internal/connectors/cloudflare"
 	"github.com/Einlanzerous/purser/internal/connectors/lyceum"
 	"github.com/Einlanzerous/purser/internal/connectors/switchyard"
@@ -283,6 +284,20 @@ func buildRegistry(cfg config.Config) *connector.Registry {
 	} else {
 		conns = append(conns, connector.NewUnavailable("lyceum", "Lyceum",
 			"set PURSER_LYCEUM_OWNER_TOKEN (owner session token) and run the lyceum service with LYCEUM_AUTH=true"))
+	}
+
+	if cfg.Catenary.Configured() {
+		cc, err := catenary.New(catenary.Config{
+			BaseURL:        cfg.Catenary.BaseURL,
+			ProvisionToken: cfg.Catenary.ProvisionToken,
+		})
+		if err != nil {
+			log.Fatalf("catenary connector: %v", err)
+		}
+		conns = append(conns, cc)
+	} else {
+		conns = append(conns, connector.NewUnavailable("catenary", "Catenary",
+			"set PURSER_CATENARY_BASE_URL and PURSER_CATENARY_PROVISION_TOKEN (matching the catenary service's CATENARY_PROVISION_TOKEN) to enable"))
 	}
 
 	return connector.NewRegistry(conns...)
