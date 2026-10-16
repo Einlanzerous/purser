@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.1](https://github.com/Einlanzerous/purser/compare/v0.19.0...v0.19.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* **store:** stamp removed_at and deprovisioned_at on each removal, not the first (PRSR-49) ([#65](https://github.com/Einlanzerous/purser/issues/65)) ([145e9c3](https://github.com/Einlanzerous/purser/commit/145e9c3556ecc72201caa05bcd486be7cba74a2c))
+
 ## [0.19.0](https://github.com/Einlanzerous/purser/compare/v0.18.1...v0.19.0) (2026-09-22)
 
 
