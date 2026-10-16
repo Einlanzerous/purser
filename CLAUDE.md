@@ -1434,7 +1434,10 @@ time on this axis: **`removed_at` stamps the first transition, not each one.**
 its tests cover a repeat teardown and a stand-back-up — but not a second *real*
 removal, so a hostname stood up, torn down, stood up and torn down again keeps
 the first date, and `gone`'s "already removed, on …" names it. Both axes. Filed
-as **PRSR-49**; not changed here.
+as **PRSR-49**; not changed here. Fixed by PRSR-49: both columns now stamp on every
+transition *into* the terminal status (`status <> 'removed'` /
+`<> 'deprovisioned'`, read from the pre-UPDATE row), so a repeat is still a
+no-op, a stand-back-up still keeps the stamp, and a second real removal moves it.
 
 **PRSR-48 closed the additive path's ownership hole** (2026-09-05), the one
 PRSR-46 named and deliberately left: `provision-service` refuses a hostname

@@ -60,7 +60,10 @@ func (s *Store) UpsertServiceResource(ctx context.Context, r model.ServiceResour
 }
 
 // MarkServiceResourceRemoved records that a resource was torn down, stamping
-// removed_at on the transition and never re-stamping it.
+// removed_at on every transition into removed and only then: a repeat teardown
+// of a removed row keeps its date, while a row stood back up and torn down
+// again carries the latest removal, not the first (PRSR-49). The CASE reads the
+// status as it was before this UPDATE.
 //
 // Separate from UpsertServiceResource because the two are called at opposite
 // moments and only one of them may be called speculatively: this one asserts
@@ -72,7 +75,10 @@ func (s *Store) MarkServiceResourceRemoved(ctx context.Context, id uuid.UUID) er
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE service_resource SET
 			status     = 'removed',
-			removed_at = COALESCE(removed_at, now()),
+			removed_at = CASE
+				WHEN status <> 'removed' OR removed_at IS NULL THEN now()
+				ELSE removed_at
+			END,
 			updated_at = now()
 		WHERE id = $1`, id)
 	if err != nil {

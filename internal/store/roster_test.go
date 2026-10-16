@@ -232,6 +232,16 @@ func TestDeprovisionedAt_SurvivesAReinvite(t *testing.T) {
 		t.Fatal("revoking should stamp deprovisioned_at")
 	}
 
+	// Re-running an offboard against an already-deprovisioned row must not move
+	// the date — nothing happened upstream.
+	if err := st.UpdateAccountStatus(ctx, acct.ID, model.AccountDeprovisioned); err != nil {
+		t.Fatal(err)
+	}
+	records, _ = st.AccountRecordsFor(ctx, p.ID)
+	if !records[0].DeprovisionedAt.Equal(*stamped) {
+		t.Errorf("the date moved on a re-run: was %v, now %v", stamped, records[0].DeprovisionedAt)
+	}
+
 	// Re-inviting them goes through UpsertAccount, which is what used to erase
 	// the evidence.
 	if _, err := st.UpsertAccount(ctx, model.Account{
@@ -248,13 +258,16 @@ func TestDeprovisionedAt_SurvivesAReinvite(t *testing.T) {
 		t.Errorf("deprovisioned_at must survive a re-invite: was %v, now %v", stamped, records[0].DeprovisionedAt)
 	}
 
-	// Re-running an offboard against an already-deprovisioned row must not move
-	// the date either — the access was taken away once.
+	// Offboarding them again after the re-invite is a second removal, and the
+	// date answers for the latest one — the row went deprovisioned → active →
+	// deprovisioned (PRSR-49). This block used to assert the opposite, under a
+	// comment calling the row "already-deprovisioned" when the re-invite above
+	// had just made it active.
 	if err := st.UpdateAccountStatus(ctx, acct.ID, model.AccountDeprovisioned); err != nil {
 		t.Fatal(err)
 	}
 	records, _ = st.AccountRecordsFor(ctx, p.ID)
-	if !records[0].DeprovisionedAt.Equal(*stamped) {
-		t.Errorf("the date moved on a re-run: was %v, now %v", stamped, records[0].DeprovisionedAt)
+	if records[0].DeprovisionedAt == nil || !records[0].DeprovisionedAt.After(*stamped) {
+		t.Errorf("a second offboard after a re-invite kept the first date: was %v, now %v", stamped, records[0].DeprovisionedAt)
 	}
 }

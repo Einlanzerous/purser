@@ -131,8 +131,9 @@ func TestUpsertServiceResource_KindsAreSeparateRows(t *testing.T) {
 	}
 }
 
-// removed_at is stamped on the transition and never moved again, and standing
-// the hostname back up must not erase it. account.deprovisioned_at (migration
+// removed_at is stamped on each transition into removed — a repeat teardown
+// keeps it, standing the hostname back up must not erase it, and a later
+// teardown moves it to the latest removal. account.deprovisioned_at (migration
 // 0006) exists because status + updated_at lost exactly this to a re-invite.
 func TestMarkServiceResourceRemoved_StampsOnceAndSurvivesReuse(t *testing.T) {
 	st := resourceStore(t)
@@ -180,6 +181,17 @@ func TestMarkServiceResourceRemoved_StampsOnceAndSurvivesReuse(t *testing.T) {
 	}
 	if back.RemovedAt == nil || !back.RemovedAt.Equal(stamped) {
 		t.Errorf("removed_at = %v, want the original stamp kept — it did happen", back.RemovedAt)
+	}
+
+	// Tearing it down again is a second removal: removed_at answers for the
+	// latest one, not the first (PRSR-49 — observed on a probe hostname stood up
+	// and torn down three times, every row still carrying the first date).
+	if err := st.MarkServiceResourceRemoved(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = st.ServiceResourcesForHostname(ctx, "argosy.zerogravity.industries")
+	if rows[0].RemovedAt == nil || !rows[0].RemovedAt.After(stamped) {
+		t.Errorf("a second teardown after a stand-back-up kept the first date: was %v, now %v", stamped, rows[0].RemovedAt)
 	}
 }
 

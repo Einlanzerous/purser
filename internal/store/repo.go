@@ -198,15 +198,21 @@ func (s *Store) PersonByEmail(ctx context.Context, email string) (model.Person, 
 //
 // Moving to deprovisioned also stamps deprovisioned_at, which UpsertAccount then
 // never clears, so "when was this taken away" survives a later re-invite
-// (PRSR-17). It is set only on the transition into that status: re-running an
-// offboard against an already-deprovisioned row is a no-op upstream and must not
-// move the date either.
+// (PRSR-17). It is set on every transition into that status, and only then:
+// re-running an offboard against an already-deprovisioned row is a no-op
+// upstream and must not move the date, but an offboard after a re-invite is a
+// new removal, and the date answers for the latest one (PRSR-49).
+//
+// The CASE reads the row's status as it was before this UPDATE — Postgres
+// evaluates every SET expression against the old row. A deprovisioned row with
+// no stamp (written before migration 0006) still gets one, as it always did.
 func (s *Store) UpdateAccountStatus(ctx context.Context, accountID uuid.UUID, status model.AccountStatus) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE account SET
 			status = $2,
 			deprovisioned_at = CASE
-				WHEN $2 = 'deprovisioned' AND deprovisioned_at IS NULL THEN now()
+				WHEN $2 = 'deprovisioned'
+				     AND (status <> 'deprovisioned' OR deprovisioned_at IS NULL) THEN now()
 				ELSE deprovisioned_at
 			END,
 			updated_at = now()
