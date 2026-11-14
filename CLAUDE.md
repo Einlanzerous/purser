@@ -3,1500 +3,219 @@
 Cross-service provisioning/invite service for the Construct. One command invites
 a person into multiple services, mints credentials, grants Cloudflare Access
 SSO, and returns a copy-pasteable credential block (or emails it). Single static
-Go binary (CLI + thin HTTP API), sibling to the other construct-server Go
-services. See `docs/architecture.md` for the full design (IDEA-14 reference).
+Go binary (CLI + thin HTTP API). Full design: `docs/architecture.md`.
 
-Tracked in Switchyard under the **PRSR** project (epic `PRSR-1`). It graduated
-there from `SERV-33`; the old `SERV-*` keys still resolve as aliases, so treat a
-`SERV-` reference in an older commit or comment as historical.
+Tracked in Switchyard under the **PRSR** project. It graduated from `SERV-33`;
+old `SERV-*` keys still resolve as aliases, so read one in an older commit or
+comment as historical. Open work lives on the board, not in this file.
+
+Rationale, incident history and live-probe measurements for the rules below are
+in `docs/person-axis-invariants.md`, `docs/spinup-invariants.md` and
+`docs/build-identity.md`. Read the relevant one before changing the code a rule
+guards.
 
 ## Layout
 
-- `cmd/purser/` — entrypoint + subcommands (`serve`, `invite`, `offboard`,
-  `provision-service`, `teardown-service`, `person add|list|show`, `audit`,
-  `reconcile`, `migrate`, `version`). Composition root: `setup()` wires store + connectors + **both**
-  orchestrators — `invite.Service` and, since PRSR-31, `spinup.Service` via
-  `spinupRegistry`/`tunnelSet`.
-- `internal/model/` — domain types (person, service, account, invite,
-  provision_task, service_resource), 1:1 with the schema.
-- `internal/connector/` — the `Connector` interface + `Registry` +
-  `Unavailable` (registered-but-unconfigured) + `ErrPending`.
-- `internal/connectors/{switchyard,cloudflare,lyceum,argosy,catenary}/` — per-service connectors.
-  `cloudflare/` serves **both** axes: the Access `Connector` (person × service)
-  and, on the spin-up axis, `DNSProvisioner` (PRSR-28, `dns.go`),
-  `AccessProvisioner` (PRSR-29, `access.go`) and `TunnelProvisioner` (PRSR-30,
-  `tunnel.go`) — over one shared API transport in `client.go`. Grouped by
-  **upstream, not by axis**: one API, one token, one place the read-modify-write
-  hazard is solved and the next person to meet it can see the precedent. The axes
-  stay separate where it counts — `spinup` imports neither `connector` nor this
-  package, and a `ServiceProvisioner` and a `Connector` remain two types sharing
-  no fields. All four have separate Config structs on purpose — see the
-  invariant below.
-- `internal/invite/` — the orchestrator (`Run`) + credential-block renderer. This
-  is where idempotency lives.
-- `internal/spinup/` — the **second axis** (PRSR-27): `ServiceSpec`, the
-  `ServiceProvisioner` interface, its own `Registry`/`Unavailable`/
-  `ErrUnavailable`, the `Ensure` orchestrator and — since PRSR-34 — the
-  `Teardown` one in `teardown.go`, with its own status set and its own
-  `TeardownChecker`. Keyed on hostname, not on a person. It imports
-  `internal/model` and nothing else of ours — deliberately not
-  `internal/connector`, and not `internal/store`.
-- `internal/placard/` — the launcher-mark resolver (PRSR-37). A client for
-  Placard's `/api/services`, deliberately **not** under `internal/connectors/`:
-  Placard is never an invite target and implements neither axis's interface.
-  It picks a URL and never decides one — see the invariant below.
-- `internal/store/` — pgx pool, embedded migrator, repo queries.
-- `internal/delivery/` — SMTP sender (email delivery).
-- `internal/api/` — thin HTTP surface.
-- `migrations/` — `NNNN_name.up.sql` / `.down.sql`, embedded, auto-applied on boot.
+The tree is the directory tour. Only the rules the tree does not show:
 
-## Conventions (match the construct-server house style)
+- `internal/spinup/` is the **second axis** (hostname-keyed infrastructure).
+  It imports `internal/model` and nothing else of ours: not `internal/connector`,
+  not `internal/store`. `ServiceProvisioner` and `Connector` are two types that
+  share no fields.
+- `internal/connectors/cloudflare/` serves both axes (Access `Connector`, plus
+  the `DNSProvisioner`, `AccessProvisioner` and `TunnelProvisioner` for
+  spin-up) because it is grouped by upstream, not by axis: one API, one token,
+  one client in `client.go`. Each connector keeps its own `Config` struct on
+  purpose (see the `DNSConfig` rule below).
+- `internal/placard/` is deliberately not under `connectors/`: Placard is never
+  an invite target and implements neither axis's interface. It picks a logo URL
+  and never decides one.
+- `cmd/purser/` `setup()` is the composition root and wires both orchestrators,
+  `invite.Service` and `spinup.Service` (via `spinupRegistry`/`tunnelSet`).
+- `internal/invite/` is where person-axis idempotency lives.
+- Migrations are `migrations/NNNN_name.{up,down}.sql`, embedded and applied on
+  boot.
 
-- Go 1.26, `pgx/v5`, `google/uuid`. No ORM. No external migration tool — the
-  in-process migrator in `internal/store/migrate.go` applies embedded SQL.
+## Conventions
+
+- Go 1.26, `pgx/v5`, `google/uuid`. No ORM, no external migration tool.
 - Config is env-only, `PURSER_`-prefixed, with a `DATABASE_URL` fallback
-  (`internal/config`). No config files.
-- Logs: stdlib `log`, which writes to **stderr** — nothing calls `SetOutput`.
-  (This line said stdout until PRSR-31, where it mattered: the CLI's own summary
-  also goes to stderr, which is what made a logged-and-detailed warning print
-  twice on the same stream.) Health: `GET /healthz`. Port 4006.
-- Release-please + GHCR image `ghcr.io/einlanzerous/purser`. Conventional
-  commits.
+  (`internal/config`). No config files. Port 4006, health at `GET /healthz`.
+- Logs go through stdlib `log` to **stderr**, which is also where the CLI
+  prints its summary, so a warning logged and also reported prints twice.
+- Conventional commits and release-please per `PRINCIPLES.md`; image is
+  `ghcr.io/einlanzerous/purser`.
 
 ## Invariants — don't break these
 
-- **Idempotency is per (person × service).** `account` has `UNIQUE(person_id,
-  service_id)`; the orchestrator skips services with an active account and
-  retries only failed ones. Keep it that way. Bundles (PRSR-12) rely on this —
-  a bundle is only a named service list, so overlapping bundles and re-invites
-  are safe without any bundle-specific logic. Don't give bundles their own
-  provisioning path.
-- **A bundle grants project access, not privilege.** The default `*:user` is a
-  Switchyard *project membership* role; the instance role stays at its preset.
-  Don't conflate the two axes.
-- **`Reconcile` must never mutate.** No create, no mint, no rotate, no revoke —
-  it answers "what does this person already have?" and nothing else. A version
-  that repairs as a side effect can't be used to audit, because running it
-  destroys the drift it's meant to report. A connector with no lookup endpoint
-  returns `ErrReconcileUnsupported` rather than inferring absence: reporting
-  "no" for a question you can't answer generates wrong records.
-- **Never treat unverifiable as absent.** `UpstreamUnknown` is deliberately
-  distinct from `UpstreamNo` throughout the audit, and a failed connector call
-  must never mark records stale — a transient outage would otherwise wipe out
-  everyone's access records.
-- **`person add` provisions nothing.** The add writes a `person` row and nothing
-  else — no `account` rows, no credentials, no `Provision`. It exists so the
-  audit can see people onboarded outside Purser, and it stops being useful the
-  moment it starts doing invite's job. (`--audit` then runs the ordinary
-  read-only audit, which does call `Reconcile`; that's the preview, not the add.)
-- **An occupied email is a conflict, not an edit.** The store used to carry an
-  `UpsertPerson` doing `ON CONFLICT … DO UPDATE SET name`, so any command taking
-  `--name` renamed whoever holds that address unless it refused first — `person
-  add` uses `InsertPersonIfAbsent` and requires `--rename`, and `invite`'s
-  `resolvePerson` keeps the stored name and reports the disagreement as
-  `Result.NameConflict` (PRSR-20). `UpsertPerson` is now deleted (PRSR-23): a
-  `person` row is created only by `InsertPersonIfAbsent` and renamed only by
-  `RenamePerson`. **Only `person add --rename` may change a name.** Don't add a
-  rename path to `invite`, and don't reintroduce a name-setting upsert — one
-  command owning renames is what makes the guarantee checkable by grep.
-- **`invite` requires an email, on every delivery method.** The address is the
-  identity key and there is no second one. Without it the person row has no
-  conflict target — `person_email_key` is partial on `email IS NOT NULL` — so
-  each run recorded a *new* person id, and the person id is what idempotency is
-  keyed on: `UNIQUE(person_id, service_id)` for the skip, and `InviteRef` for the
-  upstream `Idempotency-Key`. The command that promises to retry only what failed
-  therefore re-provisioned everything, fresh secret and all, once per run
-  (PRSR-23). Don't make it optional again or default it, and don't key identity
-  on `--name`: two people legitimately share a name, and merging them is worse
-  than duplicating one. Migration 0005 says the same thing in the schema —
-  `CHECK (email IS NOT NULL) NOT VALID`, so it binds new rows without having to
-  decide the fate of pre-0005 emailless ones at boot. Those are stranded (no
-  command can address a person with no address) and hand SQL is the only repair;
-  the constraint permits it deliberately.
-- **No connector may answer a reconcile it can't verify.** All four refuse an
-  emailless `Reconcile`. Switchyard's `findUser` still falls back to matching on
-  display name — fine on the Provision path, where Switchyard itself reported the
-  conflict, but as an *audit* answer it would record a person against a
-  same-named stranger, or mark a real account stale and re-arm provisioning for a
-  second token. Requiring the address on `invite` is what left that fallback
-  reachable only from the audit, so `Reconcile` guards it there (PRSR-23).
-- **A name mismatch blocks `--deliver email`, not copy-paste.** It's the only
-  evidence that a mistyped `--email` landed on a *different existing person*, and
-  email mails them working credentials before any warning can be read — so Run
-  returns `ErrNameConflictOnEmail` before writing an invite row or provisioning
-  (409 over HTTP). Copy-paste warns and proceeds; the operator is the gate there.
-  Don't "simplify" these into one behaviour: the asymmetry is the point, because
-  only one of the two paths can be taken back.
-- **`person.email` is unique case-insensitively** (migration 0003), and every
-  conflict target must infer on `lower(email)`. The index and the store's
-  lookups disagreed once; the gap inserted duplicate identities for the same
-  human, which the audit then populated twice.
-- **`offboard` previews; `invite` acts.** The one genuinely destructive command
-  inverts every default the provisioning path takes (PRSR-17). A dry run makes
-  **no connector call at all** — not a read-only one — and `--apply` is what acts;
-  a duplicate grant is wasteful, but revoking the wrong person is not fixed by
-  re-running. There is no bulk mode: `--email` is required and always one person,
-  which is a stronger guard than the flag `reconcile --all` needs. Dry run and
-  apply share one code path, so the preview is exactly what the apply does.
-- **A revoke that didn't happen must never be recorded as one.** Only a
-  successful `Deprovision` marks the account `deprovisioned`; `failed` and
-  `unavailable` leave it **active** so the next run retries it. The lie outlives
-  the error message — the audit, `person show`, and the next invite's idempotency
-  skip all read that column and would report access as removed while it is live.
-  For the same reason `offboard` exits non-zero on `unavailable`, the opposite of
-  `invite`, where nothing was granted and waiting harms nobody. The inverse has
-  its own state too: `revoked-not-recorded` means the connector succeeded and the
-  write didn't, so access *is* gone and Purser's records are wrong — the opposite
-  advice from `failed`, which is why they aren't one status.
-- **The preview must not promise what `--apply` refuses.** Argosy's `Deprovision`
-  is an unconditional refusal and so is every `Unavailable` stub, so a dry run
-  that reported `revoke` for them would break the property that makes previewing
-  worthwhile. `connector.CanDeprovision` answers from capability and config
-  alone, contacting nothing; a connector that knows it can't act implements
-  `RevokeChecker` and its `Deprovision` delegates to the same answer so the two
-  cannot drift.
-- **`ErrRevokeUnavailable` is the revoke-path twin of `ErrPending`.** Same
-  bucket — match with `connector.IsUnavailable` — but "provisioning not yet
-  available" is the wrong sentence on an offboard, and `ErrPending`'s text can't
-  be reworded because migration 0004's backfill matches it as a literal prefix.
-- **A 404 against a *recorded* `external_id` is a wrong record, not absent
-  access.** Both Switchyard and Lyceum fall back to the email lookup and revoke
-  what that finds. Treating it as "nothing to revoke" marks the account
-  deprovisioned while the real user's access stays live, and the next run skips
-  it — silent and permanent, unlike a failure. Lyceum has a second trap: its
-  `Provision` 409 branch records the *email* in `external_id`, and its DELETE
-  handler `ParseInt`s the path, so a non-numeric id must resolve by lookup
-  instead.
-- **`Deprovision` means revoke, not delete — except Lyceum.** Switchyard revokes
-  tokens and keeps the user, because deleting would take their authored tickets
-  with it; Cloudflare drops the email from the Access group. Lyceum's admin
-  surface offers only `DELETE /admin/users/{id}`, so there the two collapse — say
-  so rather than letting the interface's wording imply a reversibility it hasn't
-  got. Argosy has no endpoint at all and returns `ErrRevokeUnavailable`, so a three-of-four
-  offboard reports honestly instead of claiming what it didn't do.
-- **Revoking Switchyard does not close its door.** Its tokens gate the API; the
-  SSO login is gated by the *Cloudflare Access group*, so an offboard that skips
-  `cloudflare` leaves a working sign-in behind while looking finished. The CLI
-  says this outright when it happens. Don't remove that warning without removing
-  the asymmetry that makes it true.
-- **The `account` row is marked, never deleted**, and `deprovisioned_at`
-  (migration 0006) is what makes "when was it taken away" durable. `status` +
-  `updated_at` looked like enough and wasn't: `UpsertAccount` sets active and
-  bumps `updated_at`, so the next invite erased both — and re-inviting someone is
-  ordinary. The column is written on the transition into `deprovisioned` and
-  never cleared, so an *active* row may still carry one; read `status` for the
-  current state. Deleting the row instead would destroy the history the audit
-  exists to read *and* silently re-arm provisioning, since the idempotency skip
-  keys on an active account and a missing row means the opposite of a
-  deprovisioned one.
+### Person axis
+
+- **Idempotency is per (person x service).** `account` has `UNIQUE(person_id,
+  service_id)`; the orchestrator skips active accounts and retries only failed
+  ones. Bundles are only named service lists: no bundle-specific provisioning
+  path. A bundle grants Switchyard project membership, never the instance role.
+- **`Reconcile` never mutates.** No create, mint, rotate or revoke. A connector
+  with no lookup returns `ErrReconcileUnsupported`; none may answer a reconcile
+  it cannot verify, so all five refuse an emailless one.
+- **Unverifiable is not absent.** `UpstreamUnknown` is distinct from
+  `UpstreamNo`, and a failed connector call never marks records stale.
+- **`person add` provisions nothing.** It writes one `person` row, no accounts,
+  no credentials, no `Provision`.
+- **An occupied email is a conflict, not an edit.** A person row is created only
+  by `InsertPersonIfAbsent` and renamed only by `RenamePerson`; only `person add
+  --rename` changes a name. `invite` reports a disagreement as
+  `Result.NameConflict`. No name-setting upsert, no rename path in `invite`.
+- **`invite` requires an email on every delivery method.** The address is the
+  identity key and person id is what idempotency keys on. Never optional, never
+  defaulted, never keyed on `--name`. Migration 0005 enforces it (`NOT VALID`).
+- **A name mismatch blocks `--deliver email` but only warns on copy-paste**
+  (`ErrNameConflictOnEmail`, 409 over HTTP). Do not unify the two behaviours:
+  only one of the paths can be taken back.
+- **`person.email` is unique case-insensitively** (migration 0003); every
+  conflict target infers on `lower(email)`.
+- **`offboard` previews; `invite` acts.** A dry run makes no connector call at
+  all; `--apply` acts; `--email` is required and always one person, no bulk
+  mode. Dry run and apply share one code path.
+- **Only a successful `Deprovision` marks an account `deprovisioned`.**
+  `failed` and `unavailable` leave it active so the next run retries.
+  `revoked-not-recorded` (connector succeeded, write failed) is its own status
+  because its advice is the opposite. `offboard` exits non-zero on
+  `unavailable`.
+- **The preview must not promise what `--apply` refuses.**
+  `connector.CanDeprovision` answers from capability and config alone; a
+  connector that knows it cannot act implements `RevokeChecker` and its
+  `Deprovision` delegates to the same answer.
+- **`ErrRevokeUnavailable` is the revoke twin of `ErrPending`.** Match with
+  `connector.IsUnavailable`. Never reword `ErrPending`: migration 0004's
+  backfill matches its text as a literal prefix.
+- **A 404 on a recorded `external_id` is a wrong record, not absent access.**
+  Switchyard and Lyceum fall back to email lookup and revoke what that finds.
+  Lyceum's DELETE needs a numeric id, so a non-numeric `external_id` resolves
+  by lookup.
+- **`Deprovision` means revoke, not delete,** except Lyceum, whose only endpoint
+  is `DELETE`. Argosy has no endpoint and returns `ErrRevokeUnavailable`.
+- **Revoking Switchyard does not close SSO;** the Cloudflare Access group does.
+  The CLI warns when an offboard skips `cloudflare`; keep the warning while the
+  asymmetry exists.
+- **The `account` row is marked, never deleted.** `deprovisioned_at` is written
+  on the transition and never cleared (an active row may carry one; read
+  `status`). Deleting the row would erase history and re-arm provisioning.
 - **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
-  plaintext lives only in the returned/emailed credential block.
-- **The roster reads records, and cannot read a secret.** `person list` /
-  `person show` (PRSR-24) read local tables only — `person`, `account` and
-  `service`, plus `invite` for `show`'s history — and neither `Roster` nor
-  `PersonDetail` references `s.registry`, because "who is on the roster" must
-  not depend on every upstream being reachable, and that is the whole difference
-  from `audit`. Don't give them a connector call. They read
-  `store.AccountRecord`, which has no `secret_hash`/`secret_ref` field and comes
-  from a query selecting neither column: credentials are shown once, at invite
-  time, and `--json` serializes whatever the struct holds, so the guarantee is
-  that the field doesn't exist rather than that no renderer prints it. Don't add
-  one "just for the hash". `list` hides non-active accounts by default but
-  reports `Hidden` so the omission is never silent — `--to lyceum` finding
-  nobody has to mean "nobody has Lyceum", not "nobody has it any more" — and its
-  service filter selects on the same accounts it displays. `show` filters
-  nothing; a stale row is the point of the single-person view.
+  plaintext exists only in the returned or emailed credential block.
+- **The roster reads local records only.** `person list` / `person show` make no
+  connector call (`Roster`, `PersonDetail` never touch `s.registry`) and read
+  `store.AccountRecord`, which has no secret field. Do not add one. `list`
+  reports `Hidden` rather than omitting non-active accounts silently.
 - **The credential block is the recipient's; the operator note is the
-  operator's.** `Result.CredentialBlock` is the only thing `--deliver email` may
-  ever send, and `RenderCredentialBlock` must stay free of operator-facing
-  content. The failure list was once a trailing section of the block, so a single
-  failed connector mailed an invitee raw `err.Error()` text under a heading
-  saying it wasn't for them (PRSR-19). Don't re-merge them or filter the rendered
-  string — the split is at the source so the emailer has nothing to get wrong.
-- **An invite that provisioned nothing sends no email.** With the operator note
-  split out, an all-failed invite's block is a greeting and nothing else, so
-  mailing it announces access that wasn't granted — and marks the invite
-  delivered, so "did they get it?" answers yes. `deliverable()` gates the send;
-  `Delivered` stays false and the CLI says so. A *partial* failure still sends.
+  operator's.** `--deliver email` sends only `Result.CredentialBlock`, which
+  must stay free of operator-facing content (error text). Split at the source;
+  do not filter the rendered string.
+- **An invite that provisioned nothing sends no email** (`deliverable()`);
+  `Delivered` stays false. A partial failure still sends.
 - **`unavailable` is a task status, not a flavour of `failed`.** A connector
-  returning `connector.ErrPending` — registered but unconfigured, or with no
-  upstream provisioning API — records `TaskUnavailable` (PRSR-21). It used to be
-  `TaskFailed` plus a `Pending bool`, and every consumer that buckets by status
-  then had to remember the bool: the operator note filed it under "what failed"
-  and then labelled the line `(pending)`. Don't reintroduce a modifier alongside
-  the status, and don't reuse `TaskPending` for it — that's the *queued* state,
-  and "hasn't run yet" vs "can't be run" is the collision that caused this. The
-  split is only ever consulted for the difference, so let it switch on a status:
-  the note groups the two under separate headings, the CLI marks them `…` and
-  `✗`. `provision_task.status` is CHECK-constrained (not free text) — a new
-  status needs a migration.
-- **Switchyard needs the email set** on user create — it's the SSO join key
-  (`users.email`). Don't drop it.
-- Connectors should treat "already exists" upstream as success (reconcile) so a
-  failed-only retry is safe.
-- Per-service failures must not abort the whole invite.
+  returning `connector.ErrPending` records `TaskUnavailable`. No modifier field
+  beside the status; do not reuse `TaskPending` (queued). `provision_task.status`
+  is CHECK-constrained, so a new status needs a migration.
+- **Switchyard user create needs the email set** (the SSO join key).
+- **Connectors treat "already exists" upstream as success,** and a per-service
+  failure never aborts the whole invite.
 
-### Build identity on `/healthz` (PRSR-32)
+### Build identity
 
-- **`/healthz` reports what was stamped into the binary, and never guesses.**
-  Switchyard's delivery reconciler polls it and records the answer as the
-  *observed* half of the estate's delivery ledger (the SWY-192 contract, rolled
-  out by SERV-128). An observation is the half that is supposed to be
-  trustworthy, so a plausible-looking version the build did not ship becomes a
-  real row indistinguishable from a real deploy. An unstamped build says `dev`
-  and an unknown commit says `null`; neither is ever inferred from `go.mod`, a
-  VCS stamp, or the image tag.
-- **Blank is not unset, so read through `version.Get()` — never the raw vars.**
-  A Docker `ARG` that is declared but never passed expands to an *empty string*,
-  and `-X ...Version=` links that empty string in **over** the `dev` default
-  rather than leaving it alone (SWY-224). `Get()` is the only thing mapping
-  blank back to `dev`/`null`, so a caller reading `version.Version` directly
-  reports `""` where it means `dev`. The vars stay exported solely because
-  `Get()`'s rule has to be exercised from sibling packages' tests. This was
-  invisible while the Dockerfile still defaulted to the placeholder `docker`;
-  emptying that default is what made the bypass reachable.
-- **The version is bare semver, everywhere it is produced.** It is compared with
-  *strict equality* against `org.opencontainers.image.version`, which
-  docker/metadata-action stamps without the `v`. Report `v0.15.0` against a
-  label of `0.15.0` and every deploy report is filed `claimed_not_confirmed`
-  for ever — a permanent red row on the one page whose job is to be believed.
-  That is why the Makefile strips the `v` off `git describe`, and why `Get()`
-  reports verbatim instead of sanitising: a prefix is a bug in the *build*, and
-  silently stripping it at the reporter hides it from the only place it shows.
-- **`VERSION` is passed only on a tag that carries a version**, and on that path
-  the binary and the image label agree *by construction*: `publish.yml`'s `ver`
-  step resolves one output, `stamp`, which feeds `build-args: VERSION`, and the
-  `type=semver` entries that produce the label match on exactly the refs that
-  make `stamp` non-empty. One value, not two conditions kept in step by hand.
-  **The agreement is about the release path only, and the reason is worth
-  knowing before you add a tag entry.** `org.opencontainers.image.version` is not
-  set by `type=semver` as such — metadata-action sets it from `version.main`, the
-  value of the **highest-priority tag that matched**. On a release the semver
-  entry (priority 900) wins and the label is the bare version. On a push to main
-  the `type=raw` entry wins, so the label is the literal `latest` against a
-  binary stamped blank and reporting `dev`; on a `vnext` tag it is `sha-<short>`
-  against the same `dev`. Those are not agreements — they are an unstamped build
-  against a moving tag, which is the honest state for both, and nothing compares
-  them (see the `:latest` bullet below for why dev is safe).
-  The trap: **adding any tag entry with a priority above 900 moves `version.main`
-  off the semver value and breaks the agreement on the release path too**, which
-  is the one place this invariant is load-bearing.
-  **Never stamp `steps.meta.outputs.version`.** That output is only the
-  highest-*priority* tag that matched, so it silently becomes `latest` or
-  `sha-<short>` depending on which entries fired, and storing a moving tag as an
-  identity means comparing it against the label and disagreeing for ever. It was
-  read here until SERV-108.
-  A prerelease is stamped for exactly this reason: `type=semver` matches
-  `v0.17.0-rc.1` and labels the image `0.17.0-rc.1`, so refusing to stamp it
-  would put `dev` in a binary inside an image the ledger reads as versioned.
-  `GIT_SHA` goes on **both** paths: a main build has a real commit and
-  should say so, it just has no release to name. The sha is the full 40
-  characters, because the cross-service comparison is an equality test and not
-  a prefix match, and an absent one marshals to JSON `null` rather than `""` —
-  "recorded no commit" is a different claim from "built at the empty commit".
-- **`:latest` is main's tip, and has exactly one writer** (SERV-108).
-  `flavor: latest=false` is load-bearing: `docker/metadata-action` defaults to
-  `latest=auto`, which emits `:latest` on any `type=semver` match *independently*
-  of the `type=raw` entry — so a release commit published `:latest` twice, from
-  its push to main and from its tag build, and whichever runner finished last
-  won. On 2026-08-28 the main build won `v0.16.0` by 30 seconds, leaving
-  `:latest` labelled `version=latest` with a binary reporting `dev`.
-  construct-server's dev tier pins `latest`, so that coin flip decided what dev
-  purser claimed to be.
-  **The main build is now the sole writer, which makes dev's image consistently
-  `version=latest` / `/healthz: dev` instead of intermittently so.** That is the
-  intended state, not a residue of the fix: dev runs main's tip, main has no
-  release to name, and `dev` is the honest answer. It is safe because nothing
-  compares the two for dev — the per-merge dispatch deliberately carries no
-  `version`, which keeps construct-server's ledger-enrichment branch switched
-  off, so no claim is filed for dev that an observation could contradict. **If a
-  dev claim ever starts being filed, this is the thing that breaks**, and the
-  fix is a real version on main builds, not a relabelling.
-  **The estate has not settled which way `:latest` should point.** Lyceum fixed
-  the identical race the other way (LYCM-121): there `:latest` means the last
-  release and main gets only `:sha-<short>`. Both are internally consistent and
-  they cannot both be right while dev pins `latest` for every service and is
-  supposed to run what just merged. Tracked as an open decision on SERV-108 —
-  check it before changing this file's `enable=` conditions.
-- **The Makefile's `dev` fallback lives inside the subshell, before the pipe.**
-  `git describe ... | sed 's/^v//' || echo dev` never fires: `||` binds to the
-  *pipeline*, whose status is `sed`'s, and `sed` exits 0 on empty input. An
-  untagged checkout or a source tarball then linked a blank version.
+`/healthz` reports what was stamped in and never guesses; the generic rules are
+`PRINCIPLES.md` section 4. Purser-specific:
 
-### The spin-up axis (`internal/spinup`, PRSR-27)
+- **Read the version through `version.Get()`, never the raw vars.** A declared
+  but unpassed Docker `ARG` links an empty string over the `dev` default; only
+  `Get()` maps blank back to `dev`/`null`.
+- **`publish.yml` stamps `VERSION` from its `ver` step's `stamp` output only,**
+  never `steps.meta.outputs.version` (it can be `latest` or `sha-<short>`).
+  Adding any `docker/metadata-action` tag entry with priority above 900 breaks
+  label/binary agreement on the release path.
+- **`:latest` has exactly one writer, the main build** (`flavor: latest=false`,
+  SERV-108), so dev reads `version=latest` / `/healthz: dev` by design. Check
+  the open decision on SERV-108 before changing the `enable=` conditions.
+- **The Makefile's `dev` fallback goes inside the subshell, before the pipe:**
+  `||` binds to the pipeline and `sed` exits 0 on empty input.
 
-- **It is a second interface, not a widened first one.** Everything above is
-  person-shaped — `Connector.Provision(Input{PersonName, Email, …})`, idempotent
-  per (person × service). Spin-up provisions the infrastructure that makes a
-  service *exist*, is keyed on hostname, and is idempotent per (hostname, kind).
-  Bending `Connector` to serve both would mean widening `Input` until neither
-  axis's fields mean anything. The two share an ethos and no types; `spinup`
-  does not import `connector`, and its `ErrUnavailable` is its own sentinel
-  because `ErrPending`'s wording is pinned by migration 0004's backfill.
-- **`Ensure` previews; `--apply` acts.** The inverse of `invite`, matching
-  `offboard`, and settled here so the DNS/Access/tunnel provisioners can't
-  disagree. Two of the three steps are additive and idempotent, which argues for
-  acting — but the third appends to a tunnel's ingress configuration, a
-  read-modify-write of one document holding every *other* service's routes, and
-  that is the mistake re-running doesn't fix. As with `offboard`, preview and
-  apply are one code path: a single `Inspect` per step (read-only by contract)
-  decides the plan, and `--apply` is that same decision plus the write.
-- **DNS is applied last, and only if what it depends on landed.**
-  `model.KindOrder` puts it last because it is the step that makes the hostname
-  live; the other two are inert until something resolves. But ordering only
-  closes the window when the earlier step *succeeded*, so `ServiceSpec.dependsOn`
-  holds the DNS step (`StepBlocked`) when a prerequisite is failed, unavailable
-  or unknown. Publishing anyway leaves a tunnelled service answering 502 until
-  its route lands and — the reason this is an invariant and not a preference — a
-  service meant to be gated reachable *ungated*, which is self-concealing in a
-  way the 502 isn't. A **bookmark** Access app is deliberately not a
-  prerequisite: it is a launcher tile in front of a service with its own login,
-  so its absence costs an icon, not a gate. Blocking withholds changes, never the
-  report — an already-correct record is already published, and an `adopt` writes
-  a row without touching the edge.
-- **An already-correct resource is adopted, not recreated.** Upstream matching
-  the spec with no record of ours is `adopt`: `--apply` writes the row and makes
-  no upstream call. Argosy's edge predates this axis, so the pilot is a service
-  that already exists — a spin-up that can only recognise what it built itself is
-  one nobody will point at production, and re-creating a live DNS record to
-  obtain a row is the wrong way to learn its id.
-- **A resource row exists only for a resource that exists.** A failed step
-  records nothing, so "no row" means "we put nothing here", never "we tried".
-  That is what lets `Teardown` target recorded ids instead of guessing by
-  hostname — deleting a record someone made by hand is not fixed by re-running.
-  The inverse gets its own status: `applied-not-recorded` means the edge changed
-  and the write didn't, the opposite advice from `failed` (compare
-  `revoked-not-recorded`, PRSR-17). And `service_resource.hostname` is unique
-  case-insensitively, for the same reason `person.email` is (migration 0003).
-- **The teardown walk works from rows, and the rows are the plan** (PRSR-34).
-  `Ensure` takes a spec and asks upstream what is there; `Teardown` takes a
-  hostname and asks *Purser* what it put there, because the recorded id is the
-  only thing it may target — deleting a record somebody made by hand is not a
-  mistake re-running fixes. So there is no spec argument, no `Inspect`, and a dry
-  run makes **no provisioner call at all** — not even a read-only one, which is
-  `offboard`'s rule and stronger than `Ensure`'s: `Ensure` previews because one
-  of its three steps rewrites shared state, and here every step is a deletion.
-  The `Target` a provisioner is handed therefore carries only `Spec.Key` and
-  `Spec.Hostname`, with `TunnelID` empty; `rec.ParentID` is the container the
-  resource actually went into, which is the answer a teardown wants and a spec
-  cannot give now that the tunnel is per-spec.
-- **DNS comes off first, and `model.TeardownOrder()` is `KindOrder` reversed
-  rather than a second list.** The argument is `KindOrder`'s read backwards: the
-  record is what makes the hostname live, so pull the Access application while it
-  still resolves and a gated service is reachable *ungated* — not
-  self-announcing, unlike the 502 a removed ingress route gives. Derived rather
-  than written out again, because the way a second literal fails is by removing
-  the gate before the record with nothing anywhere reporting it. And ordering
-  only closes the window when the earlier removal *landed*, so
-  `teardownDependsOn` holds the other two behind DNS (`blocked`) exactly as
-  `ServiceSpec.dependsOn` holds DNS behind them on the way up.
-  It takes no spec and cannot, which costs one distinction: a *bookmark* Access
-  app is deliberately not a DNS prerequisite going up, and a row records the kind
-  rather than whether the application was a gate or a tile. Blocking both is the
-  only answer available and the right direction to be wrong in — wrong about a
-  bookmark costs a re-run, wrong about a gate costs an ungated service.
-- **"Is this hostname still someone's?" is answered by two coordinates that must
-  agree, not by Purser guessing.** A `service_resource` row proves Purser created
-  something here; it does not prove the hostname is still that service's to
-  remove, and a reassigned key, a hostname now fronting something else and a
-  hand-edited record each want a different answer. So `teardown-service` requires
-  `--service` as well as `--hostname` and refuses the **whole run** —
-  `spinup.ErrHostnameNotThisService`, 409 over HTTP — when any active row
-  disagrees, removing nothing and contacting nothing. That is `offboard`'s shape
-  (`--email` required, always one target, no bulk mode) and the comparison is
-  load-bearing rather than ceremonial: `UpsertServiceResource` overwrites
-  `service_key` on conflict and `ensureOne` adopts on a mismatch, so a hostname
-  that changed hands names its new owner from the first spin-up run. *Every*
-  active row is checked, since a hostname whose kinds disagree with each other
-  has been half-reassigned. A **removed** row from a former owner does not
-  refuse: that is the history of a hostname that legitimately changed hands.
-- **A removal that didn't happen must never be recorded as one**, and
-  `removed-not-recorded` is its own status. Only a successful `Teardown` marks
-  the row removed; `failed`, `unavailable`, `refused` and `blocked` leave it
-  **active** so the next run retries — PRSR-17's invariant unchanged, because the
-  lie outlives the error message and the row is what the next run reads. The
-  inverse points the other way: the resource is gone and Purser holds an active
-  row for it, which a later spin-up reads as something to adopt and a later
-  teardown targets an id nobody can delete. It counts toward `NeedsAttention` for
-  that reason even though the edge is correct.
-- **`Teardown` returns a `spinup.Removal`, not a bare `error`.** The tunnel's
-  concurrent-write note is what forced it: on the `Ensure` path that warning
-  reaches an operator through `Resource.Warning`, and on this path it reached a
-  server log and nothing else — so whoever ran the teardown was told nothing,
-  about the one message saying another service may have just lost its route.
-  Same split as on the way up: `Detail` describes this resource, `Warning` is
-  about one that is not this one, and it is returned rather than logged because
-  `log` and the CLI's summary share stderr.
-- **A teardown plan cannot learn from an `Inspect` that never runs, so
-  `TeardownChecker` exists.** Without it a plan reports `remove` for a step
-  `--apply` then reports `unavailable`, and "the preview is exactly what the
-  apply does" stops being true on the one command you cannot take back. It is
-  `connector.RevokeChecker` one axis over, with the same rule: `CanTeardown`
-  answers from capability and configuration alone, contacting nothing, and
-  `Teardown` delegates to the same answer so the two cannot drift. It asks about
-  the *empty* spec a teardown carries on purpose — Access's `available()` demands
-  the members group id only for a gated spec, and a checker that wanted it would
-  refuse to remove a bookmark tile over a credential nothing on this path reads.
-  The per-direction half is the hand-fix sentence: the tunnel's "add the ingress
-  rule in the dashboard" is exactly the wrong instruction to give somebody taking
-  a service down, which is why `teardownUnavailable` exists beside `unavailable`.
-  Found by running the binary, which is now the fourth time on this axis.
-- **`Ensure` and `Teardown` must agree about who owns a shadowed ingress rule**
-  (PRSR-34, out of PRSR-30's review). `planRoute`, meeting a rule for the
-  hostname behind a catch-all or a wildcard, leaves it alone on a stated
-  principle — a rule Purser did not write is not one it deletes — and names it in
-  the plan. `withoutRoute` took every rule with the hostname and no path,
-  reachable or not, so the same rule was removed without being mentioned; and it
-  is *provably* not Purser's, since `assertWritable` makes it impossible to have
-  written a route into a region cloudflared never reaches. It is somebody's hand
-  edit, most plausibly a route they meant to work. `withoutRoute` now splits at
-  `scanRoute`'s shadow, reports what it left, and the read-back checks the
-  reachable region so the restraint is not misread as a removal that failed.
-- **A malformed ingress document is refused on the teardown path too, before
-  anything is concluded from it.** The write path already refuses it and the read
-  path already refuses it; the teardown used to remove what it could see and, in
-  the case with teeth, find *nothing* and return success — after which the
-  orchestrator marked the row removed over a rule still in the file. "No rule for
-  this hostname" out of a document nobody may read is not evidence, which is the
-  revoked-not-recorded lie reached through a read rather than a write.
-- **`--prune` is the orphan's command, and it is a *second* flag on purpose**
-  (PRSR-46). An orphan is a resource at a hostname the spec is keeping up — a
-  service that was `--access gated` and is now `--access none` — so
-  `teardown-service` is the wrong tool twice over: it removes everything at the
-  hostname, and it works from rows and has no spec, which is the only thing that
-  can tell an orphan from a resource. `Ensure` can, so the command lives there.
-  Both `--apply` and `--prune` are needed to remove anything: `--apply` is "act
-  on this plan", `--prune` is "and the plan includes taking things away", and the
-  overwhelmingly common operator never has to think about the second.
-- **Pruning runs after the whole additive pass, and that ordering is the reason
-  it is safe rather than a tidiness.** The case that decides it is a tunnelled →
-  direct switch: the ingress route becomes an orphan while the DNS step
-  *repoints* the record off `<tunnel>.cfargotunnel.com`. Drop the route first and
-  the hostname 502s until the record catches up; repoint first and the route is
-  already serving nobody when it goes. Running `KindOrder` to completion gets
-  that for every spec without a second ordering rule to keep in step.
-  The guard behind it is one rule, deliberately stronger than a per-kind
-  dependency list: **a prune is held back when any step the spec *does* call for
-  did not land** (`unmetPruneDeps`, reusing `inPlace`). `--prune` means "make the
-  edge match this spec", so if the additive half didn't land the edge is not the
-  one the spec describes, and removing what it no longer names is acting on a
-  state nobody has. The concrete case is the ordering one gone wrong — a *failed*
-  DNS repoint leaves the record pointing at the tunnel, so dropping the route
-  takes a working service down — and the general rule catches it without needing
-  to know it, which is what an enumeration of pairs would stop doing the moment a
-  fourth kind arrives.
-- **`prune` is a status, and `pruned-not-recorded` is not
-  `applied-not-recorded`.** `--prune` changes what the run is *asking for*, so an
-  extra resource stops being "nothing will be done about this" and becomes "this
-  is going" — different instructions to a reader, which is what a status is for.
-  Note this is not the distinction `--apply` makes: `--apply` never changes a
-  status, because the plan is the first half of the apply. And the two
-  not-recorded statuses point opposite ways: `applied-not-recorded` means
-  something was *created* and Purser holds no id, so a teardown would miss it;
-  `pruned-not-recorded` means something is *gone* and Purser holds a live-looking
-  row, so a later run reads it as one to adopt. Same argument PRSR-34 made for
-  keeping `removed-not-recorded` separate.
-- **`orphaned` still does not count toward `NeedsAttention`, and the reason is
-  now the durable one.** It has outlived two: "nothing orchestrates a teardown",
-  then "PRSR-34's walk is whole-hostname". Neither survives `--prune`. It stays
-  excluded because an orphan does not falsify the claim that method makes — "the
-  spec is satisfied", and everything the spec asks for *is* in place. Reading it
-  as "and nothing else is here" is the rounding-up the exclusion exists to stop.
-  A run that passed `--prune` reports `prune` instead, which **is** counted by
-  `Pending`: that run asked for the removal, so it is work outstanding rather
-  than a state.
-- **A prune removes only *this* service's resources, and the refusal is the
-  whole run.** `Ensure` builds its record map from
-  `ServiceResourcesForHostname`, which is keyed on hostname alone, so without a
-  check every active row there is a prune candidate whatever service it is
-  recorded to — and a spec naming `--access none` would delete *another*
-  service's Access application, leave its hostname resolving, and mark the row
-  removed so nothing mentions it again. That is the hole `checkOwnership` refuses
-  on for a teardown, reached through the additive command. It reuses that
-  sentinel (`ErrHostnameNotThisService`, 409 over HTTP), so one rule is stated
-  once and both surfaces answer the same way.
-  **Two narrower shapes were tried first and both are wrong, which is worth
-  keeping because each looks obviously right.** Refusing each orphan on its own
-  leaves the additive pass free to run — and *every* row-writing branch of
-  `ensureOne` calls `s.record`, which stamps this spec's `service_key`. So the
-  run rebound one kind while refusing the others, producing exactly the
-  half-reassigned hostname `checkOwnership` refuses a whole teardown on, for
-  **both** keys: it manufactured, in the act of refusing, the condition that
-  stops the remedy its own message names. Holding only the `adopt` then fixed one
-  branch of four and left `update` doing the same — and `update` is the *likelier*
-  input, since a hostname genuinely held by another service has a record that
-  does not match this spec.
-  **The objection that sent it down that road was wrong, and is recorded so
-  nobody re-derives it.** A whole-run refusal looked unfixable: nothing rebinds an
-  *orphan's* `service_key`, because only `ensureOne`'s adopt path rewrites a row
-  and an orphan is a kind the spec does not call for, so the row would refuse for
-  ever with no command to type. That overlooked the remedy the refusal itself
-  names. `teardown-service --service <owner>` removes the hostname's resources,
-  and it works **precisely because nothing was written** — every row still names
-  one service. Refusing early is what keeps that true; the narrower shapes are
-  what broke it.
-  That check asked the question of orphans only, on the grounds that a
-  *called-for* kind whose row names another service is the reassignment an
-  adopt exists to rebind. It is now asked of every row, by
-  `checkSpecOwnership` — see the next bullet — and `refuseContested` is gone:
-  a prune is covered by the general rule rather than being a special case of it.
-- **A spin-up writes only its own service's edge, and a hostname moves only
-  when its previous owner is named** (PRSR-48). `Ensure` is keyed on hostname:
-  `ensureOne` asks the provisioner what is there and makes it match the spec,
-  and never consulted `service_key`. When upstream already matched, the
-  mismatch was the deliberate reassignment adopt. When it did not, the same
-  mismatch was an `update`, and `--apply` wrote one service's spec onto
-  another's resources — a `--access bookmark` spec against somebody's *gated*
-  application strips its policies and leaves it resolving, which is a service
-  admitting everyone with nothing anywhere reporting it. The plan did say
-  `update`, which on a service you meant to update is not a line that invites
-  suspicion: PRSR-41's lesson, met from the other side.
-  So `checkSpecOwnership` asks the teardown's question one command over, and
-  refuses the **whole run, before any `Inspect`**, on the plan as much as the
-  apply, when any active row at the hostname names a service the request did
-  not — `ErrHostnameNotThisService` again, exit 2 / 409, so all three surfaces
-  answer the same way and the comparison is stated once (`recordedToOthers`).
-  Whole-run for the reason PRSR-46 found over three rounds: every row-writing
-  branch of `ensureOne` stamps this spec's `service_key`, so a run that refused
-  one kind and ran the rest manufactures the half-owned hostname that refuses
-  both owners' teardowns. `--reassign-from KEY` (`reassign_from` over HTTP) is
-  the stated way to move a hostname: rows recorded to exactly that service are
-  treated as the spec's own, so adopt rebinds and update writes as before, and
-    **orphans move too** (`rebindOrphan`, a row write and nothing upstream), so a
-  reassignment never *leaves* the hostname half-owned — the run after a move
-  needs no flag, and a teardown as the new owner works. A partial failure still
-  can, since a called-for kind moves only through `ensureOne`'s row-writing
-  branches and a failed `Inspect` writes none; re-running with the same
-  previous owner repairs it, because both keys are then permitted. Rows that
-  name **two** other services — what that leaves behind if nobody re-runs —
-  can be moved or torn down as no single owner, so that refusal names the one
-  command that permits two keys: a spin-up as one of them naming the other,
-  which collapses the rows onto one key (purser#60 review; a teardown was the
-  first wording, and would itself have refused). Two coordinates that must agree, the
-  second one typed rather than inferred: `offboard`'s shape, and the person
-  axis's rule that only `person add --rename` may change a name. Naming a
-  previous owner that holds nothing here is not an error, so re-running the
-  command that moved a hostname says `ok`; naming the spec's own service is
-  `ErrReassignFromSelf` (400), refused rather than ignored because a flag that
-  does nothing is likelier a wrong key. Under `--prune` the orphan is
-    re-attributed *first* and pruned second, so a prune that does not land leaves
-  a row its new owner can still remove. A rebind is work `--apply` does, so
-  `Pending` counts an `orphaned` line carrying one (`StepFinding.Rebind`): a
-  plan whose only work is a row moving must not say "nothing to do" over it.
-  **The guard is keyed on rows**, so a hostname Purser has *never* recorded is
-  not guarded by it: `findApp` still selects whatever whole-host application
-  serves the name and a bookmark spec still converts it, reported as `update`.
-  The plan naming the application is the whole defence there, as it is for any
-  hand-made resource this axis meets — the row is what makes ownership
-  checkable, and only Purser writes rows.
-- **DETAIL describes the resource; ACTION carries the verb.** The prune line
-  first read "… — removing it (app-77e1 …)", which is fine under `prune` and a
-  lie under every other status the path produces, since `pruneOne` leaves Detail
-  alone when it declines. A live run against an unconfigured deployment printed
-  `unavailable` beside "removing it" — a plan promising in one column what it
-  refuses in the next. Found by running the binary, which is now the fifth time
-  on this axis.
-- **The tunnel is a spec field, not a global** (PRSR-33). The account has two
-  healthy tunnels; a dev instance is the same shape pointed at a different one.
-  Specs name a ref (`prod` | `dev`) and `TunnelSet` resolves it to an id once per
-  run, before any step, so the ingress route and the DNS record cannot end up
-  describing different tunnels. Only `prod` is wired; `dev` resolves to a
-  refusal rather than falling back — which is the entire point of a named ref.
-- **The terminal catch-all rule stays last, and that is checked rather than
-  assumed.** A tunnel's ingress list ends in a rule matching everything (no
-  hostname, no path — typically `http_status:404`), which cloudflared requires. A
-  rule appended *after* it is never matched and **nothing errors**: the route
-  simply doesn't work, which is why this is asserted on the document before the
-  PUT and again on the read-back, rather than trusted. The generalisation is the
-  same bug one step out — a catch-all that isn't last has already killed every
-  rule behind it, so inserting before the final rule there would land the new
-  route in the dead tail. Both shapes are refused, not repaired: a document
-  Purser doesn't understand is not one to rewrite on a guess. Anything walking
-  ingress entries must also tolerate the missing hostname instead of tripping
-  over it.
-- **The dead tail is a *read*-path rule too, and that is the half that bites.**
-  The write path refusing a malformed document isn't enough on its own, because
-  `Inspect` is the only call a dry run makes and the status of every step is
-  decided from it. A rule behind a catch-all reported as a working route gives
-  the orchestrator `ok`/`adopt` — both `inPlace()` — so the DNS step unblocks and
-  publishes a hostname in front of a tunnel that will 404 it, which is precisely
-  the window `KindOrder` and `dependsOn` exist to close. So `findRoute` stops
-  where cloudflared stops, at the first catch-all, and a rule behind one is not
-  found. And the gate is `documentShape`, not just "is this rule dead": every
-  answer other than *reachable and already correct* is one `--apply` would write
-  from, so a document it will refuse must preview as `unknown` rather than as
-  `create` or `update` — a plan is the first half of the apply, not a guess at it
-  (PRSR-27), and a preview that promises what apply refuses is the same broken
-  promise `connector.CanDeprovision` exists to stop making on `offboard`. A
-  hostname that *is* served on a document broken elsewhere still reports in
-  place, with the malformation named: that resource is already published, so
-  withholding the line protects nobody.
-- **The catch-all is not the only thing that shadows.** cloudflared matches
-  ingress top-down, first match wins, and a rule's hostname may carry `*`
-  wildcards — `*.zerogravity.industries` in front of a holding page is a
-  *documented, deliberate* configuration, so this precondition is likelier than
-  the malformed-document one, not rarer. So the walk stops at the first rule that
-  would take the hostname (`scanRoute`/`shadows`), of which the terminal
-  catch-all is just the case where the pattern is empty. Both paths read through
-  that one helper, which is what keeps them agreeing: without it the read path
-  reports a shadowed rule as a working route, and the write path inserts a new
-  rule into the same dead region and then *confirms* it — a PUT lands, the
-  read-back passes, DNS publishes, and the hostname serves the holding page with
-  nothing erroring anywhere. **A new route is therefore inserted before the first
-  rule that shadows it**, not before the terminal rule; most-specific-first is
-  cloudflared's own idiom and the only position where the route works. And a
-  wildcard is **never adopted as ours** even when it serves exactly what the spec
-  asks: `isRoute` matches literally, because adopting it would have `Teardown`
-  delete a rule standing in front of every other hostname in the zone.
-- **`hostnameTakes` mirrors cloudflared's matcher; it does not approximate it.**
-  It was a general `*`-glob first, and a glob is wrong in two directions at once.
-  The rule, read from `Rule.Matches` in cloudflared's `ingress/rule.go` and
-  `matchHost` in `ingress/ingress.go` rather than inferred: `""` and `"*"` match
-  everything; otherwise exact equality; otherwise, **only** a leading `*.` is a
-  wildcard, and it trims the `*` alone so the suffix tested keeps its dot. So
-  `wiki.*` and `*.*.industries` are *literals* upstream and stop nothing — a glob
-  treating them as patterns reports `create` for a hostname whose real rule is
-  right below, inserts a duplicate in front of it, and calls a serving rule
-  "never matched". And `*.zerogravity.industries` does **not** take the apex
-  `zerogravity.industries`, so an apex route belongs in front of the terminal
-  rule and works there. Both are pinned in `TestHostnameTakes` with the reason on
-  each row; if that matcher is ever rewritten, check the source again rather than
-  reasoning from the shape of the wildcard. cloudflared's own `isCatchAllRule` is
-  `(Hostname == "" || Hostname == "*") && Path == ""` — the same predicate — and
-  its validation rejects a non-last catch-all outright, so refusing that document
-  is agreeing with the thing that has to serve it.
-- **Check that the document is the one in force, not just who else wrote it.**
-  `getConfig` refuses any tunnel whose `source` is not `cloudflare`. A
-  *locally*-managed tunnel is configured by a YAML file on the origin machine, so
-  the remote configuration this endpoint returns is not what it serves — and none
-  of the four write guards can see that, because every one of them is about *who
-  else wrote this document*. Left unchecked the entire sequence succeeds: the read
-  reports "no ingress rule" from a document that is no evidence about what is
-  served, the PUT is stored, the read-back finds the route, and DNS publishes a
-  hostname the tunnel has never heard of, with nothing erroring anywhere. An
-  **absent** `source` is refused too — "we could not tell" is not "it is fine",
-  and this is the oldest invariant on the axis. PRSR-26 established that
-  `construct-server` is remotely managed by hand, once; nothing re-asserted it at
-  run time, converting a tunnel is a dashboard toggle, and PRSR-33 wires a second
-  tunnel whose mode nobody has checked.
-- **The ingress document is written back whole.** `PUT …/configurations`
-  replaces it, so every key omitted is a setting the tunnel loses —
-  `warp-routing`, the tunnel-wide `originRequest`, a per-rule `noTLSVerify`
-  somebody set once by hand. Rules are held as raw JSON per key for exactly that
-  reason: a field this build doesn't model is still one it can hand back
-  byte-for-byte. Don't decode ingress into a tidy struct.
-- **The lost update is the hazard, and one guard doesn't cover it.** There is no
-  per-hostname write, so a stale read doesn't corrupt this service's route — it
-  deletes somebody else's. `TunnelProvisioner.docMu` serializes the
-  read-modify-write the way `groupMu` does for the Access group's email list, and
-  `Ensure`/`Teardown` take their **own fresh read inside that lock** rather than
-  building a write on the plan's `Inspect`, which ran outside it. The read-back
-  then confirms our own route landed — and the configuration's `version` is
-  checked to have moved by exactly one, because that is the only thing that can
-  see a *different process* writing in between: confirming our own route always
-  passes, since our write necessarily contains everything our own read did. A
-  version jump is a warning on a step that succeeded, not a failure of it; what
-  may have been lost is another service's route.
-  **The `+1` is measured now, not assumed** (PRSR-38, on a disposable tunnel
-  created and deleted for the purpose — neither live tunnel is a place to run
-  an experiment). A content-changing PUT moves `version` by exactly one
-  (0→1→2→3→4 across four writes), so our own route-adding write can never
-  trip the guard and the false alarm this was worried about does not exist. The
-  refinement: an **identical** PUT does not move it at all (2→2→2). That is the
-  right behaviour rather than a gap — a writer who changed nothing lost nobody's
-  route — but it does mean `version` counts *revisions*, not requests, so don't
-  reach for it as a write counter. The PUT response also returns the new
-  version directly, so the read-back is earning its keep by confirming the route
-  landed, not by fetching the number.
-- **Never treat unverifiable as absent**, here too. A failed `Inspect` is
-  `unknown`, and `--apply` does not act on an unknown step: acting on a state
-  that couldn't be read creates a second copy of something, or rebuilds a shared
-  ingress document from a read that just failed. The DNS provisioner extends
-  this past outright failure: **several records answering for one name, none of
-  them the spec's, is also `unknown`** — a guess there changes whichever record
-  wasn't this service's — and so is a lookup that comes back a *full page*,
-  which means the name filter narrowed nothing and page one of the zone would
-  otherwise read as "nothing here".
-- **A direct spec pins the record's value and nothing else.** A tunnelled record
-  must be proxied (SERV-45: an unproxied CNAME to `cfargotunnel.com` reaches
-  nothing, since the tunnel is only reachable from Cloudflare's edge), so that is
-  checked and an update turns it on, and its TTL is pinned to automatic because a
-  proxied record requires it. A **direct** spec expresses neither, so
-  `recordMatches` ignores both and an update carries the *existing* values
-  across. `ttlAuto` and unproxied are **create-time defaults only** — applying
-  them on an update would flip the traffic path of a running service and
-  overwrite a TTL a human set, and since neither field is compared or printed,
-  the plan the operator approved would not have mentioned either. A direct
-  service that wants proxying is a spec field somebody adds.
-- **`DNSConfig` is not `cloudflare.Config`.** Same package, same API client, two
-  credentials sets: the zone id must stay out of the Access connector's
-  readiness check, or `--to cloudflare` goes offline for every deployment that
-  hasn't set `PURSER_CF_ZONE_ID`. An unconfigured DNS provisioner reports
-  `spinup.ErrUnavailable` — one step of a spin-up, not a broken connector.
-- **Don't assume every Cloudflare route sends the `{success, errors}`
-  envelope, or sends a body at all.** `do()` decodes `success` into a `*bool`:
-  absent plus a 2xx is success, and only an actual `false` is a failure. A plain
-  bool made the zero value mean failure, which would report a deletion that
-  *happened* as one that didn't — PRSR-17's lie backwards. An **empty** body is
-  the same question one step out and has to be answered *before* the decode,
-  since `json.Unmarshal` fails on `""` and would take the error branch: a 204
-  would report as a failure through the door the `*bool` cannot cover.
-  Both survived because the DNS delete is the first `DELETE` this client ever
-  sent, and because the fake wrapped that response in an envelope — the second
-  one was still there after the first was fixed, and it is the first test with
-  the fake writing nothing. **When a fake models the shape you assumed, the
-  suite asserts your model rather than the API.** PRSR-29/30 share this client:
-  check each new route's real response instead of the fake's.
-- **Absence is spelled per-product, so each resource type owns its own
-  predicate.** `dnsRecordNotFound` lives in `dns.go`, not in the shared client,
-  and is named for what it answers about: 81044 is *DNS's* code and means
-  nothing to an Access application or a tunnel route. A general-looking
-  `notFound()` in `client.go` would be reached for by the two provisioners that
-  share the file and would answer `false` for ever — safe, but silently wrong.
-  `client.go` exposes `errorCode(err)` and stops there.
-  The code decides it and **a bare 404 is not enough**. `Teardown` reads the
-  predicate as "already gone", so treating any 404 as absence risks reporting a
-  deletion that never happened — and the next run reads the row as removed,
-  which makes it silent and permanent, where the opposite error is a noisy retry
-  on a record that was already gone. The asymmetry is the whole argument; it does
-  not depend on knowing every 404 the API can emit. Only 81044 is listed, and
-  only codes actually observed in a response may be added — a guessed one turns
-  an unrelated failure into a reported deletion.
-- **An Access application is updated by merge, never by rebuild.** Cloudflare
-  refuses `PATCH` on `/access/apps/{id}`, so an update is a full-replacement
-  `PUT`: whatever the body omits is deleted. `access.go` therefore holds the live
-  application as a **map**, not a struct — `encoding/json` drops unknown keys on
-  decode, so a struct round-trip would silently send back an object missing every
-  field nobody modelled, including ones an operator set in the dashboard. On a
-  gated app the field that goes is `policies`, and an update meaning to fix a
-  logo would delete the rule that gates the service, which then stays up, keeps
-  resolving, and admits everyone. Only spec-owned keys are written and only
-  `id`/`uid`/`aud`/`created_at`/`updated_at` are stripped.
-  **`policies` is appended to, never assigned** — that was the same bug by a
-  second route, and worse for being invisible: an app already admitting the
-  members group reports only its rotted logo as drift, so the plan says "fix a
-  logo" while the apply deletes whoever else was allowed (a service token for an
-  uptime monitor, a second group). The spec says this service is gated by the
-  members group; it does not say the group is the only thing that may reach it,
-  and the difference is somebody else's access. A policy list that cannot be
-  read — Cloudflare is documented to return bare references for apps whose
-  policies are managed separately — is left untouched and reported as a note,
-  for the same reason an unfetchable logo is.
-  **A policy's `id` is the load-bearing field, and which half of the body counts
-  depends on `reusable`** (PRSR-40, measured 2026-08-26 on a disposable app and a
-  disposable reusable policy shared by two disposable apps). A `reusable: true`
-  policy in an application write is a **reference**: Cloudflare reads the id and
-  ignores everything else. The probe sent one back with `name` rewritten and
-  `decision` flipped to `deny`; the write returned 200 echoing the policy's real
-  name and decision, the standalone policy's `updated_at` did not move, and the
-  second app sharing it was untouched. So echoing the estate's `Standard` policy
-  back cannot edit the gate on the six services that share it — the outcome
-  PRSR-40 was filed to rule out is structurally impossible. The corollary is the
-  thing to protect: **strip a policy's `id` and it stops being a reference**, so
-  the app gets gated by a fresh private copy that no longer tracks the shared
-  group, with nothing erroring and the plan still saying "fix a logo". The lever
-  is `livePolicies` and the append through it — *not* `serverOwned`, which
-  already lists `id` and is applied only to the top-level application map,
-  never walking into the policy objects inside it. What invites the mistake is
-  symmetry: a carried policy really does arrive with server-assigned
-  `created_at`, `updated_at` and `uid`, so the obvious tidy-up is a policy-level
-  strip modelled on `serverOwned`, and `id` goes in with them because at the
-  callsite it looks like the same kind of field.
-  `TestEnsure_AReusablePolicyIsCarriedByReferenceNotRewritten` is the guard, and
-  it pins the pre-existing policy **by id** on both arms: counting the list is
-  not enough, since a body holding only `membersPolicy` satisfies a count and is
-  precisely the assign-instead-of-append failure.
-  A `reusable: false` policy is the opposite — its body **is** honoured (the same
-  probe flipped one to `deny` and the read-back confirmed it), so a gated update
-  is a real write of that policy's content, safe only because `Ensure` takes its
-  own fresh read immediately before building the body.
-- **An application that serves a *path* is not that hostname's application**
-  (PRSR-41). `domainHost` strips the path on purpose, so a bookmark's
-  `https://argosy…/` compares equal to a self_hosted app's bare hostname — right
-  for "which hostname is this app about", wrong for "is this the app this spec
-  manages", and `findApp` answered the second question with the first by taking
-  the first match. Two applications serve `switchyard.zerogravity.industries`:
-  the service, and a path-scoped one on `/v1/external/github` whose only policy
-  is **`decision: bypass`** — no Access authentication at all, correct for a
-  webhook that authenticates by HMAC and safe *only* because it is confined to
-  that path. The bypass sorts first, so it won; and since `desiredApp` writes
-  `domain` from the spec, an `--apply` would have rewritten it to the bare
-  hostname, **widening an unauthenticated bypass from one path to the whole
-  service** while the real application sat untouched. The plan did describe it —
-  that was the defence being relied on — as `update`, which is not a line that
-  invites suspicion on a service you meant to update.
-  So the match is `servesWholeHost` and nothing less: exactly one whole-host app
-  is this spec's; **none** is a create, which is correct rather than merely safe
-  because Access matches the more specific path first, so a hostname-wide gate in
-  front of a narrower bypass is the shape this estate already runs (and the plan
-  names the path-scoped applications it is landing in front of, because "correct
-  because of a rule you have to know" is worth a line); **more than one** is
-  `spinup.ErrRefused` naming them, which is `pickCandidate`'s reasoning exactly
-  and `refused` rather than `unknown` because the read succeeded.
-  **It reads all three spellings of what an application fronts** — `domain`,
-  `destinations[].uri` and `self_hosted_domains`. This package already models all
-  three (the bypass carries the path in each; `desiredApp` deletes the latter two
-  by name on a bookmark conversion), so reading a subset is an enumeration gap
-  rather than a judgement call. All seven live apps agree across all three
-  (checked 2026-08-26, bypass included), which is an observation about today and
-  not a guarantee — and this predicate gates a full-replacement PUT. PRSR-47
-  found the mechanism: Cloudflare **normalises `self_hosted_domains` to
-  `destinations[].uri` on write** (two disagreeing bodies came back agreeing,
-  and a `domain` absent from `destinations` is refused with 12130), so
-  `hostAmbiguous` cannot be produced through the API as of 2026-09-05. The
-  branch stays: that is also an observation about today, and refusing is the
-  safe direction.
-  **A path-carrying spelling disqualifies only when nothing names the host
-  whole** — asked **per field**, not over the two lists pooled. The naive "any
-  same-host path means not ours" is wrong the other way and worse: an app with
-  `domain: H` and destinations `[H, H/admin]` really does front the whole host,
-  so calling it somebody else's reports `create` and `--apply` stands up a
-  **second** whole-host application while the real one sits untouched and
-  unrecorded — the duplicate `listApps` exists to prevent. "Access prefers the
-  more specific path" does not rescue that: it only helps when the loser is
-  narrower, and there both are hostname-wide.
-  Pooling the lists inverts the answer in exactly the state the third field was
-  added for: a path-only `destinations` excused by a bare host in
-  `self_hosted_domains` reads as ours, while `destinations` — the successor field
-  — says it covers a path and nothing else. And that pair is the *only* state in
-  which reading the second list changes anything, since while the fields agree
-  `domain` alone decides; reading it in a way that does not survive the
-  disagreement is reading it for nothing.
-  **And when they disagree the answer is neither yes nor no — it is
-  `spinup.ErrRefused`.** Which spelling is true depends on the field Access
-  honours, which is what Purser does not know, and both answers are expensively
-  wrong: "not ours" reports `create` and `--apply` stands up a **duplicate**
-  whole-host application that nothing afterwards reports (the next run sees one
-  whole-host app — ours — so the two-candidate refusal never fires), while "ours"
-  writes the spec onto an application that may cover only a path and then lets
-  DNS publish in front of it. The refusal is correct *without* knowing which
-  field wins, which is what makes it an answer rather than a deferral, and
-  `findApp` checks it before counting candidates — an application nobody can
-  classify is exactly the one that might or might not belong in that count.
-  **Selection is still on `domain`, deliberately.** `appsOn` picks candidates by
-  it, so the three-field rule can disqualify an application and never discover
-  one. `domain` is the only one of the three that every application has — a
-  bookmark carries neither list — so one filter serves both shapes only by
-  reading it, and it is what Cloudflare's dashboard shows the application as
-  being about. The other two are a safety check on a candidate, not a wider net.
-  **A third answer means every consumer has to decide about it.**
-  `servesWholeHost` returns `hostWhole` / `hostPath` / `hostAmbiguous`, and the
-  two callers want opposite things from the last one. `findApp` refuses, because
-  both concrete answers are expensively wrong there. `confirmGone` must **error**,
-  and tested `== hostWhole` — so ambiguous fell through into `hostPath`'s bucket
-  ("was never this spec's") and the teardown reported success. That is the one
-  place in the file where the undecidable answer must not resolve to absent:
-  `hostPath` earns its pass because Purser *knows* the application was never this
-  spec's, while `hostAmbiguous` is the state where it knows nothing, which is
-  `Teardown`'s third documented outcome. PRSR-34's walk reads a `nil` there as
-  licence to mark the `service_resource` row removed, after which the remaining
-  application is tracked by nothing. So `!= hostPath`, not `== hostWhole` —
-  erroring is the safe direction here in a way it is not in `findApp`, because a
-  wrong error costs a noisy retry and a wrong `nil` costs a removal recorded over
-  a live gate.
-  **`confirmGone` asks about the id, then about the hostname**, and needs both.
-  Narrowing `findApp` broke it: "nothing serves this hostname" stopped meaning
-  "our application is gone" the moment a path-scoped remnant of *our own* app
-  could hide from a hostname-shaped re-read — a failed DELETE would then report
-  success over a live gate, which is the revoked-not-recorded lie. But an id
-  check alone is not enough either, because a 404 against a recorded
-  `external_id` is a wrong record rather than absent access: if our id is gone
-  and a *whole-host* application still serves the name, the service is still
-  gated. A remaining **path-scoped** app is neither, and is not an error — it was
-  never this spec's.
-  `desiredApp` still writes `domain` on an update. The power to widen came from
-  *which application was selected*, not from writing the field, and that is what
-  moved; base is now guaranteed whole-host, so the assignment is a no-op except
-  on a type change, where a bookmark's scheme-carrying domain genuinely differs.
-  Converting to a bookmark drops `destinations` and `self_hosted_domains`, which
-  a live bookmark does not carry.
-- **A logo has three outcomes, not two, and none of them fails the step.**
-  Cloudflare stores any `logo_url` without validating it and the launcher falls
-  back to the service's initials, so a wrong URL is indistinguishable from an
-  unset one — one of six live apps had a working icon before this axis.
-  `checkLogo` fetches it **as the sessionless public** (an Access-gated asset
-  answers `200 text/html`, which a status-only check would pass) and returns
-  `logoOK`, `logoBroken` — a definite non-image answer — or `logoUnknown` — a
-  transport failure or 5xx, so **change nothing**. Collapsing
-  unknown into broken clears a working icon every time a CDN blinks, and on
-  `Inspect` it is a note rather than drift, because an update here is that
-  full-replacement PUT. Never fatal either way: a gated app is a DNS
-  prerequisite, so refusing it would leave a service unpublished over an icon.
-- **A logo is a ref with three states, and only one of them removes an icon**
-  (PRSR-37). `ServiceSpec.Logo` is `placard` | `none` | an https URL, defaulted
-  to `placard` in `Normalized` — so an omitted `--logo` means *resolve it*, not
-  *clear it*. That inverts the trap PRSR-38 found live: `resolveLogo("")` used to
-  return `""` ("clearing is intended, not a fallback") and `desiredApp` writes
-  the empty string rather than omitting the key, so a forgotten flag composed
-  into an `--apply` that stripped a working tile — reported then as `update`,
-  "has a logo (…), spec sets none". Clearing is still expressible and still
-  correct; it now takes a keyword somebody typed.
-  Defaulted in `Normalized` rather than at each surface for the reason `Mode`,
-  `Access` and `Tunnel` are trimmed there: the CLI and the HTTP API must not
-  disagree about what an omitted field means.
-  **The plan must still name a clearing before it happens** — preview-by-default
-  is the last thing between `--logo none` and a deleted icon — and the three
-  answers stay distinguishable, which is what PRSR-38 asked for: "the spec asked
-  for no icon" is drift, while "Placard has no mark for this slug" and "Placard
-  could not be asked" are *notes* that change nothing. Collapsing the last two
-  into the first would clear icons estate-wide on a registry blip; collapsing
-  them into drift would have the plan promise a deletion `--apply` will not do.
-  Pinned by `TestArgosy_AnOmittedLogoNoLongerClearsTheLiveOne`,
-  `TestArgosy_LogoNoneStillClearsTheLiveOne` and
-  `TestEnsure_AnUnresolvableLogoLeavesTheLiveOneAlone`.
-- **`logoBroken` and `logoUnknown` differ about what to *write*, and not about
-  what to keep.** Both leave an existing icon alone; only the note differs. The
-  broken case used to discard `current` and return `""`, which `desiredApp`
-  writes as an empty `logo_url` and PRSR-40 confirmed live really does remove the
-  icon — so a spec naming a mark that 404s **cleared the working one already on
-  the tile**, and the plan had said `update`, naming the new URL. The keep is
-  conditioned on `current != want`, which is the whole of what it was reasoned
-  about: where the live icon *is* the dead URL the spec asks for, `current` is
-  not a tile to protect but the thing just proved broken, and writing it back
-  makes the drift permanent — the plan reporting "set correctly but not a
-  servable image" for ever while every `--apply` PUTs a gated application for a
-  change that cannot happen. Clearing there converges. A spec asking
-  for a different icon did not ask for this one to be removed, and losing a
-  working tile is strictly worse than not gaining the new one. Only
-  `spinup.LogoNone` clears, which is the same rule the ref itself encodes.
-  **The plan fetches the candidate too**, in `logoDiff`'s `live != want` branch,
-  and **unconditionally**. Without it the preview reports drift on a URL it never
-  checked, so plan and apply disagree by construction — a preview is the first
-  half of an apply, not a guess at it. Guarding the fetch on `live != ""` looks
-  like an optimisation for the create path and is not one: `logoDiff` runs only
-  when the application exists, so an empty `live` is an existing application with
-  no icon yet — seven of the ten PRSR-38 audited. That case destroys nothing but
-  never converges, printing `update` for a URL the apply then declines to write,
-  for ever, with each `--apply` doing a full-replacement PUT for a change that
-  will not happen. Reachable rather than
-  theoretical: Placard reports a file `in_repo` from the repo's contents, and
-  jsDelivr 404ing it (propagation lag after a rename) is a definite non-image
-  answer, so it lands on `logoBroken` and not `logoUnknown`. Pinned by
-  `TestEnsure_ABrokenSpecLogoDoesNotClearTheWorkingLiveOne`.
-- **Placard picks the URL; the write-time fetch decides** (PRSR-37).
-  `internal/placard` resolves a mark by service key, behind a one-method
-  `cloudflare.LogoResolver` so the Access provisioner does not import a second
-  upstream to decorate a tile. It answers *pick*, never *verify*: Placard's own
-  per-file `check` is a periodic monitor carrying a `checked_at`, so a stale
-  green is exactly how the silent failure returns, and `checkLogo` still runs at
-  the moment of writing.
-  Two live traps it exists for. **A working `logo_url` is not a correct one** —
-  argosy's old URL answered `200 image/png` and was the 3.6:1 wordmark, which
-  letterboxes to a sliver in a square tile, and no fetch check can tell that from
-  the tile mark; Placard is the thing that knows which asset is which. And
-  **`state: "missing"` still carries a fully populated `canonical_url`**, because
-  Placard reports where a file *would* live — so reading the URL without reading
-  the state writes a guaranteed 404, which is the exact condition switchyard's
-  tile was in.
-- **A correct URL is not a correctly-shaped asset** (PRSR-43). Third variant of
-  one failure, and each defeats the check before it: a stored `logo_url` can be a
-  lie (answered by the fetch, PRSR-29); a *working* URL can be the wrong asset
-  (answered by asking Placard which one is the tile mark, PRSR-37); and a
-  *correct* URL can be the right asset in the wrong proportions. Placard's
-  canonical argosy mark was 1169×512 — the only non-square one in the repo,
-  against 0.94:1 for switchyard and 1.00:1 for lyceum and placard — and
-  Cloudflare's App Launcher tile is square and **fills** rather than fits, so it
-  cropped the outer ships off the glyph. Placard's own page *fits*, so the same
-  file looked right there and wrong in the launcher, with nothing anywhere
-  reporting a problem.
-  `checkLogo` reads the dimensions off the response it was already making —
-  `measure` sniffs the format from the bytes rather than trusting `Content-Type`,
-  so a header that lies produces no measurement instead of a wrong one — and
-  `logoShape.note` prints when width ÷ height leaves 0.8–1.25. That band is
-  symmetric because the tile has no preference about which way a mark is wrong;
-  0.8 is `1/1.25` and `TestLogoShape_TheBandIsSymmetric` says so rather than
-  leaving it to look like a second judgement.
-  **It is emphatically not a fourth outcome of `logoVerdict`.** It is never
-  drift, because there is nothing `--apply` could write that would fix it — a
-  plan calling it drift would promise an update that changes nothing, for ever —
-  and never fatal, because a gated app is a DNS prerequisite and a letterboxed
-  icon still beats two grey initials. The icon is written and the plan says what
-  the tile will do to it. An **unmeasured** mark (an SVG, a truncated body, a
-  format nothing decodes) reports nothing: never treat unmeasurable as bad, which
-  is `logoUnknown`'s rule one field over. Fixing the asset is Placard's job —
-  placard#6 padded argosy's viewBox to 1:1 rather than cropping tight; **the
-  authoring-end guard, an aspect check in Placard's own `checker`, is
-  PRSR-44** and is not done. It has a key rather than this sentence for the
-  reason `Teardown` does: prose in the repo that isn't going to do the work,
-  attached to a ticket about to close, is how the remaining half gets lost.
-  The reason it belongs here *as well* is that Purser knows the **surface**. That
-  the tile is square is a fact about Cloudflare, this is the package that talks to
-  Cloudflare, and this is the last point before the URL is written.
-- **The Access teardown confirms absence by reading, not by an error code.**
-  `dnsRecordNotFound` works because 81044 was observed; when this was written
-  there was no observed Access equivalent, and the rule above forbids guessing
-  one. There is one now — PRSR-47 saw **11021
-  `access.api.error.unknown_application`** on both GET and DELETE of a deleted
-  application — and the re-read is kept anyway, because it asserts what
-  `Teardown` actually claims rather than what one code says. So a failed delete
-  re-reads the hostname: nothing there means it really is gone, something there
-  means the gate is still up and the record is wrong, and a failed re-read means
-  unverifiable — which is never absent. That is stronger than a code test, not a
-  substitute for one: it asserts what `Teardown` actually claims, and it also
-  catches a delete that failed at the transport after Cloudflare applied it.
-- **Those two premises are observed now, and one of them was wrong** (PRSR-38,
-  probed 2026-08-26). The sentence that stood here said not to harden either
-  into fact without a probe; this is the probe. The DNS delete does **not**
-  answer with a bare `{"result":{"id":…}}` — it carries the full envelope,
-  `{"result":{"id":…},"success":true,"errors":[],"messages":[]}`. So `do()`'s
-  `*bool` is defensive rather than load-bearing *on this route*; keep it, since
-  it costs nothing and the route that omits an envelope is exactly the one
-  nobody will think to check. The 404 half is confirmed in the shape that
-  matters: deleting a well-formed id that is not there answers **404 with code
-  81044**, which is the observation `dnsRecordNotFound` was waiting for and the
-  licence to keep that code listed. What was *not* reproduced is a "could not
-  route" 404 — a **malformed** id answers **405, code 10405** ("Method not
-  allowed for this authentication scheme"), which is neither absence nor a clean
-  failure, and is handled correctly for precisely the reason the predicate keys
-  on the code rather than the status: 10405 is not 81044, so it can never read
-  as "already gone". That asymmetry now has a live counter-example behind it
-  instead of an argument.
-- **Cloudflare appends the zone to a name it doesn't recognise.** A hostname from
-  another domain becomes `svc.example.org.zerogravity.industries` with no error
-  anywhere. `ServiceSpec` can't catch it (it validates the shape of a hostname,
-  not which zone the token points at), so the *created* record's name is checked
-  against what was asked for, and a mismatch deletes it. Cleanup runs on the
-  create path only: on an update the record predates Purser, and removing it
-  would destroy something nobody asked to have removed.
-  **The reason this file used to give for checking it afterwards was wrong**
-  (PRSR-38). It said a Zone→DNS→Edit token "can't read the zone object to find
-  out first"; the production token answers `GET /zones/{zone_id}` with `name:
-  zerogravity.industries, status: active` — that object read is the one
-  `preflight` makes, and the list endpoint answers too.
-- **So the pre-flight runs first, and the create-then-delete is the backstop
-  behind it** (PRSR-39). `preflight` resolves `PURSER_CF_ZONE_ID` to the zone's
-  *name* and refuses a hostname that is not inside it, on `Inspect` as well as
-  `Ensure`, before the record lookup — so the operator reads it in the **plan**,
-  no wrong record ever resolves, and the most alarming line this provisioner can
-  print ("Purser deleted a record it had just made") is off the ordinary path.
-  Refused, not unknown: the read succeeded and re-running says the same thing for
-  ever. What needs fixing is the *spec*, which is a third thing neither status
-  names — but `unknown` says "re-run" and `unavailable` says "set an env var",
-  and only the refusal's message is the actual fix.
-  The two guards ask **different questions** and that is why both stay:
-  pre-flight asks what the spec said, `wrongName` asks what Cloudflare *did*. So
-  the backstop still catches a normalisation surprise a pre-flight cannot
-  predict, it is the half that has actually been exercised live (PRSR-42), and it
-  is the only guard left in the one state the pre-flight waves everything
-  through — **a zone that could not be read**, which is never evidence the
-  hostname is wrong. Usually the same failure takes the record lookup with it and
-  the step reports `unknown` anyway, but that is a tendency, not a property: a
-  failure specific to `GET /zones/{id}` leaves the pre-flight silently inert, and
-  the backstop is what makes that acceptable rather than any self-healing. Only a
-  *successful* zone read is memoised, so one timeout cannot disable the check for
-  the life of a `purser serve`; and a 200 naming no zone counts as a failed read,
-  since an empty zone name would otherwise suffix-match every hostname alive. The zone name is derived from the id and **never
-  configured** beside it: two settings that can disagree just relocate the
-  mismatch this exists to catch.
-- **A refusal is not a failed read** (PRSR-31). `StepUnknown` covers a read that
-  did not complete — re-running is the whole fix. `StepRefused` covers a read
-  that *succeeded* and came back with something no provisioner may write to: a
-  tunnel whose catch-all is not last, or one that is locally managed. Both
-  decline to act and they want opposite things from an operator, so the
-  difference is a **status**, not the `Err` string — putting it there was the
-  `TaskFailed` + `Pending bool` shape PRSR-21 removed from the person axis, where
-  every consumer bucketing by status had to remember a second field existed.
-  Provisioners signal it with `spinup.ErrRefused`, matched via
-  `spinup.IsRefused`, exactly as they already signal `ErrUnavailable`. The
-  sentinel rides on `documentShape` and `checkTunnelSource` and **not** on
-  `terminalIndex`: that helper's other callers (`assertWritable`, `confirmRoute`,
-  `Teardown`) ask it about a document *this run just built or read back*, where a
-  failure is our own arithmetic or a concurrent writer — a breakage, not
-  something upstream to go and fix. Keep `unavailable` distinct from both: it is
-  Purser's own missing credential, fixed here rather than there.
-  **The line runs through the DNS provisioner too, and both sides of it are
-  live.** `pickCandidate` — several records answer for this name and none is the
-  spec's — is `refused`: the read succeeded, and its own message says to resolve
-  it in the dashboard. `records()`'s full-page refusal stays `unknown`: the
-  filter narrowed nothing, so the answer really was not read and a re-run is the
-  fix. Getting that backwards prints "could not be read … re-run" at somebody
-  whose zone needs editing, which is the sentence this split exists to stop.
-- **A warning is its own field, printed once per surface.** Trouble *around* a
-  step that succeeded travels as `Resource.Warning` → `StepFinding.Warning`, not
-  as a clause appended to `Detail`. The two are read by different people: Detail
-  describes this resource and a surface may truncate it, while the tunnel's
-  concurrent-write note says another service's ingress route may have been
-  dropped from the shared document — which a caller must be able to find without
-  pattern-matching a substring out of a description.
-  It is **not logged from `Ensure`**, because `log` and the CLI's own summary
-  both write to stderr and one event then read as two; it *is* logged by the API
-  layer, where there is no double-print to avoid and a caller that ignores the
-  field would leave no trace of it anywhere — the same argument `handleSpinup`
-  already makes for `applied-not-recorded`. Dropping the log outright (PRSR-31's
-  first attempt) fixed the CLI and blinded `purser serve`: a 200 with sensible
-  counts reveals nothing, and the damage is somebody *else's* outage.
-  `Teardown` still logs its own — nothing carries a `Resource` back from there.
-- **"Nothing pending" is not "the edge is up."** `Result.Pending()` counts only
-  what `--apply` would act on, and deliberately excludes `unavailable`,
-  `refused`, `unknown` and `blocked` — none of them is fixed by the flag. So
-  neither `pending` nor `changed` is a verdict: an apply against an unconfigured
-  deployment reports `0` and `0`, which is identical to an edge that was already
-  correct. `Result.NeedsAttention()` is the verdict, and it lives on the result
-  rather than in a renderer so the CLI's exit code and the HTTP response cannot
-  drift about what counts as fine. Reading the pending count as success reported
-  "the edge already matches this spec" over a plan whose DNS step was
-  unavailable — a hostname that does not resolve, signed off as a service that
-  is up. Found by running the binary, not by reading it, which is the argument
-  for running it.
-- **A spec is an argument, not configuration.** `provision-service` takes flags
-  and there is no spec file: config here is env-only by house convention, and a
-  spec is written rarely and read carefully — the same reason a tunnelled spec
-  must name its tunnel rather than defaulting to one. `spinupRegistry` registers
-  all three provisioners *unconditionally*, unlike `buildRegistry` on the person
-  axis: each reports the env var it is missing, which a generic `Unavailable`
-  stand-in could not, and registering them keeps the kind known so a step can
-  never be quietly absent from a report.
-- **`Normalized()` trims every field a surface might pad, and does it *first*.**
-  The order is load-bearing, not tidy: `Mode` decides whether `Upstream` is
-  case-folded, so trimming it afterwards left `"direct "` skipping that fold —
-  and since `validHostname` assumes what `Normalized` produced, an upstream like
-  `Origin.Example.Com` was then refused outright on one spelling of the spec and
-  accepted on the other. Anything added here goes above its readers.
-  `Mode`, `Access` and `Tunnel` are compared against constants, so a
-  stray space is a refusal — and it was a refusal on the HTTP path only, because
-  the CLI trimmed them itself and `Normalized` did not. One surface accepting
-  `"direct "` while the other answers `unknown mode "direct "` is a difference
-  nobody would guess at. Trimmed, but deliberately **not** case-folded: `Key` and
-  `Hostname` are identity keys where two spellings would split a service in half,
-  whereas these three are a closed set, and accepting `"Direct"` would widen what
-  a spec may say without anybody deciding it should.
-- **`spinup.ErrTunnelUnconfigured` exists so the HTTP surface need not match on
-  a message.** `Validate` has already rejected refs that are not names, so it is
-  only ever a legal ref nobody has wired (`dev`, until PRSR-33) — the caller's to
-  fix, so a 400 rather than a 500. It must never fall back to prod: that would
-  have a dev spin-up rewrite the production tunnel's shared ingress document.
+### Spin-up axis (`internal/spinup`)
+
+- **`Ensure` previews; `--apply` acts** (and `--prune` additionally for
+  removals). Preview and apply are one code path: one read-only `Inspect` per
+  step decides the plan. `Teardown` is stricter: a dry run makes no provisioner
+  call at all, works from recorded rows, and takes no spec.
+- **DNS applies last and comes off first.** `model.KindOrder` is the apply order;
+  `TeardownOrder()` is derived from it, never a second list. `dependsOn` /
+  `teardownDependsOn` hold DNS (`blocked`) when a prerequisite did not land,
+  because publishing before the gate exists exposes a service ungated.
+  A bookmark Access app is not a DNS prerequisite going up.
+- **A resource row exists only for a resource that exists,** so a failed step
+  records nothing and `Teardown` targets recorded ids, never hostnames.
+  `applied-not-recorded`, `removed-not-recorded` and `pruned-not-recorded` are
+  their own statuses. Only a successful removal marks a row removed; both
+  `removed_at` and `deprovisioned_at` stamp on every transition into the status.
+- **An already-correct resource is adopted, not recreated** (row written, no
+  upstream call).
+- **Ownership is checked on rows, whole-run, before any `Inspect`.** Teardown
+  requires `--service` and `--hostname` to agree; an `Ensure` or prune that finds
+  an active row recorded to another service refuses the whole run
+  (`ErrHostnameNotThisService`, exit 2 / 409). A hostname moves only with
+  `--reassign-from KEY`. Never refuse per kind: a partial run leaves the
+  hostname half-owned.
+- **`--prune` runs after the whole additive pass and is held back when any step
+  the spec calls for did not land** (`unmetPruneDeps`).
+- **Unverifiable is not absent, here too.** A failed `Inspect` is `unknown` and
+  `--apply` does not act on it. `refused` (read succeeded, upstream state not
+  writable, fix it there) is a different status from `unknown` (read failed,
+  re-run) and from `unavailable` (Purser's own missing credential).
+- **Tunnel ingress is one shared document written back whole.** Hold rules as
+  raw JSON, never a tidy struct. Insert before the first rule that shadows the
+  hostname (`scanRoute`), never adopt a wildcard, keep the catch-all last, and
+  refuse a malformed document, a non-`cloudflare` or absent `source`, on the
+  read path and the teardown path as well as the write path.
+  `hostnameTakes` mirrors cloudflared's matcher; re-read its source before
+  changing it. `TunnelProvisioner.docMu` serializes the read-modify-write with a
+  fresh read inside the lock, and the config `version` must move by exactly one.
+- **The tunnel is a spec field.** `TunnelSet` resolves it once per run; `dev`
+  refuses (`ErrTunnelUnconfigured`, a 400), never falls back to prod.
+- **An Access app is updated by merge, never rebuilt.** It is held as a map,
+  `policies` is appended to never assigned, and a policy's `id` is never
+  stripped (a `reusable` policy is a reference). Anything else deletes the gate
+  or somebody else's access.
+- **`findApp` selects exactly one whole-host app (`servesWholeHost`).** A
+  path-scoped app, such as the `bypass` webhook one, is not that hostname's app.
+  Ambiguity is `ErrRefused`, and `confirmGone` treats ambiguous as an error,
+  never as absent. Selection stays on `domain`.
+- **Absence is spelled per product and decided by code.** `dnsRecordNotFound`
+  (81044) lives in `dns.go`; a bare 404 is not absence; add a code only after
+  observing it. The Access teardown re-reads rather than trusting 11021.
+- **Cloudflare `do()` does not assume the `{success, errors}` envelope or a
+  body:** absent `success` on a 2xx is success, empty body is checked first.
+- **A logo is a ref (`placard` | `none` | https URL), default `placard`** in
+  `Normalized`. Only `none` clears an icon; an unresolvable, broken or unknown
+  logo leaves the live one alone (a note, never drift, never fatal). `checkLogo`
+  fetches sessionless at write time; the plan fetches the candidate too.
+  Aspect ratio outside 0.8-1.25 is a note only. Placard picks, never verifies.
+- **A direct DNS spec pins the value only.** TTL and proxied are create-time
+  defaults; an update carries the existing values across.
+- **`DNSConfig` is not `cloudflare.Config`.** The zone id stays out of the Access
+  connector's readiness check. The zone preflight runs first; the
+  create-then-delete `wrongName` check stays as the backstop.
+- **`Result.NeedsAttention()` is the verdict;** `Pending()` counts only what
+  `--apply` would act on and is not a success signal. Warnings travel in
+  `Resource.Warning` / `Removal.Warning`, logged once per surface.
+- **`Normalized()` trims every padded field first,** before anything that reads
+  it. `Key` and `Hostname` are not case-folded. A spec is flags, not a file.
+  `spinupRegistry` registers all three provisioners unconditionally.
+- **Fakes model your assumptions, not the API.** Check each new Cloudflare
+  route's real response; run the binary against the real API before trusting a
+  green suite on this axis.
 
 ## Testing
 
-- `make test` — unit tests (fake store + fake connectors for the orchestrator;
-  httptest for the Switchyard/Cloudflare connectors and the DNS provisioner —
-  `dns_test.go` runs a stateful fake zone, so create → read back → delete is a
-  test rather than a manual probe; in-process SMTP for delivery). DB-backed store
-  tests skip unless `PURSER_TEST_DATABASE_URL` is set.
-- `make test-db` — spins a throwaway Postgres 16 and runs everything.
-- Never point tests (or `purser migrate`) at the live shared `postgres` — use a
-  throwaway container / the `_test` DB.
-
-## Status
-
-Phase 0+1 (schema + Switchyard connector) plus the owner-requested Cloudflare
-Access connector and email/copy-paste delivery. All four connectors are live:
-`switchyard`, `cloudflare`, `lyceum` (PRSR-10) and `argosy` (PRSR-13) — each of
-the three token-gated ones registers Unavailable when its token is unset.
-
-Also shipped: onboarding bundles + the launcher-led credential block (PRSR-12),
-`audit` / `reconcile` (PRSR-15), which retired 15 (person × service) pairs of
-real drift with zero upstream mutation, `person add` (PRSR-16), the roster entry
-point that provisions nothing, the recipient/operator split in the invite result
-(PRSR-19), the end of `invite`'s silent rename (PRSR-20), which also made a
-name mismatch fatal on the email path, `TaskUnavailable` (PRSR-21), which
-stopped a not-yet-configured connector counting as a breakage, a required
-`--email` on `invite` (PRSR-23), which closed the emailless path that minted a
-new person — and so a new idempotency key — on every run, and the read-only
-roster commands `person list` / `person show` (PRSR-24), which answer "who has
-what" from local records so nobody has to reach for psql, and `purser offboard`
-(PRSR-17), which gave Purser the revoke half it had never had — three of four
-connectors revoking, Argosy reporting `unavailable` until it has an endpoint, and
-`deprovisioned` finally a status something writes.
-
-Purser also carries the SWY-192 build-identity contract as of v0.15.0
-(PRSR-32): `/healthz` reports `version` + `sha`, so it probes as a corroborated
-deploy on the delivery matrix instead of `no_version`. Verified against the
-published images rather than only in tests — `:0.15.0` answers
-`"version":"0.15.0"` with the full 40-char sha, both matching that image's
-`org.opencontainers.image.version` / `.revision` labels exactly, and `:latest`
-answers `"version":"dev"` rather than leaking the literal `latest` its own label
-carries.
-
-**Service spin-up (epic PRSR-22) is in progress**, and its prerequisites are
-done. PRSR-11 closed both halves: the CF token carries Zone→DNS→Edit (scoped to
-`zerogravity.industries`) and Account→Cloudflare Tunnel→Edit, both probed
-against the live API, and `PURSER_CF_ZONE_ID` / `PURSER_CF_TUNNEL_ID` ship
-through `internal/config`, `.env.example` and the deploy compose as of v0.14.0.
-Edit subsumes Read in Cloudflare's model, so there is no separate read scope to
-grant: keeping `Reconcile` read-only is a constraint on the code, not on the
-token. PRSR-26 closed done — the tunnel is remotely-managed (`source:
-"cloudflare"`), so the tunnel connector is an ordinary API client and no tunnel
-migration is needed.
-
-PRSR-28 and PRSR-29 landed two of the three provisioners.
-`cloudflare.DNSProvisioner` does both record shapes, idempotent by
-lookup-then-write, recording `dns_record_id` so `Teardown` targets an id rather
-than re-resolving a name. `cloudflare.AccessProvisioner` does the gated
-`self_hosted` app and the `bookmark` tile, verifies a logo before writing it,
-and merges rather than replaces on update.
-
-PRSR-27 landed the foundation: `internal/spinup` (spec, `ServiceProvisioner`,
-registry, `Ensure` orchestrator) and `service_resource` (migration 0007). It
-settled the two questions the connectors were waiting on — preview by default,
-and the tunnel as a spec field — and it deliberately stops short of the three
-provisioners and the CLI. `Teardown` was on the interface from the start,
-because the resource table exists to give it concrete ids to target, and for a
-fortnight nothing called it — which is exactly why it was filed as **PRSR-34**
-rather than left as a comment on a closed ticket: twice this project has lost the
-remaining half of a piece of work by closing the ticket that described it (see
-PRSR-25, below). **PRSR-34 is now done** — see the teardown invariants above and
-the entry below.
-
-PRSR-30 completes the three: `TunnelProvisioner` in `tunnel.go`, the ingress
-route. It is the step with the blast radius — one shared document per tunnel
-holding every hostname on it — so the invariants above are where the work went:
-insert before the terminal catch-all and assert it stayed last, write every key
-back verbatim, and guard the read-modify-write with a mutex, a fresh read inside
-it, a read-back, and a version check for the writer the read-back cannot see.
-The read path refuses the same documents the write path does, which review
-caught as the half that actually reaches production. It also refuses a tunnel
-that is not remotely managed, because the configuration this endpoint returns is
-then not the one being served, and every other guard in the file is about *who
-else wrote it* rather than whether it is live.
-
-PRSR-31 wired all three into `setup()` and gave the axis its entry points:
-`purser provision-service` (flags, plans by default, `--apply` acts) and `POST
-/v1/spinups`. It settled the two questions PRSR-30's review deferred — `refused`
-split from `unknown`, and the concurrent-write warning reported once — and it
-added `spinup_argosy_test.go`, which runs all three real provisioners through
-the real orchestrator against an already-up edge and asserts three no-ops with
-zero upstream writes — against a fake, which is the caveat **PRSR-38 retired on
-2026-08-26 by running the binary against the real Cloudflare API for the first
-time in this project's history.** The three runs the ticket asked for all pass:
-plan → `adopt`/`adopt`/`skipped`, `--apply` → two rows and *zero* upstream
-calls, re-plan → `ok`/`ok`/`skipped` with `Pending()==0`. "An adopt is a row and
-nothing else" is now checked against Cloudflare's own `modified_on` and
-`updated_at`, which did not move, rather than against Purser's self-report.
-
-**What the first run actually found is the part worth keeping.** The Access step
-came back `update`, not `adopt`: the live tile carries a logo and the ticket's
-spec named none, so `--apply` would have cleared a working icon. The cause was
-`liveBookmark()` — a fixture built to match the spec rather than the API, so the
-suite asserted `adopt` on a shape Cloudflare does not return. That is the
-"a fake models the shape you assumed" trap reached through fixture *data*
-instead of a wire shape, and it is the argument for this ticket existing at all:
-five green tests could not see it, and one live plan could. The fixture is now
-the observed response, `tags` and `policies` included.
-
-PRSR-38 was **adopt-only by construction** — the plan wrote nothing, `--apply`
-produced two rows and zero upstream calls, the re-run was `ok`/`ok` — so what it
-established was a claim about the **read** paths: `Inspect`, the matchers, the
-reconcile logic and the statuses they produce. Its own probes were **raw API
-calls**, confirming Cloudflare's behaviour rather than the bodies `desiredApp`
-and `putConfig` construct; confirming that a PUT bumps a version is not
-confirming that the document we would PUT is one Cloudflare accepts.
-
-**PRSR-40 closed that gap for Access, and only for Access** (2026-08-26). It ran
-the real `AccessProvisioner` — not curl — against the live API on disposable
-hostnames, so what went on the wire was `desiredApp`'s own body. **Every write
-verb in `access.go` has now executed**, on both application shapes:
-
-- **gated create** — the inline policy is accepted, and comes back with a fresh
-  id, `reusable: false`, `precedence: 1`. So a new gated service gets its own
-  private gate rather than joining the estate's shared `Standard`.
-- **gated update, both branches** — carry-through when the group is already
-  admitted, and the **append** when it is not (the foreign policy survived at
-  precedence 1, the members policy landed at 2).
-- **bookmark create and update** — a materially different body, not a variant of
-  the gated one: `type: bookmark`, a `domain` carrying a **scheme**, and
-  `policies` **assigned** to `[]any{}` rather than appended to. Cloudflare accepts
-  the empty list and echoes it back as `[]`, `tags` survives, and the response
-  key set is far smaller than a `self_hosted` app's — no `destinations`,
-  `self_hosted_domains` or `session_duration`. Added after review pointed out the
-  residual caveat below was still exhaustive and still omitted this one.
-- **the logo clear** — `logo_url: ""` really does remove it (the key is absent on
-  read-back), and the plan named the clearing first.
-- **`Teardown`** — including a second teardown of an already-gone app, where
-  `confirmGone`'s re-read correctly reported success rather than an error.
-
-The estate was byte-identical to its pre-probe snapshot afterwards, `updated_at`
-included; all three disposable apps and the disposable policy were deleted.
-
-**PRSR-42 finished the job (2026-08-28). Every write verb this axis owns has now
-executed against Cloudflare through the provisioner that owns it** — the caveat
-that stood here is retired rather than narrowed again.
-
-DNS, on a disposable hostname: create in both shapes (a direct spec really does
-come out **unproxied** with automatic TTL; a tunnelled one **proxied**, which
-SERV-45 requires because an unproxied CNAME to `cfargotunnel.com` reaches
-nothing), the no-op on a match (`modified_on` did not move), an **A → CNAME type
-change in place** on the same record id, `Teardown`, and the already-gone path.
-The two update invariants that had only ever been asserted against a fake are
-now measured: a direct-spec update carried a hand-set **TTL of 300** and a
-hand-set **`proxied: true`** across instead of resetting them to this file's
-create-time defaults. And the zone-append backstop ran end to end — asking for
-`prsr42-probe.example.org` produced
-`prsr42-probe.example.org.zerogravity.industries`, `wrongName` caught it,
-`removeStray` deleted it, and the zone diffed byte-identical to its snapshot.
-
-The tunnel was exercised on a **disposable tunnel seeded with a verbatim copy of
-production's ingress document** — same six rules, same `warp-routing`, same
-sha256 — so the bytes round-tripped were the real ones while the blast radius
-stayed at zero. `putConfig` inserted before the terminal catch-all, `version`
-moved **1 → 2, exactly one**, `warp-routing` survived byte-for-byte, and all six
-original rules came back unchanged and in order. A re-run wrote nothing and left
-`version` at 2. `Teardown` returned the document byte-identical to the seed.
-Then the case production cannot exercise: with a `*.zerogravity.industries`
-holding-page rule in the document, the route was inserted **before the wildcard**
-(index 5 of 8) and the plan named it — the shadowing case, which without
-`scanRoute` would have landed in the dead region behind it and still passed its
-read-back. A wildcard was correctly never adopted as ours. Production's document
-was untouched throughout: `version` 5, identical sha, before and after.
-
-**PRSR-37** made the launcher icon a resolved fact rather than a typed path.
-`ServiceSpec.Logo` is a ref (`placard` | `none` | url) defaulting to `placard`,
-`internal/placard` resolves a mark by service key behind a one-method
-`LogoResolver`, and every answer other than "here is the mark" leaves the tile
-alone. Verified by running the binary against live Placard and live Cloudflare in
-plan mode: switchyard resolves to
-`…/placard@main/switchyard/switchyard-mark-light.png` against a stored URL that
-is a live 404, argosy reports the repoint from its 3.6:1 wordmark to the tile
-mark with both URLs named, and chronicle — which Placard has never heard of —
-reports `adopt` with a note rather than drift or a failure. It is also what
-turned up PRSR-41.
-
-**PRSR-33** wires the `dev` tunnel ref
-that PRSR-27 left resolving to a refusal, and now also owns whether "dev" is one
-spec field driving both the tunnel and Placard's `-dev` mark. **PRSR-44** is PRSR-43's
-authoring-end half — the aspect check in Placard's own checker. **PRSR-36**,
-**PRSR-37**, **PRSR-39** and **PRSR-40** are all closed — PRSR-39 built the zone
-pre-flight that PRSR-38's probe showed was available all along, and left the
-create-then-delete in place behind it as the backstop for the case a pre-flight
-cannot see.
-
-**PRSR-34 gives the axis its inverse**: `internal/spinup/teardown.go`, `purser
-teardown-service` and `POST /v1/teardowns`. It settled the two questions PRSR-27
-left open. Ordering is `KindOrder` reversed and *derived* from it, with the other
-two removals held behind DNS rather than merely ordered after it. "Is this
-hostname still someone's?" is answered by requiring the operator to name the
-service and refusing the whole run when Purser's rows disagree — the honest
-answer, since Purser cannot settle it from the outside and both wrong guesses
-delete something. It also widened `ServiceProvisioner.Teardown` to return a
-`spinup.Removal`, which is what gave PRSR-30's concurrent-write warning somewhere
-to go, and added `TeardownChecker` so a plan that contacts nothing still cannot
-promise what `--apply` refuses.
-
-Two behaviour changes fell out of it rather than being added to it. The tunnel's
-`withoutRoute` no longer sweeps rules the `Ensure` path declines to touch — the
-disagreement PRSR-30's review filed, which stopped being low-stakes the moment
-`Teardown` became reachable — and it refuses a malformed ingress document up
-front instead of reading an absence out of one. And running the binary turned up
-a third: the tunnel's `unavailable` message was telling an operator taking a
-service *down* to go and add its ingress rule.
-
-The caveat it left — nothing on the teardown path had contacted Cloudflare,
-and both of its silent-success bugs were found by argument rather than by
-observation — is retired by **PRSR-47**, below.
-
-**PRSR-46 gives the orphan a command**: `provision-service --prune`, plus
-`"prune": true` on `POST /v1/spinups`. It closes the gap PRSR-34 left open and
-named — `Ensure` reported a resource the spec no longer called for, exited zero,
-and there was nothing to type. See the invariants above for the two things that
-make it safe rather than merely possible: it runs after the additive pass, and it
-is held back when any step the spec *does* call for did not land.
-
-**PRSR-47 retired the last fake-only caveat on this axis (2026-09-05).** Every
-verb this axis owns has now executed against Cloudflare **in both directions and
-through both callers** — `purser teardown-service --apply` and
-`provision-service --prune --apply` — via the real binary (0.18.0), a throwaway
-Postgres, and `PURSER_CF_TUNNEL_ID` pointed at a disposable tunnel seeded with a
-verbatim copy of production's ingress document, on a disposable hostname. The
-estate diffed byte-identical afterwards, `updated_at` and the prod tunnel's sha
-included. What was observed rather than argued:
-
-- **`removed == 0 && behind > 0` refused on a real document.** A
-  `*.zerogravity.industries` rule inserted *after* the route was written —
-  the sequence PRSR-34 reasoned about and PRSR-42 could not stage — came back
-  `refused`, the document was untouched at its version, and the row stayed
-  active. Removing the wildcard by hand and re-running removed the route and
-  restored the document to the seed's sha.
-- **Ordering, timestamped:** a poll saw the DNS record answer 81044 0.6 s
-  before the Access application answered 11021.
-- **Idempotence:** a third `--apply` under an *invalid* API token reported three
-  `gone` and exited 0, so no upstream call was made — a claim the fake could
-  only assert.
-- **81044 through the walk** marked the row removed; **`confirmGone`** refused
-  over a hand-made whole-host application ("the record was wrong and the gate
-  is still up"), and after that application was deleted the re-read path
-  reported the removal and marked the row.
-- **`blocked` behind a real DNS failure**, twice: the recorded id answering for
-  another hostname (the name-mismatch guard), and a 9106 authentication
-  failure. All three rows stayed active both times.
-- **The prune caller.** `ErrHostnameNotThisService` fired on a real hostname
-  under an invalid token, so it contacted nothing. Cloudflare rejected a
-  proxied repoint to `10.0.0.1` with **9003 "Target … is not allowed for a
-  proxied record"**, and `unmetPruneDeps` held both prunes with the route still
-  serving — the "repoint failed upstream" case, produced by Cloudflare rather
-  than a fake. The real prune then repointed the record *before* the route
-  dropped and the application went, which the poll showed and the CLI table
-  cannot: it prints in `KindOrder`, so the two `prune ✓` rows sit above the
-  `update ✓` they ran after.
-
-It also found one thing by running the binary that reading did not — the sixth
-time on this axis: **`removed_at` stamped the first transition, not each one.**
-`COALESCE(removed_at, now())` mirrored `deprovisioned_at`, and its tests covered
-a repeat teardown and a stand-back-up — but not a second *real* removal, so a
-hostname stood up, torn down, stood up and torn down again kept the first date,
-and `gone`'s "already removed, on …" named it. Both axes. Filed as **PRSR-49**
-and fixed there: both columns now stamp on every transition *into* the terminal
-status, judged from the pre-UPDATE row, so a repeat is still a no-op, a
-stand-back-up still keeps the stamp, and a second real removal moves it.
-
-**PRSR-48 closed the additive path's ownership hole** (2026-09-05), the one
-PRSR-46 named and deliberately left: `provision-service` refuses a hostname
-whose rows name another service, and `--reassign-from` is how a hostname moves.
-See the invariant above.
-
-**PRSR-41 was found by running the binary** — the third time on this axis that
-has caught something reading could not (PRSR-31's outcome line, PRSR-38's
-fixture, and now this), and it is fixed. See the invariant above.
-
-**PRSR-43** closed the loop PRSR-37 opened, and was found by *looking at the
-launcher* after the repoint landed: argosy's tile was still wrong, because
-Placard's canonical mark was 1169×512 and the tile is square and fills. The
-shape is now measured off the fetch `checkLogo` already makes and reported as a
-note — never drift, never fatal. The Placard-side half the ticket calls "worth
-doing on the same trip" — an aspect check in its own `checker`, which would
-catch a bad mark at authoring time for every consumer — is **not done, and is
-PRSR-44**.
-
-**PRSR-36** asked for two Cloudflare response shapes that PRSR-28's fixes were
-reasoning about from the published schema rather than from a response anybody
-had seen. **PRSR-38 observed both** — see the DNS bullet above: the delete
-*does* send the envelope (so that premise was wrong and the code was defensively
-right anyway), 81044 arrives with a 404 as hoped, and a malformed id answers
-405/10405 rather than any "could not route" 404. The reason it blocked PRSR-34
-was discharged with it: `Teardown` is where a wrong absence-predicate starts
-marking rows removed for records that still resolve, and the predicate is now
-keyed on a code somebody has actually seen.
-
-Also open: nothing runs the audit on a schedule (PRSR-18). Argosy has no delete
-or disable endpoint, so it is the one service `offboard` cannot close (ARGY
-ticket pending).
-
-PRSR-25 — the dedicated Switchyard provisioning token — reads as closed/done on
-the board, but its own last comment (2026-08-15) records step 2, minting the
-token, as still blocked on SERV-49, which is still in Backlog: the assistant's
-MCP token holds no `users:manage`. The `purser` agent user itself has existed
-since 2026-08-01. Check what `PURSER_SWITCHYARD_TOKEN` actually holds before
-repeating either answer — the board and the thread disagree, and this file has
-been wrong about it in both directions.
-
-**PRSR-50 gives Purser a fifth connector: `catenary`**, cross-repo from
-CANT-33/CANT-131's pinned `provision/openapi.yaml` (tag `provision-v1`). Three
-operations rather than the other four's create/lookup/revoke-with-fan-out
-shape — `POST /accounts` (ensure/reactivate, one idempotent call, no
-409-then-reissue), `GET /accounts?email=` (`Reconcile`, keyed on
-`status == "active"`, never row existence), `POST /accounts/{id}/deactivate`
-(one request, one transaction, idempotent). Unlike Switchyard/Cloudflare/
-Lyceum, `Deprovision`'s offboard is atomic upstream, so the ordering hazard
-`catenary/spike/r6-purser` (IDEA-29) found for a fan-out revoke cannot occur
-here — R6's stub predates the real API and is retired by this connector. The
-double is checked against the vendored, pinned contract
-(`internal/connectors/catenary/testdata/`) rather than hand-shaped, the first
-connector in this repo held to that standard. `PURSER_CATENARY_BASE_URL` has
-no default, unlike Argosy/Lyceum/Switchyard's: the provisioning listener
-(`CATENARY_PROVISION_ADDR`) has no fixed estate-wide port and is never
-routed, so guessing one risks pointing at nothing, or at the wrong thing,
-with no operator having typed it — the same shape of reasoning that keeps
-`PURSER_CF_ZONE_ID`/`PURSER_CF_TUNNEL_ID` undefaulted above, though not the
-same invariant (those two stay out of the Access connector's readiness check
-for a different reason). `construct-server`-side wiring (the compose entry, the listener's own network
-exposure) is SERV-202; the live drill against a deployed Catenary is CANT-133.
-Neither is done here.
+- `make test` runs unit tests (fake store and connectors, httptest for HTTP
+  upstreams, in-process SMTP). DB-backed store tests skip unless
+  `PURSER_TEST_DATABASE_URL` is set.
+- `make test-db` spins a throwaway Postgres 16 and runs everything.
+- Never point tests or `purser migrate` at the live shared `postgres`; use a
+  throwaway container or the `_test` DB.

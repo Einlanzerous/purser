@@ -1,0 +1,178 @@
+# Person-axis invariants: rationale and history
+
+`CLAUDE.md` carries each person-axis rule as a short statement. This file keeps
+the incident history and reasoning behind them (moved out of `CLAUDE.md` under
+SERV-317, text preserved). Ticket keys are PRSR-* unless noted; the board and
+`git log` hold the full stories. Connector counts below predate the fifth
+connector (`catenary`, PRSR-50): "all four" read as "every connector".
+
+- **Idempotency is per (person × service).** `account` has `UNIQUE(person_id,
+  service_id)`; the orchestrator skips services with an active account and
+  retries only failed ones. Keep it that way. Bundles (PRSR-12) rely on this —
+  a bundle is only a named service list, so overlapping bundles and re-invites
+  are safe without any bundle-specific logic. Don't give bundles their own
+  provisioning path.
+- **A bundle grants project access, not privilege.** The default `*:user` is a
+  Switchyard *project membership* role; the instance role stays at its preset.
+  Don't conflate the two axes.
+- **`Reconcile` must never mutate.** No create, no mint, no rotate, no revoke —
+  it answers "what does this person already have?" and nothing else. A version
+  that repairs as a side effect can't be used to audit, because running it
+  destroys the drift it's meant to report. A connector with no lookup endpoint
+  returns `ErrReconcileUnsupported` rather than inferring absence: reporting
+  "no" for a question you can't answer generates wrong records.
+- **Never treat unverifiable as absent.** `UpstreamUnknown` is deliberately
+  distinct from `UpstreamNo` throughout the audit, and a failed connector call
+  must never mark records stale — a transient outage would otherwise wipe out
+  everyone's access records.
+- **`person add` provisions nothing.** The add writes a `person` row and nothing
+  else — no `account` rows, no credentials, no `Provision`. It exists so the
+  audit can see people onboarded outside Purser, and it stops being useful the
+  moment it starts doing invite's job. (`--audit` then runs the ordinary
+  read-only audit, which does call `Reconcile`; that's the preview, not the add.)
+- **An occupied email is a conflict, not an edit.** The store used to carry an
+  `UpsertPerson` doing `ON CONFLICT … DO UPDATE SET name`, so any command taking
+  `--name` renamed whoever holds that address unless it refused first — `person
+  add` uses `InsertPersonIfAbsent` and requires `--rename`, and `invite`'s
+  `resolvePerson` keeps the stored name and reports the disagreement as
+  `Result.NameConflict` (PRSR-20). `UpsertPerson` is now deleted (PRSR-23): a
+  `person` row is created only by `InsertPersonIfAbsent` and renamed only by
+  `RenamePerson`. **Only `person add --rename` may change a name.** Don't add a
+  rename path to `invite`, and don't reintroduce a name-setting upsert — one
+  command owning renames is what makes the guarantee checkable by grep.
+- **`invite` requires an email, on every delivery method.** The address is the
+  identity key and there is no second one. Without it the person row has no
+  conflict target — `person_email_key` is partial on `email IS NOT NULL` — so
+  each run recorded a *new* person id, and the person id is what idempotency is
+  keyed on: `UNIQUE(person_id, service_id)` for the skip, and `InviteRef` for the
+  upstream `Idempotency-Key`. The command that promises to retry only what failed
+  therefore re-provisioned everything, fresh secret and all, once per run
+  (PRSR-23). Don't make it optional again or default it, and don't key identity
+  on `--name`: two people legitimately share a name, and merging them is worse
+  than duplicating one. Migration 0005 says the same thing in the schema —
+  `CHECK (email IS NOT NULL) NOT VALID`, so it binds new rows without having to
+  decide the fate of pre-0005 emailless ones at boot. Those are stranded (no
+  command can address a person with no address) and hand SQL is the only repair;
+  the constraint permits it deliberately.
+- **No connector may answer a reconcile it can't verify.** All four refuse an
+  emailless `Reconcile`. Switchyard's `findUser` still falls back to matching on
+  display name — fine on the Provision path, where Switchyard itself reported the
+  conflict, but as an *audit* answer it would record a person against a
+  same-named stranger, or mark a real account stale and re-arm provisioning for a
+  second token. Requiring the address on `invite` is what left that fallback
+  reachable only from the audit, so `Reconcile` guards it there (PRSR-23).
+- **A name mismatch blocks `--deliver email`, not copy-paste.** It's the only
+  evidence that a mistyped `--email` landed on a *different existing person*, and
+  email mails them working credentials before any warning can be read — so Run
+  returns `ErrNameConflictOnEmail` before writing an invite row or provisioning
+  (409 over HTTP). Copy-paste warns and proceeds; the operator is the gate there.
+  Don't "simplify" these into one behaviour: the asymmetry is the point, because
+  only one of the two paths can be taken back.
+- **`person.email` is unique case-insensitively** (migration 0003), and every
+  conflict target must infer on `lower(email)`. The index and the store's
+  lookups disagreed once; the gap inserted duplicate identities for the same
+  human, which the audit then populated twice.
+- **`offboard` previews; `invite` acts.** The one genuinely destructive command
+  inverts every default the provisioning path takes (PRSR-17). A dry run makes
+  **no connector call at all** — not a read-only one — and `--apply` is what acts;
+  a duplicate grant is wasteful, but revoking the wrong person is not fixed by
+  re-running. There is no bulk mode: `--email` is required and always one person,
+  which is a stronger guard than the flag `reconcile --all` needs. Dry run and
+  apply share one code path, so the preview is exactly what the apply does.
+- **A revoke that didn't happen must never be recorded as one.** Only a
+  successful `Deprovision` marks the account `deprovisioned`; `failed` and
+  `unavailable` leave it **active** so the next run retries it. The lie outlives
+  the error message — the audit, `person show`, and the next invite's idempotency
+  skip all read that column and would report access as removed while it is live.
+  For the same reason `offboard` exits non-zero on `unavailable`, the opposite of
+  `invite`, where nothing was granted and waiting harms nobody. The inverse has
+  its own state too: `revoked-not-recorded` means the connector succeeded and the
+  write didn't, so access *is* gone and Purser's records are wrong — the opposite
+  advice from `failed`, which is why they aren't one status.
+- **The preview must not promise what `--apply` refuses.** Argosy's `Deprovision`
+  is an unconditional refusal and so is every `Unavailable` stub, so a dry run
+  that reported `revoke` for them would break the property that makes previewing
+  worthwhile. `connector.CanDeprovision` answers from capability and config
+  alone, contacting nothing; a connector that knows it can't act implements
+  `RevokeChecker` and its `Deprovision` delegates to the same answer so the two
+  cannot drift.
+- **`ErrRevokeUnavailable` is the revoke-path twin of `ErrPending`.** Same
+  bucket — match with `connector.IsUnavailable` — but "provisioning not yet
+  available" is the wrong sentence on an offboard, and `ErrPending`'s text can't
+  be reworded because migration 0004's backfill matches it as a literal prefix.
+- **A 404 against a *recorded* `external_id` is a wrong record, not absent
+  access.** Both Switchyard and Lyceum fall back to the email lookup and revoke
+  what that finds. Treating it as "nothing to revoke" marks the account
+  deprovisioned while the real user's access stays live, and the next run skips
+  it — silent and permanent, unlike a failure. Lyceum has a second trap: its
+  `Provision` 409 branch records the *email* in `external_id`, and its DELETE
+  handler `ParseInt`s the path, so a non-numeric id must resolve by lookup
+  instead.
+- **`Deprovision` means revoke, not delete — except Lyceum.** Switchyard revokes
+  tokens and keeps the user, because deleting would take their authored tickets
+  with it; Cloudflare drops the email from the Access group. Lyceum's admin
+  surface offers only `DELETE /admin/users/{id}`, so there the two collapse — say
+  so rather than letting the interface's wording imply a reversibility it hasn't
+  got. Argosy has no endpoint at all and returns `ErrRevokeUnavailable`, so a three-of-four
+  offboard reports honestly instead of claiming what it didn't do.
+- **Revoking Switchyard does not close its door.** Its tokens gate the API; the
+  SSO login is gated by the *Cloudflare Access group*, so an offboard that skips
+  `cloudflare` leaves a working sign-in behind while looking finished. The CLI
+  says this outright when it happens. Don't remove that warning without removing
+  the asymmetry that makes it true.
+- **The `account` row is marked, never deleted**, and `deprovisioned_at`
+  (migration 0006) is what makes "when was it taken away" durable. `status` +
+  `updated_at` looked like enough and wasn't: `UpsertAccount` sets active and
+  bumps `updated_at`, so the next invite erased both — and re-inviting someone is
+  ordinary. The column is written on the transition into `deprovisioned` and
+  never cleared, so an *active* row may still carry one; read `status` for the
+  current state. Deleting the row instead would destroy the history the audit
+  exists to read *and* silently re-arm provisioning, since the idempotency skip
+  keys on an active account and a missing row means the opposite of a
+  deprovisioned one.
+- **Never persist a secret in plaintext.** `account.secret_hash` is sha256;
+  plaintext lives only in the returned/emailed credential block.
+- **The roster reads records, and cannot read a secret.** `person list` /
+  `person show` (PRSR-24) read local tables only — `person`, `account` and
+  `service`, plus `invite` for `show`'s history — and neither `Roster` nor
+  `PersonDetail` references `s.registry`, because "who is on the roster" must
+  not depend on every upstream being reachable, and that is the whole difference
+  from `audit`. Don't give them a connector call. They read
+  `store.AccountRecord`, which has no `secret_hash`/`secret_ref` field and comes
+  from a query selecting neither column: credentials are shown once, at invite
+  time, and `--json` serializes whatever the struct holds, so the guarantee is
+  that the field doesn't exist rather than that no renderer prints it. Don't add
+  one "just for the hash". `list` hides non-active accounts by default but
+  reports `Hidden` so the omission is never silent — `--to lyceum` finding
+  nobody has to mean "nobody has Lyceum", not "nobody has it any more" — and its
+  service filter selects on the same accounts it displays. `show` filters
+  nothing; a stale row is the point of the single-person view.
+- **The credential block is the recipient's; the operator note is the
+  operator's.** `Result.CredentialBlock` is the only thing `--deliver email` may
+  ever send, and `RenderCredentialBlock` must stay free of operator-facing
+  content. The failure list was once a trailing section of the block, so a single
+  failed connector mailed an invitee raw `err.Error()` text under a heading
+  saying it wasn't for them (PRSR-19). Don't re-merge them or filter the rendered
+  string — the split is at the source so the emailer has nothing to get wrong.
+- **An invite that provisioned nothing sends no email.** With the operator note
+  split out, an all-failed invite's block is a greeting and nothing else, so
+  mailing it announces access that wasn't granted — and marks the invite
+  delivered, so "did they get it?" answers yes. `deliverable()` gates the send;
+  `Delivered` stays false and the CLI says so. A *partial* failure still sends.
+- **`unavailable` is a task status, not a flavour of `failed`.** A connector
+  returning `connector.ErrPending` — registered but unconfigured, or with no
+  upstream provisioning API — records `TaskUnavailable` (PRSR-21). It used to be
+  `TaskFailed` plus a `Pending bool`, and every consumer that buckets by status
+  then had to remember the bool: the operator note filed it under "what failed"
+  and then labelled the line `(pending)`. Don't reintroduce a modifier alongside
+  the status, and don't reuse `TaskPending` for it — that's the *queued* state,
+  and "hasn't run yet" vs "can't be run" is the collision that caused this. The
+  split is only ever consulted for the difference, so let it switch on a status:
+  the note groups the two under separate headings, the CLI marks them `…` and
+  `✗`. `provision_task.status` is CHECK-constrained (not free text) — a new
+  status needs a migration.
+- **Switchyard needs the email set** on user create — it's the SSO join key
+  (`users.email`). Don't drop it.
+- Connectors should treat "already exists" upstream as success (reconcile) so a
+  failed-only retry is safe.
+- Per-service failures must not abort the whole invite.
