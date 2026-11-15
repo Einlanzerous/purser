@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.2](https://github.com/Einlanzerous/purser/compare/v0.19.1...v0.19.2) (2026-11-15)
+
+
+### Maintenance
+
+* **purser:** trim CLAUDE.md to rules, move rationale to docs/ (SERV-317) ([#67](https://github.com/Einlanzerous/purser/issues/67)) ([032bfce](https://github.com/Einlanzerous/purser/commit/032bfce3f59af79033d657dc72ed9f733fed796b))
+
 ## [0.19.1](https://github.com/Einlanzerous/purser/compare/v0.19.0...v0.19.1) (2026-10-16)
 
 
