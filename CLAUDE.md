@@ -129,6 +129,10 @@ The tree is the directory tour. Only the rules the tree does not show:
 `/healthz` reports what was stamped in and never guesses; the generic rules are
 `PRINCIPLES.md` section 4. Purser-specific:
 
+- **The version is bare semver, compared with strict equality** against the image
+  label `org.opencontainers.image.version` (PRSR-32; docker/metadata-action
+  stamps it without the `v`). Any disagreement is a permanently unresolvable row
+  in the delivery ledger. The Makefile strips the `v`; `Get()` reports verbatim.
 - **Read the version through `version.Get()`, never the raw vars.** A declared
   but unpassed Docker `ARG` links an empty string over the `dev` default; only
   `Get()` maps blank back to `dev`/`null`.
@@ -147,7 +151,9 @@ The tree is the directory tour. Only the rules the tree does not show:
 - **`Ensure` previews; `--apply` acts** (and `--prune` additionally for
   removals). Preview and apply are one code path: one read-only `Inspect` per
   step decides the plan. `Teardown` is stricter: a dry run makes no provisioner
-  call at all, works from recorded rows, and takes no spec.
+  call at all, works from recorded rows, and takes no spec. It returns a
+  `spinup.Removal`, not a bare `error`, so the tunnel's concurrent-write
+  `Warning` reaches the operator instead of only a server log.
 - **DNS applies last and comes off first.** `model.KindOrder` is the apply order;
   `TeardownOrder()` is derived from it, never a second list. `dependsOn` /
   `teardownDependsOn` hold DNS (`blocked`) when a prerequisite did not land,
@@ -201,7 +207,7 @@ The tree is the directory tour. Only the rules the tree does not show:
 - **`findApp` selects exactly one whole-host app (`servesWholeHost`).** A
   path-scoped app, such as the `bypass` webhook one, is not that hostname's app.
   Ambiguity is `ErrRefused`, and `confirmGone` treats ambiguous as an error,
-  never as absent. Selection stays on `domain`.
+  never as absent; it asks about the id, then the hostname, and needs both. Selection stays on `domain`.
 - **Absence is spelled per product and decided by code.** `dnsRecordNotFound`
   (81044) lives in `dns.go`; a bare 404 is not absence; add a code only after
   observing it. The Access teardown re-reads rather than trusting 11021.
@@ -209,14 +215,19 @@ The tree is the directory tour. Only the rules the tree does not show:
   body:** absent `success` on a 2xx is success, empty body is checked first.
 - **A logo is a ref (`placard` | `none` | https URL), default `placard`** in
   `Normalized`. Only `none` clears an icon; an unresolvable, broken or unknown
-  logo leaves the live one alone (a note, never drift, never fatal). `checkLogo`
-  fetches sessionless at write time; the plan fetches the candidate too.
+  logo leaves the live one alone (a note, never drift, never fatal), except
+  where the live icon *is* the dead URL the spec asks for: clear it, or the drift
+  is permanent and every `--apply` does a full-replacement PUT (`current !=
+  want`). `checkLogo` fetches sessionless at write time; the plan fetches the
+  candidate too, unconditionally, never guarded on `live != ""`.
   Aspect ratio outside 0.8-1.25 is a note only. Placard picks, never verifies.
 - **A direct DNS spec pins the value only.** TTL and proxied are create-time
   defaults; an update carries the existing values across.
 - **`DNSConfig` is not `cloudflare.Config`.** The zone id stays out of the Access
   connector's readiness check. The zone preflight runs first; the
-  create-then-delete `wrongName` check stays as the backstop.
+  create-then-delete `wrongName` check stays as the backstop; its cleanup
+  (`removeStray`) runs on the create path only, because on an update the record
+  predates Purser and nobody asked for it to be removed.
 - **`Result.NeedsAttention()` is the verdict;** `Pending()` counts only what
   `--apply` would act on and is not a success signal. `orphaned` does not count
   toward `NeedsAttention`; `applied-not-recorded`, `removed-not-recorded` and
