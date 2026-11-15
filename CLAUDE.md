@@ -85,6 +85,10 @@ The tree is the directory tour. Only the rules the tree does not show:
   `connector.CanDeprovision` answers from capability and config alone; a
   connector that knows it cannot act implements `RevokeChecker` and its
   `Deprovision` delegates to the same answer.
+- **`Reconcile` must guard Switchyard's `findUser` name fallback.** `findUser`
+  falls back to display name, which is fine on `Provision` but as an audit
+  answer would record a person against a same-named stranger or mark a real
+  account stale. That is why every connector refuses an emailless reconcile.
 - **`ErrRevokeUnavailable` is the revoke twin of `ErrPending`.** Match with
   `connector.IsUnavailable`. Never reword `ErrPending`: migration 0004's
   backfill matches its text as a literal prefix.
@@ -149,6 +153,10 @@ The tree is the directory tour. Only the rules the tree does not show:
   `teardownDependsOn` hold DNS (`blocked`) when a prerequisite did not land,
   because publishing before the gate exists exposes a service ungated.
   A bookmark Access app is not a DNS prerequisite going up.
+- **The teardown preview must not promise what `--apply` refuses.**
+  `spinup.TeardownChecker` / `CanTeardown` is the twin of `RevokeChecker`: it
+  answers from capability and config alone, contacts nothing, asks about the
+  empty spec a teardown carries, and `Teardown` delegates to the same answer.
 - **A resource row exists only for a resource that exists,** so a failed step
   records nothing and `Teardown` targets recorded ids, never hostnames.
   `applied-not-recorded`, `removed-not-recorded` and `pruned-not-recorded` are
@@ -161,13 +169,18 @@ The tree is the directory tour. Only the rules the tree does not show:
   an active row recorded to another service refuses the whole run
   (`ErrHostnameNotThisService`, exit 2 / 409). A hostname moves only with
   `--reassign-from KEY`. Never refuse per kind: a partial run leaves the
-  hostname half-owned.
+  hostname half-owned. A *removed* row from a former owner does not refuse a
+  teardown. `--reassign-from` naming the spec's own service is
+  `ErrReassignFromSelf` (400). `rebindOrphan` moves orphans (a row write,
+  nothing upstream), and `Pending` counts an `orphaned` line carrying a rebind.
 - **`--prune` runs after the whole additive pass and is held back when any step
   the spec calls for did not land** (`unmetPruneDeps`).
 - **Unverifiable is not absent, here too.** A failed `Inspect` is `unknown` and
   `--apply` does not act on it. `refused` (read succeeded, upstream state not
   writable, fix it there) is a different status from `unknown` (read failed,
-  re-run) and from `unavailable` (Purser's own missing credential).
+  re-run) and from `unavailable` (Purser's own missing credential). In DNS,
+  `pickCandidate` (several records answer, none is the spec's) is `refused`;
+  `records()`'s full-page lookup is `unknown`.
 - **Tunnel ingress is one shared document written back whole.** Hold rules as
   raw JSON, never a tidy struct. Insert before the first rule that shadows the
   hostname (`scanRoute`), never adopt a wildcard, keep the catch-all last, and
@@ -176,6 +189,9 @@ The tree is the directory tour. Only the rules the tree does not show:
   `hostnameTakes` mirrors cloudflared's matcher; re-read its source before
   changing it. `TunnelProvisioner.docMu` serializes the read-modify-write with a
   fresh read inside the lock, and the config `version` must move by exactly one.
+  `Ensure` and `Teardown` must agree on a rule shadowed by a wildcard or
+  catch-all: `withoutRoute` leaves it alone and names it, and `removed == 0 &&
+  behind > 0` is refused, not read as success.
 - **The tunnel is a spec field.** `TunnelSet` resolves it once per run; `dev`
   refuses (`ErrTunnelUnconfigured`, a 400), never falls back to prod.
 - **An Access app is updated by merge, never rebuilt.** It is held as a map,
@@ -202,7 +218,9 @@ The tree is the directory tour. Only the rules the tree does not show:
   connector's readiness check. The zone preflight runs first; the
   create-then-delete `wrongName` check stays as the backstop.
 - **`Result.NeedsAttention()` is the verdict;** `Pending()` counts only what
-  `--apply` would act on and is not a success signal. Warnings travel in
+  `--apply` would act on and is not a success signal. `orphaned` does not count
+  toward `NeedsAttention`; `applied-not-recorded`, `removed-not-recorded` and
+  `pruned-not-recorded` do. Warnings travel in
   `Resource.Warning` / `Removal.Warning`, logged once per surface.
 - **`Normalized()` trims every padded field first,** before anything that reads
   it. `Key` and `Hostname` are not case-folded. A spec is flags, not a file.

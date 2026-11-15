@@ -54,7 +54,8 @@ connector (`catenary`, PRSR-50): "all four" read as "every connector".
   decide the fate of pre-0005 emailless ones at boot. Those are stranded (no
   command can address a person with no address) and hand SQL is the only repair;
   the constraint permits it deliberately.
-- **No connector may answer a reconcile it can't verify.** All four refuse an
+- **No connector may answer a reconcile it can't verify.** (Written when four
+  connectors existed; all five now refuse, `catenary` included.) All four refuse an
   emailless `Reconcile`. Switchyard's `findUser` still falls back to matching on
   display name — fine on the Provision path, where Switchyard itself reported the
   conflict, but as an *audit* answer it would record a person against a
